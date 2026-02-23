@@ -1,0 +1,9 @@
+/target
+*.swp
+*.swo
+*~
+.DS_Store
+
+/vendor/
+/.cargo/config.toml
+/.cargo/config.toml.bak
