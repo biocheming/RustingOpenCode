@@ -252,7 +252,7 @@ fn handle_binary_file(
     let msg = format!("{} read successfully ({} bytes)", file_type, content.len());
 
     let output = format!(
-        "<path>{}</path>\n<type>binary</type>\n<mime>{}</mime>\n<size>{}</size>\n<data-url>\n{}\n</data-url>",
+        "<path>{}</path>\n<type>binary</type>\n<mime>{}</mime>\n<size>{}</size>\n<total-lines>0</total-lines>\n<data-url>\n{}\n</data-url>",
         path.display(),
         mime,
         content.len(),
@@ -416,8 +416,10 @@ async fn read_file_content(
     };
 
     let mut output = format!(
-        "<path>{}</path>\n<type>file</type>\n<content>\n{}{}\n</content>",
+        "<path>{}</path>\n<type>file</type>\n<size>{}</size>\n<total-lines>{}</total-lines>\n<content>\n{}{}\n</content>",
         path.display(),
+        content.len(),
+        total_lines,
         result_lines.join("\n"),
         truncation_msg
     );
@@ -450,6 +452,8 @@ async fn read_file_content(
             m.insert("truncated".into(), serde_json::json!(truncated));
             m.insert("filepath".into(), serde_json::json!(path_str));
             m.insert("loaded".into(), serde_json::json!(loaded_files));
+            m.insert("size".into(), serde_json::json!(content.len()));
+            m.insert("total_lines".into(), serde_json::json!(total_lines));
             m
         },
         truncated,

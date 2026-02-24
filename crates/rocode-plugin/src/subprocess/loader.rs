@@ -2,10 +2,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::auth::PluginAuthBridge;
 use super::client::{PluginContext, PluginSubprocess, PluginSubprocessError};
@@ -50,6 +52,12 @@ pub struct PluginLoader {
     hook_system: Arc<PluginSystem>,
     runtime: JsRuntime,
     host_script_path: PathBuf,
+    bootstrap_context: RwLock<Option<PluginContext>>,
+    bootstrap_specs: RwLock<Vec<String>>,
+    bootstrap_builtins: AtomicBool,
+    ensure_lock: Mutex<()>,
+    last_activity_epoch_secs: AtomicU64,
+    idle_shutdown_enabled: AtomicBool,
 }
 
 impl PluginLoader {
@@ -72,7 +80,81 @@ impl PluginLoader {
             hook_system: Arc::new(PluginSystem::new()),
             runtime,
             host_script_path,
+            bootstrap_context: RwLock::new(None),
+            bootstrap_specs: RwLock::new(Vec::new()),
+            bootstrap_builtins: AtomicBool::new(true),
+            ensure_lock: Mutex::new(()),
+            last_activity_epoch_secs: AtomicU64::new(now_epoch_secs()),
+            idle_shutdown_enabled: AtomicBool::new(true),
         })
+    }
+
+    /// Configure how plugin subprocesses should be (re)started on demand.
+    pub async fn configure_bootstrap(
+        &self,
+        context: PluginContext,
+        specs: Vec<String>,
+        load_builtins: bool,
+    ) {
+        *self.bootstrap_context.write().await = Some(context);
+        *self.bootstrap_specs.write().await = specs;
+        self.bootstrap_builtins
+            .store(load_builtins, Ordering::Relaxed);
+        self.touch_activity();
+    }
+
+    /// Ensure plugin subprocesses are running.
+    ///
+    /// Returns `true` when a cold start happened.
+    pub async fn ensure_started(&self) -> Result<bool, PluginLoaderError> {
+        self.touch_activity();
+        if !self.clients.read().await.is_empty() {
+            return Ok(false);
+        }
+
+        let _guard = self.ensure_lock.lock().await;
+        if !self.clients.read().await.is_empty() {
+            return Ok(false);
+        }
+
+        let context = self.bootstrap_context.read().await.clone().ok_or_else(|| {
+            PluginLoaderError::Io(std::io::Error::other("plugin bootstrap context missing"))
+        })?;
+        let specs = self.bootstrap_specs.read().await.clone();
+        let load_builtins = self.bootstrap_builtins.load(Ordering::Relaxed);
+
+        if load_builtins {
+            self.load_builtins(&context).await?;
+        }
+        if !specs.is_empty() {
+            self.load_all(&specs, &context).await?;
+        }
+
+        self.touch_activity();
+        Ok(true)
+    }
+
+    pub fn touch_activity(&self) {
+        self.last_activity_epoch_secs
+            .store(now_epoch_secs(), Ordering::Relaxed);
+    }
+
+    pub fn set_idle_shutdown_enabled(&self, enabled: bool) {
+        self.idle_shutdown_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn idle_shutdown_enabled(&self) -> bool {
+        self.idle_shutdown_enabled.load(Ordering::Relaxed)
+    }
+
+    pub async fn has_live_clients(&self) -> bool {
+        !self.clients.read().await.is_empty()
+    }
+
+    pub fn is_idle_for(&self, duration: Duration) -> bool {
+        let now = now_epoch_secs();
+        let last = self.last_activity_epoch_secs.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= duration.as_secs()
     }
 
     /// Load all plugins from the given spec list.
@@ -186,12 +268,24 @@ impl PluginLoader {
 
     /// Shut down all plugin subprocesses.
     pub async fn shutdown_all(&self) {
-        let clients = self.clients.read().await;
-        for client in clients.iter() {
+        let clients = {
+            let mut clients = self.clients.write().await;
+            std::mem::take(&mut *clients)
+        };
+        for client in clients {
+            for hook_name in client.hooks() {
+                let Some(event) = super::hook_name_to_event(hook_name) else {
+                    continue;
+                };
+                let hook_id = format!("ts:{}:{}", client.name(), hook_name);
+                let _ = self.hook_system.remove(&event, &hook_id).await;
+            }
             if let Err(e) = client.shutdown().await {
                 tracing::warn!(plugin = client.name(), error = %e, "error shutting down plugin");
             }
         }
+        self.auth_bridges.write().await.clear();
+        self.touch_activity();
     }
 
     /// Get the auth bridge for a given provider ID, if any plugin provides it.
@@ -346,6 +440,13 @@ fn parse_npm_spec(spec: &str) -> (&str, &str) {
     }
 
     (spec, "*")
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn hook_io_from_context(context: &HookContext) -> (Value, Value) {

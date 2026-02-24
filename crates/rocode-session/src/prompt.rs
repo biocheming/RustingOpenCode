@@ -1217,6 +1217,12 @@ impl SessionPrompt {
             // Finalize the placeholder assistant message with tool calls and usage.
             if let Some(assistant_msg) = session.messages.get_mut(assistant_index) {
                 for (tc_id, (tc_name, tc_args)) in &tool_calls {
+                    // Skip ghost entries created by Ollama-style models that
+                    // stream tool_calls chunks with empty or missing names.
+                    if tc_name.is_empty() {
+                        tracing::warn!(tool_call_id = %tc_id, "skipping tool call with empty name");
+                        continue;
+                    }
                     let input: serde_json::Value =
                         serde_json::from_str(tc_args).unwrap_or(serde_json::json!({}));
                     assistant_msg.parts.push(crate::MessagePart {

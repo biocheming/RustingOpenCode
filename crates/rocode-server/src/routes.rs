@@ -286,6 +286,33 @@ async fn set_session_run_status(
     );
 }
 
+/// Drop guard that sets session status to idle when the prompt task exits.
+/// Mirrors the TS `defer(() => cancel(sessionID))` pattern to guarantee
+/// the spinner stops even if the spawned task panics.
+struct IdleGuard {
+    state: Arc<ServerState>,
+    session_id: Option<String>,
+}
+
+impl IdleGuard {
+    /// Defuse the guard — the caller will handle cleanup explicitly.
+    fn defuse(&mut self) {
+        self.session_id = None;
+    }
+}
+
+impl Drop for IdleGuard {
+    fn drop(&mut self) {
+        let Some(sid) = self.session_id.take() else {
+            return;
+        };
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            set_session_run_status(&state, &sid, SessionRunStatus::Idle).await;
+        });
+    }
+}
+
 async fn session_status(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<HashMap<String, SessionStatusInfo>>> {
@@ -1619,6 +1646,7 @@ async fn session_prompt(
             return Err(ApiError::SessionNotFound(id));
         }
     }
+    let _ = ensure_plugin_loader_active(&state).await?;
 
     let config = CONFIG_STATE.read().await;
     let (provider, provider_id, model_id) =
@@ -1640,6 +1668,14 @@ async fn session_prompt(
             session
         };
         set_session_run_status(&task_state, &session_id, SessionRunStatus::Busy).await;
+
+        // Safety guard: ensure status is always set to idle when this block
+        // exits, mirroring the TS `defer(() => cancel(sessionID))` pattern.
+        // This prevents the spinner from getting stuck if anything panics.
+        let mut _idle_guard = IdleGuard {
+            state: task_state.clone(),
+            session_id: Some(session_id.clone()),
+        };
 
         if let Some(variant) = task_variant.as_deref() {
             session
@@ -1664,7 +1700,7 @@ async fn session_prompt(
         let (update_tx, mut update_rx) =
             tokio::sync::mpsc::unbounded_channel::<rocode_session::Session>();
         let update_state = task_state.clone();
-        let update_task = tokio::spawn(async move {
+        let mut update_task = tokio::spawn(async move {
             while let Some(snapshot) = update_rx.recv().await {
                 let snapshot_id = snapshot.id.clone();
                 {
@@ -1744,7 +1780,18 @@ async fn session_prompt(
             }
             assistant.add_text(format!("Provider error: {}", error));
         }
-        let _ = update_task.await;
+        match tokio::time::timeout(Duration::from_secs(1), &mut update_task).await {
+            Ok(joined) => {
+                let _ = joined;
+            }
+            Err(_) => {
+                update_task.abort();
+                tracing::warn!(
+                    session_id = %session_id,
+                    "timed out waiting for prompt update task shutdown; aborted task"
+                );
+            }
+        }
 
         {
             let mut sessions = task_state.sessions.lock().await;
@@ -1758,6 +1805,8 @@ async fn session_prompt(
             })
             .to_string(),
         );
+        // Normal path reached — defuse the guard so we handle cleanup explicitly.
+        _idle_guard.defuse();
         set_session_run_status(&task_state, &session_id, SessionRunStatus::Idle).await;
         persist_sessions_if_enabled(&task_state).await;
     });
@@ -2253,8 +2302,11 @@ pub struct AuthMethodInfo {
 }
 
 async fn get_provider_auth(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
 ) -> Json<HashMap<String, Vec<AuthMethodInfo>>> {
+    if let Err(error) = ensure_plugin_loader_active(&state).await {
+        tracing::warn!(%error, "failed to warm plugin loader for provider auth list");
+    }
     let Some(loader) = get_plugin_loader() else {
         return Json(HashMap::new());
     };
@@ -2289,10 +2341,11 @@ pub struct OAuthAuthorizeResponse {
 }
 
 async fn oauth_authorize(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     Json(req): Json<OAuthAuthorizeRequest>,
 ) -> Result<Json<OAuthAuthorizeResponse>> {
+    let _ = ensure_plugin_loader_active(&state).await?;
     let loader = get_plugin_loader()
         .ok_or_else(|| ApiError::NotFound("no plugin loader initialized".to_string()))?;
     let authorization = ProviderAuth::authorize(loader, &id, req.method, None)
@@ -2320,6 +2373,7 @@ async fn oauth_callback(
     Path(id): Path<String>,
     Json(req): Json<OAuthCallbackRequest>,
 ) -> Result<Json<bool>> {
+    let _ = ensure_plugin_loader_active(&state).await?;
     let loader = get_plugin_loader()
         .ok_or_else(|| ApiError::NotFound("no plugin loader initialized".to_string()))?;
     ProviderAuth::new(state.auth_manager.clone())
@@ -2331,10 +2385,10 @@ async fn oauth_callback(
     if let Some(bridge) = loader.auth_bridge(&id).await {
         match bridge.load().await {
             Ok(load_result) => {
-                crate::server::sync_custom_fetch_proxy(&id, bridge, load_result.has_custom_fetch);
+                crate::server::sync_custom_fetch_proxy(&id, bridge, loader, load_result.has_custom_fetch);
             }
             Err(error) => {
-                crate::server::sync_custom_fetch_proxy(&id, bridge, false);
+                crate::server::sync_custom_fetch_proxy(&id, bridge, loader, false);
                 tracing::warn!(
                     provider = %id,
                     %error,
@@ -4491,7 +4545,10 @@ struct PluginAuthMethodInfo {
     label: String,
 }
 
-async fn list_plugin_auth(_state: State<Arc<ServerState>>) -> Result<Json<Vec<PluginAuthInfo>>> {
+async fn list_plugin_auth(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<Vec<PluginAuthInfo>>> {
+    let _ = ensure_plugin_loader_active(&state).await?;
     let Some(loader) = get_plugin_loader() else {
         return Ok(Json(Vec::new()));
     };
@@ -4530,11 +4587,11 @@ struct PluginAuthAuthorizeResponse {
 }
 
 async fn plugin_auth_authorize(
-    _state: State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
     Json(req): Json<PluginAuthAuthorizeRequest>,
 ) -> Result<Json<PluginAuthAuthorizeResponse>> {
-    let bridge = get_auth_bridge(&name).await?;
+    let bridge = get_auth_bridge(&state, &name).await?;
 
     let result = bridge
         .authorize(req.method, req.inputs)
@@ -4554,11 +4611,11 @@ struct PluginAuthCallbackRequest {
 }
 
 async fn plugin_auth_callback(
-    _state: State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
     Json(req): Json<PluginAuthCallbackRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let bridge = get_auth_bridge(&name).await?;
+    let bridge = get_auth_bridge(&state, &name).await?;
 
     let result = bridge
         .callback(req.code.as_deref())
@@ -4577,10 +4634,10 @@ struct PluginAuthLoadResponse {
 }
 
 async fn plugin_auth_load(
-    _state: State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
 ) -> Result<Json<PluginAuthLoadResponse>> {
-    let bridge = get_auth_bridge(&name).await?;
+    let bridge = get_auth_bridge(&state, &name).await?;
 
     let result = bridge
         .load()
@@ -4610,11 +4667,11 @@ struct PluginAuthFetchResponse {
 }
 
 async fn plugin_auth_fetch(
-    _state: State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
     Json(req): Json<PluginAuthFetchRequest>,
 ) -> Result<Json<PluginAuthFetchResponse>> {
-    let bridge = get_auth_bridge(&name).await?;
+    let bridge = get_auth_bridge(&state, &name).await?;
 
     let fetch_req = rocode_plugin::subprocess::PluginFetchRequest {
         url: req.url,
@@ -4636,7 +4693,11 @@ async fn plugin_auth_fetch(
 }
 
 /// Helper: look up the auth bridge for a provider name.
-async fn get_auth_bridge(provider: &str) -> Result<Arc<PluginAuthBridge>> {
+async fn get_auth_bridge(
+    state: &Arc<ServerState>,
+    provider: &str,
+) -> Result<Arc<PluginAuthBridge>> {
+    let _ = ensure_plugin_loader_active(state).await?;
     let loader = get_plugin_loader()
         .ok_or_else(|| ApiError::NotFound("no plugin loader initialized".into()))?;
 
@@ -4644,4 +4705,22 @@ async fn get_auth_bridge(provider: &str) -> Result<Arc<PluginAuthBridge>> {
         .auth_bridge(provider)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("no auth plugin for provider: {}", provider)))
+}
+
+async fn ensure_plugin_loader_active(
+    state: &Arc<ServerState>,
+) -> Result<Option<&'static Arc<PluginLoader>>> {
+    let Some(loader) = get_plugin_loader() else {
+        return Ok(None);
+    };
+    let started = loader
+        .ensure_started()
+        .await
+        .map_err(|e| ApiError::InternalError(format!("failed to start plugin loader: {}", e)))?;
+    if started {
+        let _any_custom_fetch =
+            crate::server::refresh_plugin_auth_state(loader, state.auth_manager.clone()).await;
+    }
+    loader.touch_activity();
+    Ok(Some(loader))
 }

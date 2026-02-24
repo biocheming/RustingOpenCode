@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -32,6 +33,7 @@ const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:4096";
 
 struct PluginBridgeFetchProxy {
     bridge: Arc<PluginAuthBridge>,
+    loader: Arc<PluginLoader>,
 }
 
 #[async_trait]
@@ -40,6 +42,7 @@ impl CustomFetchProxy for PluginBridgeFetchProxy {
         &self,
         request: CustomFetchRequest,
     ) -> Result<CustomFetchResponse, ProviderError> {
+        self.loader.touch_activity();
         let response = self
             .bridge
             .fetch_proxy(PluginFetchRequest {
@@ -62,6 +65,7 @@ impl CustomFetchProxy for PluginBridgeFetchProxy {
         &self,
         request: CustomFetchRequest,
     ) -> Result<CustomFetchStreamResponse, ProviderError> {
+        self.loader.touch_activity();
         let response = self
             .bridge
             .fetch_proxy_stream(PluginFetchRequest {
@@ -86,6 +90,7 @@ impl CustomFetchProxy for PluginBridgeFetchProxy {
 pub(crate) fn sync_custom_fetch_proxy(
     provider_id: &str,
     bridge: Arc<PluginAuthBridge>,
+    loader: &Arc<PluginLoader>,
     enabled: bool,
 ) {
     if enabled {
@@ -93,12 +98,16 @@ pub(crate) fn sync_custom_fetch_proxy(
             provider_id.to_string(),
             Arc::new(PluginBridgeFetchProxy {
                 bridge: bridge.clone(),
+                loader: Arc::clone(loader),
             }),
         );
         if provider_id == "github-copilot" {
             register_custom_fetch_proxy(
                 "github-copilot-enterprise",
-                Arc::new(PluginBridgeFetchProxy { bridge }),
+                Arc::new(PluginBridgeFetchProxy {
+                    bridge,
+                    loader: Arc::clone(loader),
+                }),
             );
         }
     } else {
@@ -107,6 +116,83 @@ pub(crate) fn sync_custom_fetch_proxy(
             unregister_custom_fetch_proxy("github-copilot-enterprise");
         }
     }
+}
+
+pub(crate) async fn refresh_plugin_auth_state(
+    loader: &Arc<PluginLoader>,
+    auth_manager: Arc<AuthManager>,
+) -> bool {
+    let mut any_custom_fetch = false;
+    let bridges = loader.auth_bridges().await;
+    for (provider_id, bridge) in bridges {
+        match bridge.load().await {
+            Ok(result) => {
+                any_custom_fetch |= result.has_custom_fetch;
+                sync_custom_fetch_proxy(&provider_id, bridge.clone(), loader, result.has_custom_fetch);
+
+                if let Some(api_key) = result.api_key {
+                    auth_manager
+                        .set(
+                            &provider_id,
+                            AuthInfo::Api {
+                                key: api_key.clone(),
+                            },
+                        )
+                        .await;
+                    if provider_id == "github-copilot" {
+                        auth_manager
+                            .set("github-copilot-enterprise", AuthInfo::Api { key: api_key })
+                            .await;
+                    }
+                }
+            }
+            Err(error) => {
+                sync_custom_fetch_proxy(&provider_id, bridge.clone(), loader, false);
+                tracing::warn!(provider = provider_id, %error, "failed to load plugin auth");
+            }
+        }
+    }
+    any_custom_fetch
+}
+
+fn plugin_idle_timeout() -> Duration {
+    let secs = std::env::var("ROCODE_PLUGIN_IDLE_SECS")
+        .ok()
+        .or_else(|| std::env::var("OPENCODE_PLUGIN_IDLE_SECS").ok())
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(90);
+    Duration::from_secs(secs)
+}
+
+fn spawn_plugin_idle_monitor(loader: Arc<PluginLoader>) {
+    let timeout = plugin_idle_timeout();
+    if timeout.is_zero() {
+        tracing::info!("plugin idle shutdown disabled (timeout=0)");
+        return;
+    }
+    let poll = Duration::from_secs(std::cmp::max(5, std::cmp::min(30, timeout.as_secs() / 3)));
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll).await;
+            if !loader.has_live_clients().await {
+                continue;
+            }
+            if !loader.is_idle_for(timeout) {
+                continue;
+            }
+
+            let bridges = loader.auth_bridges().await;
+            for (provider_id, bridge) in bridges {
+                sync_custom_fetch_proxy(&provider_id, bridge, &loader, false);
+            }
+            loader.shutdown_all().await;
+            tracing::info!(
+                timeout_secs = timeout.as_secs(),
+                "plugin subprocesses shut down due to idleness"
+            );
+        }
+    });
 }
 
 pub struct ServerState {
@@ -162,6 +248,19 @@ impl ServerState {
                 rocode_provider::BootstrapConfig::default()
             }
         };
+
+        // Ensure models.dev cache exists before bootstrap (which reads it synchronously).
+        {
+            let registry = rocode_provider::ModelsRegistry::default();
+            match tokio::time::timeout(Duration::from_secs(10), registry.get()).await {
+                Ok(data) => {
+                    tracing::info!(providers = data.len(), "models.dev cache ready");
+                }
+                Err(_) => {
+                    tracing::warn!("timed out fetching models.dev data; built-in model list may be incomplete");
+                }
+            }
+        }
 
         state.providers = create_registry_from_bootstrap_config(&bootstrap_config, &auth_store);
         state.tool_registry = Arc::new(rocode_tool::create_default_registry().await);
@@ -375,6 +474,9 @@ async fn load_plugin_auth_store(server_url: &str, auth_manager: Arc<AuthManager>
         directory,
         server_url: server_url.to_string(),
     };
+    loader
+        .configure_bootstrap(context.clone(), config.plugin.clone(), true)
+        .await;
 
     if let Err(error) = loader.load_builtins(&context).await {
         tracing::warn!(%error, "failed to load builtin auth plugins");
@@ -387,37 +489,9 @@ async fn load_plugin_auth_store(server_url: &str, auth_manager: Arc<AuthManager>
         }
     }
 
+    let _any_custom_fetch = refresh_plugin_auth_state(&loader, auth_manager.clone()).await;
     routes::set_plugin_loader(loader.clone());
-
-    let bridges = loader.auth_bridges().await;
-    for (provider_id, bridge) in bridges {
-        match bridge.load().await {
-            Ok(result) => {
-                sync_custom_fetch_proxy(&provider_id, bridge.clone(), result.has_custom_fetch);
-
-                if let Some(api_key) = result.api_key {
-                    auth_manager
-                        .set(
-                            &provider_id,
-                            AuthInfo::Api {
-                                key: api_key.clone(),
-                            },
-                        )
-                        .await;
-                    // TS parity: copilot auth can power both standard and enterprise providers.
-                    if provider_id == "github-copilot" {
-                        auth_manager
-                            .set("github-copilot-enterprise", AuthInfo::Api { key: api_key })
-                            .await;
-                    }
-                }
-            }
-            Err(error) => {
-                sync_custom_fetch_proxy(&provider_id, bridge.clone(), false);
-                tracing::warn!(provider = provider_id, %error, "failed to load plugin auth");
-            }
-        }
-    }
+    spawn_plugin_idle_monitor(loader);
 }
 
 impl Default for ServerState {

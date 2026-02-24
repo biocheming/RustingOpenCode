@@ -169,9 +169,11 @@ pub struct OpenAIUsage {
 }
 
 fn openai_tool_call_id(tc: &OpenAIToolCall) -> String {
-    tc.id
-        .clone()
-        .unwrap_or_else(|| format!("tool-call-{}", tc.index))
+    // Always use index-based ID for consistency across stream chunks.
+    // The first chunk may carry an explicit `id` (e.g. "call_xxx") while
+    // subsequent delta chunks only have `index`, causing ID mismatches
+    // that result in orphaned tool-call entries with empty names.
+    format!("tool-call-{}", tc.index)
 }
 
 fn anthropic_tool_call_id(index: Option<u32>, explicit_id: Option<&str>) -> String {
@@ -199,19 +201,22 @@ pub fn parse_openai_sse(data: &str) -> Option<StreamEvent> {
             if let Some(tool_calls) = &delta.tool_calls {
                 for tc in tool_calls {
                     if let Some(func) = &tc.function {
-                        if let Some(name) = &func.name {
+                        // Ollama-compatible models may send empty tool names;
+                        // treat those as absent so we don't create ghost entries.
+                        let has_name = func.name.as_deref().is_some_and(|n| !n.is_empty());
+                        let has_args = func.arguments.as_deref().is_some_and(|a| !a.is_empty());
+
+                        if has_name {
                             return Some(StreamEvent::ToolCallStart {
                                 id: openai_tool_call_id(tc),
-                                name: name.clone(),
+                                name: func.name.clone().unwrap_or_default(),
                             });
                         }
-                        if let Some(args) = &func.arguments {
-                            if !args.is_empty() {
-                                return Some(StreamEvent::ToolCallDelta {
-                                    id: openai_tool_call_id(tc),
-                                    input: args.clone(),
-                                });
-                            }
+                        if has_args {
+                            return Some(StreamEvent::ToolCallDelta {
+                                id: openai_tool_call_id(tc),
+                                input: func.arguments.clone().unwrap_or_default(),
+                            });
                         }
                     }
                 }
@@ -396,6 +401,44 @@ mod tests {
             StreamEvent::ToolCallDelta { id, input } => {
                 assert_eq!(id, "tool-call-3");
                 assert_eq!(input, "{\"cmd\":\"ls\"}");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_openai_sse_skips_empty_tool_name() {
+        // Ollama models sometimes send an empty tool name string.
+        let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":""}}]}}]}"#;
+        let event = parse_openai_sse(data);
+        assert!(event.is_none(), "empty tool name should be ignored");
+    }
+
+    #[test]
+    fn parse_openai_sse_skips_null_tool_name_emits_args() {
+        // When name is absent but arguments are present, emit ToolCallDelta.
+        let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"path\":\".\"}"}}]}}]}"#;
+        let event = parse_openai_sse(data).expect("event should parse");
+        match event {
+            StreamEvent::ToolCallDelta { id, input } => {
+                assert_eq!(id, "tool-call-1");
+                assert_eq!(input, r#"{"path":"."}"#);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_openai_sse_ignores_explicit_id_for_consistent_tool_call_ids() {
+        // When the first chunk has an explicit id like "call_xxx", we still
+        // use the index-based ID so that subsequent delta chunks (which lack
+        // the explicit id) produce matching IDs.
+        let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc123","function":{"name":"read"}}]}}]}"#;
+        let event = parse_openai_sse(data).expect("event should parse");
+        match event {
+            StreamEvent::ToolCallStart { id, name } => {
+                assert_eq!(id, "tool-call-0", "should use index, not explicit id");
+                assert_eq!(name, "read");
             }
             other => panic!("unexpected event: {:?}", other),
         }

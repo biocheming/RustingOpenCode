@@ -122,7 +122,7 @@ impl CommandPalette {
             Command {
                 action: CommandAction::ToggleToolDetails,
                 title: "Toggle tool details".to_string(),
-                keybind: None,
+                keybind: Some("ctrl+o".to_string()),
                 category: "View".to_string(),
             },
             Command {

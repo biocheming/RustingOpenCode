@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::protocol::{RpcError, RpcRequest, RpcResponse};
@@ -152,13 +152,20 @@ impl PluginSubprocess {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // plugin logs go to parent stderr
+            // Capture stderr so we can log it without corrupting TUI rendering.
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
 
         let mut child = cmd.spawn()?;
+        if let Some(stderr) = child.stderr.take() {
+            let plugin_label = plugin_path.to_string();
+            tokio::spawn(async move {
+                log_plugin_stderr(plugin_label, stderr).await;
+            });
+        }
 
         let stdin = child
             .stdin
@@ -506,5 +513,27 @@ impl PluginSubprocess {
         reader.read_exact(&mut buf).await?;
         let value: Value = serde_json::from_slice(&buf)?;
         Ok(value)
+    }
+}
+
+async fn log_plugin_stderr(plugin_path: String, stderr: ChildStderr) {
+    let mut reader = BufReader::new(stderr);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let msg = line.trim_end();
+                if !msg.is_empty() {
+                    tracing::debug!(plugin = %plugin_path, message = %msg, "plugin stderr");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(plugin = %plugin_path, %error, "failed to read plugin stderr");
+                break;
+            }
+        }
     }
 }

@@ -9,6 +9,7 @@
 - CLI 入口：`docs/rocode-cli.md`
 - TUI 入口：`docs/rocode-tui.md`
 - 服务端入口：`docs/rocode-server.md`
+- 插件与 Skill 示例：`docs/plugins_example/`
 
 ## 模块文档
 

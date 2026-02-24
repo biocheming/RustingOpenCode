@@ -3090,6 +3090,11 @@ impl App {
         } else {
             session_ctx.revert.remove(session_id);
         }
+        if let Ok(status_map) = client.get_session_status() {
+            if let Some(status) = status_map.get(session_id) {
+                session_ctx.set_status(session_id, map_api_run_status(status));
+            }
+        }
         drop(session_ctx);
 
         self.last_session_sync = Instant::now();

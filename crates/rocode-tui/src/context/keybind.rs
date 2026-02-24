@@ -175,7 +175,6 @@ impl KeybindRegistry {
         self.register("model_cycle", Keybind::ctrl(KeyCode::Char('m')));
         self.register("variant_cycle", Keybind::ctrl(KeyCode::Char('v')));
 
-        self.register("session_parent", Keybind::ctrl(KeyCode::Char('o')));
         self.register("session_child_cycle", Keybind::ctrl(KeyCode::Char('j')));
         self.register(
             "session_child_cycle_reverse",
@@ -187,6 +186,7 @@ impl KeybindRegistry {
 
         self.register("sidebar_toggle", Keybind::ctrl(KeyCode::Char('s')));
         self.register("help_toggle", Keybind::ctrl(KeyCode::Char('h')));
+        self.register("tool_details", Keybind::ctrl(KeyCode::Char('o')));
 
         self.register("editor_open", Keybind::ctrl(KeyCode::Char('e')));
 

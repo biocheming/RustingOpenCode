@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use glob::Pattern;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -154,11 +154,14 @@ impl Tool for LsTool {
 
         let mut files: Vec<String> = Vec::new();
         for entry in WalkDir::new(&base_dir)
-            .follow_links(true)
+            .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            let rel_path = entry.path().strip_prefix(&base_dir).unwrap_or(entry.path());
+            let Ok(rel_path) = entry.path().strip_prefix(&base_dir) else {
+                // Skip entries outside the requested directory (e.g. followed symlinks).
+                continue;
+            };
             let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
             if rel_str.is_empty() {
@@ -180,99 +183,9 @@ impl Tool for LsTool {
             }
         }
 
-        let mut dirs: HashSet<String> = HashSet::new();
-        let mut files_by_dir: HashMap<String, Vec<String>> = HashMap::new();
+        files.sort();
 
-        for file in &files {
-            let dir = Path::new(file)
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| ".".to_string());
-
-            let parts: Vec<&str> = if dir == "." {
-                vec![]
-            } else {
-                dir.split('/').collect()
-            };
-
-            for i in 0..=parts.len() {
-                let dir_path = if i == 0 {
-                    ".".to_string()
-                } else {
-                    parts[..i].join("/")
-                };
-                dirs.insert(dir_path);
-            }
-
-            let file_name = Path::new(file)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| file.clone());
-
-            files_by_dir.entry(dir).or_default().push(file_name);
-        }
-
-        fn render_dir(
-            dir_path: &str,
-            depth: usize,
-            dirs: &HashSet<String>,
-            files_by_dir: &HashMap<String, Vec<String>>,
-        ) -> String {
-            let indent = "  ".repeat(depth);
-            let mut output = String::new();
-
-            if depth > 0 {
-                let name = Path::new(dir_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| dir_path.to_string());
-                output.push_str(&format!("{}{}/\n", indent, name));
-            }
-
-            let child_indent = "  ".repeat(depth + 1);
-
-            let parent_prefix = if dir_path == "." {
-                String::new()
-            } else {
-                format!("{}/", dir_path)
-            };
-
-            let mut children: Vec<String> = dirs
-                .iter()
-                .filter(|d| {
-                    let d_str = d.as_str();
-                    if d_str == dir_path {
-                        return false;
-                    }
-                    if dir_path == "." {
-                        !d_str.contains('/')
-                    } else {
-                        d_str.starts_with(&parent_prefix)
-                            && d_str[parent_prefix.len()..].matches('/').count() == 0
-                    }
-                })
-                .cloned()
-                .collect();
-            children.sort();
-
-            for child in &children {
-                output.push_str(&render_dir(child, depth + 1, dirs, files_by_dir));
-            }
-
-            let mut files = files_by_dir.get(dir_path).cloned().unwrap_or_default();
-            files.sort();
-            for file in files {
-                output.push_str(&format!("{}{}\n", child_indent, file));
-            }
-
-            output
-        }
-
-        let output = format!(
-            "{}/\n{}",
-            base_dir.display(),
-            render_dir(".", 0, &dirs, &files_by_dir)
-        );
+        let output = format!("{}/\n{}", base_dir.display(), files.join("\n"));
 
         let title = match base_dir.strip_prefix(Path::new(&ctx.worktree)) {
             Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),

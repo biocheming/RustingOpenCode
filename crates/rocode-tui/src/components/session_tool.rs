@@ -19,6 +19,12 @@ pub enum ToolState {
 /// Threshold: tool results longer than this are "block" tools with expandable output
 const BLOCK_RESULT_THRESHOLD: usize = 3;
 
+#[derive(Debug, Clone, Default)]
+struct ReadSummary {
+    size_bytes: Option<usize>,
+    total_lines: Option<usize>,
+}
+
 /// Map tool name to a semantic glyph
 pub fn tool_glyph(name: &str) -> &'static str {
     match name {
@@ -54,6 +60,29 @@ fn is_block_tool(name: &str, result: Option<&(String, bool)>) -> bool {
     }
 }
 
+fn is_read_tool(normalized_name: &str) -> bool {
+    matches!(normalized_name, "read" | "readfile" | "read_file")
+}
+
+fn is_list_tool(normalized_name: &str) -> bool {
+    matches!(
+        normalized_name,
+        "ls" | "list" | "listdir" | "list_dir" | "list_directory"
+    )
+}
+
+fn split_list_output<'a>(lines: &'a [&'a str]) -> (Option<&'a str>, Vec<&'a str>) {
+    if lines.is_empty() {
+        return (None, Vec::new());
+    }
+    let first = lines[0].trim();
+    if first.starts_with('/') && first.ends_with('/') {
+        (Some(first), lines[1..].to_vec())
+    } else {
+        (None, lines.to_vec())
+    }
+}
+
 /// Render a single tool call as lines (inline or block style)
 pub fn render_tool_call(
     id: &str,
@@ -71,6 +100,17 @@ pub fn render_tool_call(
     let result = tool_results.get(id);
     let block_mode = is_block_tool(name, result);
     let normalized = normalize_tool_name(name);
+    let read_summary = if is_read_tool(&normalized) {
+        result.and_then(|(result_text, is_error)| {
+            if *is_error {
+                None
+            } else {
+                Some(parse_read_summary(result_text))
+            }
+        })
+    } else {
+        None
+    };
 
     let glyph = tool_glyph(name);
     let is_denied =
@@ -94,6 +134,14 @@ pub fn render_tool_call(
                 format!("  {}", argument_preview),
                 Style::default().fg(theme.text_muted).bg(bg),
             ));
+        }
+        if let Some(summary) = read_summary.as_ref() {
+            if let Some(compact) = format_read_summary(summary) {
+                main_spans.push(Span::styled(
+                    format!("  [{}]", compact),
+                    Style::default().fg(theme.text_muted).bg(bg),
+                ));
+            }
         }
 
         if is_denied {
@@ -130,23 +178,48 @@ pub fn render_tool_call(
                         ));
                     }
                 }
+            } else if is_read_tool(&normalized) {
+                // Read output is very large and noisy; keep it summarized in the header only.
             } else if show_tool_details {
                 let output_lines = result_text.lines().collect::<Vec<_>>();
-                let line_count = output_lines.len();
-                let preview_limit = if normalized == "bash" || normalized == "shell" {
+                let (list_root, list_entries) = if is_list_tool(&normalized) {
+                    split_list_output(&output_lines)
+                } else {
+                    (None, output_lines.clone())
+                };
+                let line_count = list_entries.len();
+                let mut preview_limit = if normalized == "bash" || normalized == "shell" {
                     10usize
+                } else if is_list_tool(&normalized) {
+                    40usize
                 } else {
                     6usize
                 };
+                if line_count.saturating_sub(preview_limit) <= 2 {
+                    preview_limit = line_count;
+                }
+
+                if let Some(root) = list_root {
+                    lines.push(block_content_line(
+                        format!("Directory {}", root),
+                        Style::default().fg(theme.info),
+                        theme,
+                        bg,
+                    ));
+                }
 
                 lines.push(block_content_line(
-                    format!("({} lines of output)", line_count),
+                    if is_list_tool(&normalized) {
+                        format!("({} files)", line_count)
+                    } else {
+                        format!("({} lines of output)", line_count)
+                    },
                     Style::default().fg(theme.text_muted),
                     theme,
                     bg,
                 ));
 
-                for line in output_lines.iter().take(preview_limit) {
+                for line in list_entries.iter().take(preview_limit) {
                     lines.push(block_content_line(
                         format_preview_line(line, 96),
                         Style::default().fg(theme.text),
@@ -566,6 +639,51 @@ fn format_primitive_arguments(
     }
 }
 
+fn parse_read_summary(result_text: &str) -> ReadSummary {
+    let mut summary = ReadSummary::default();
+    for line in result_text.lines() {
+        if summary.size_bytes.is_none() {
+            summary.size_bytes = extract_tag_value(line, "size").and_then(|v| v.parse().ok());
+        }
+        if summary.total_lines.is_none() {
+            summary.total_lines =
+                extract_tag_value(line, "total-lines").and_then(|v| v.parse().ok());
+        }
+        if summary.size_bytes.is_some() && summary.total_lines.is_some() {
+            break;
+        }
+    }
+    summary
+}
+
+fn format_read_summary(summary: &ReadSummary) -> Option<String> {
+    match (summary.size_bytes, summary.total_lines) {
+        (Some(size), Some(lines)) => Some(format!("{}, {} lines", format_bytes(size), lines)),
+        (Some(size), None) => Some(format_bytes(size)),
+        (None, Some(lines)) => Some(format!("{} lines", lines)),
+        (None, None) => None,
+    }
+}
+
+fn extract_tag_value<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    let start_tag = format!("<{}>", tag);
+    let end_tag = format!("</{}>", tag);
+    let content = line.strip_prefix(start_tag.as_str())?;
+    content.strip_suffix(end_tag.as_str())
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else if bytes as f64 >= KB {
+        format!("{:.1} KB", bytes as f64 / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn is_denied_result(result_text: &str) -> bool {
     let lower = result_text.to_ascii_lowercase();
     lower.contains("permission denied")
@@ -585,7 +703,7 @@ fn format_preview_line(line: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_argument_preview;
+    use super::{format_read_summary, parse_read_summary, tool_argument_preview};
 
     #[test]
     fn list_tool_preview_shows_path() {
@@ -609,5 +727,15 @@ mod tests {
     fn apply_patch_preview_hides_patch_body() {
         let preview = tool_argument_preview("apply_patch", "*** Begin Patch\n...");
         assert_eq!(preview.as_deref(), Some("Patch"));
+    }
+
+    #[test]
+    fn parse_read_summary_from_tool_output_tags() {
+        let output = "<path>/tmp/a.txt</path>\n<size>4096</size>\n<total-lines>256</total-lines>\n<content>...</content>";
+        let summary = parse_read_summary(output);
+        assert_eq!(
+            format_read_summary(&summary).as_deref(),
+            Some("4.0 KB, 256 lines")
+        );
     }
 }
