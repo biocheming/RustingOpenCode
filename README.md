@@ -7,8 +7,8 @@ RustingOpenCode（简称 ROCode）是 OpenCode 的 Rust 实现与演进版本，
 ## 当前状态
 
 - 品牌名：`RustingOpenCode` / `ROCode`
-- 版本标识：`2026.02.23`
-- 可执行命令：`opencode`（为兼容历史工作流保留）
+- 版本标识：`2026.02.24`
+- 可执行命令：`rocode`
 
 ## 功能概览
 
@@ -30,19 +30,19 @@ RustingOpenCode（简称 ROCode）是 OpenCode 的 Rust 实现与演进版本，
 ### 2. 构建
 
 ```bash
-cargo build -p opencode-cli
+cargo build -p rocode-cli
 ```
 
 ### 3. 查看帮助
 
 ```bash
-./target/debug/opencode --help
+./target/debug/rocode --help
 ```
 
 或
 
 ```bash
-cargo run -p opencode-cli -- --help
+cargo run -p rocode-cli -- --help
 ```
 
 ### 4. 启动方式
@@ -50,30 +50,30 @@ cargo run -p opencode-cli -- --help
 - 默认进入 TUI：
 
 ```bash
-cargo run -p opencode-cli --
+cargo run -p rocode-cli --
 ```
 
 - 显式进入 TUI：
 
 ```bash
-cargo run -p opencode-cli -- tui
+cargo run -p rocode-cli -- tui
 ```
 
 - 非交互运行：
 
 ```bash
-cargo run -p opencode-cli -- run "请检查这个仓库中的风险点"
+cargo run -p rocode-cli -- run "请检查这个仓库中的风险点"
 ```
 
 - 启动 HTTP 服务：
 
 ```bash
-cargo run -p opencode-cli -- serve --port 3000 --hostname 127.0.0.1
+cargo run -p rocode-cli -- serve --port 3000 --hostname 127.0.0.1
 ```
 
 ## CLI 命令总览
 
-以下命令来自当前 `opencode --help`：
+以下命令来自当前 `rocode --help`：
 
 - `tui`：启动交互式终端界面
 - `attach`：附加到已运行的服务
@@ -99,10 +99,10 @@ cargo run -p opencode-cli -- serve --port 3000 --hostname 127.0.0.1
 常用帮助：
 
 ```bash
-opencode tui --help
-opencode run --help
-opencode serve --help
-opencode session --help
+rocode tui --help
+rocode run --help
+rocode serve --help
+rocode session --help
 ```
 
 ## 配置
@@ -118,20 +118,20 @@ opencode session --help
 
 - Linux/macOS：`~/.config/opencode/opencode.jsonc`（或 `.json`）
 
-参考：`docs/opencode-config.md`
+参考：`docs/rocode-config.md`
 
 ## 仓库结构
 
-- `crates/opencode-cli`：CLI 入口（binary: `opencode`）
-- `crates/opencode-server`：HTTP/SSE/WebSocket 服务
-- `crates/opencode-tui`：终端 UI
-- `crates/opencode-session`：会话与消息
-- `crates/opencode-tool`：工具注册与执行
-- `crates/opencode-provider`：模型 Provider 适配
-- `crates/opencode-plugin`：插件系统与子进程桥接
-- `crates/opencode-mcp`：MCP 客户端与注册
-- `crates/opencode-lsp`：LSP 支持
-- `crates/opencode-storage`：SQLite 存储
+- `crates/rocode-cli`：CLI 入口（binary: `rocode`）
+- `crates/rocode-server`：HTTP/SSE/WebSocket 服务
+- `crates/rocode-tui`：终端 UI
+- `crates/rocode-session`：会话与消息
+- `crates/rocode-tool`：工具注册与执行
+- `crates/rocode-provider`：模型 Provider 适配
+- `crates/rocode-plugin`：插件系统与子进程桥接
+- `crates/rocode-mcp`：MCP 客户端与注册
+- `crates/rocode-lsp`：LSP 支持
+- `crates/rocode-storage`：SQLite 存储
 
 ## 开发与验证
 
@@ -144,21 +144,21 @@ cargo clippy --workspace --all-targets
 最小验证（常用）：
 
 ```bash
-cargo check -p opencode-cli
-cargo check -p opencode-tui
+cargo check -p rocode-cli
+cargo check -p rocode-tui
 ```
 
 ## 文档导航
 
 - 用户指南：`USER_GUIDE.md`
 - 文档索引：`docs/README.md`
-- CLI：`docs/opencode-cli.md`
-- TUI：`docs/opencode-tui.md`
-- Server：`docs/opencode-server.md`
-- Tool：`docs/opencode-tool.md`
-- Provider：`docs/opencode-provider.md`
-- Config：`docs/opencode-config.md`
+- CLI：`docs/rocode-cli.md`
+- TUI：`docs/rocode-tui.md`
+- Server：`docs/rocode-server.md`
+- Tool：`docs/rocode-tool.md`
+- Provider：`docs/rocode-provider.md`
+- Config：`docs/rocode-config.md`
 
 ## 说明
 
-- 目前命令名仍为 `opencode`，后续如切换为 `rocode`，会在文档和发布说明中同步更新。
+- 当前默认命令名为 `rocode`。

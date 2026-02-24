@@ -1,29 +1,29 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/opencode-core",
-    "crates/opencode-types",
-    "crates/opencode-util",
-    "crates/opencode-config",
-    "crates/opencode-grep",
-    "crates/opencode-permission",
-    "crates/opencode-provider",
-    "crates/opencode-session",
-    "crates/opencode-storage",
-    "crates/opencode-tool",
-    "crates/opencode-agent",
-    "crates/opencode-server",
-    "crates/opencode-watcher",
-    "crates/opencode-lsp",
-    "crates/opencode-mcp",
-    "crates/opencode-cli",
-    "crates/opencode-command",
-    "crates/opencode-plugin",
-    "crates/opencode-tui",
+    "crates/rocode-core",
+    "crates/rocode-types",
+    "crates/rocode-util",
+    "crates/rocode-config",
+    "crates/rocode-grep",
+    "crates/rocode-permission",
+    "crates/rocode-provider",
+    "crates/rocode-session",
+    "crates/rocode-storage",
+    "crates/rocode-tool",
+    "crates/rocode-agent",
+    "crates/rocode-server",
+    "crates/rocode-watcher",
+    "crates/rocode-lsp",
+    "crates/rocode-mcp",
+    "crates/rocode-cli",
+    "crates/rocode-command",
+    "crates/rocode-plugin",
+    "crates/rocode-tui",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "2026.2.24"
 edition = "2021"
 authors = ["OpenCode Team"]
 license = "MIT"

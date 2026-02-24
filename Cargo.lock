@@ -2119,440 +2119,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opencode-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "opencode-config",
- "opencode-core",
- "opencode-permission",
- "opencode-plugin",
- "opencode-provider",
- "opencode-tool",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "opencode-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "dirs",
- "futures",
- "opencode-agent",
- "opencode-command",
- "opencode-config",
- "opencode-core",
- "opencode-grep",
- "opencode-lsp",
- "opencode-permission",
- "opencode-plugin",
- "opencode-provider",
- "opencode-server",
- "opencode-session",
- "opencode-storage",
- "opencode-tool",
- "opencode-tui",
- "opencode-types",
- "opencode-util",
- "reqwest",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "which",
-]
-
-[[package]]
-name = "opencode-command"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "glob",
- "opencode-plugin",
- "regex",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "opencode-config"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs",
- "jsonc-parser",
- "opencode-core",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "opencode-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hex",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "opencode-grep"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "opencode-core",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "walkdir",
-]
-
-[[package]]
-name = "opencode-lsp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "lsp-types",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "opencode-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "chrono",
- "dirs",
- "futures",
- "hex",
- "oauth2",
- "opencode-core",
- "rand 0.8.5",
- "reqwest",
- "reqwest-eventsource",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "opencode-permission"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs",
- "glob",
- "lazy_static",
- "opencode-core",
- "opencode-plugin",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "opencode-plugin"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "dirs",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "which",
-]
-
-[[package]]
-name = "opencode-provider"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "dirs",
- "futures",
- "hex",
- "hmac",
- "once_cell",
- "opencode-core",
- "pin-project-lite",
- "regex",
- "reqwest",
- "reqwest-eventsource",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tracing",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
-name = "opencode-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "axum-extra",
- "chrono",
- "dirs",
- "futures",
- "once_cell",
- "opencode-agent",
- "opencode-config",
- "opencode-core",
- "opencode-mcp",
- "opencode-plugin",
- "opencode-provider",
- "opencode-session",
- "opencode-storage",
- "opencode-types",
- "portable-pty",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite 0.26.2",
- "tower",
- "tower-http",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "opencode-session"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "dirs",
- "futures",
- "glob",
- "opencode-core",
- "opencode-lsp",
- "opencode-mcp",
- "opencode-plugin",
- "opencode-provider",
- "opencode-storage",
- "opencode-tool",
- "opencode-types",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "opencode-storage"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dirs",
- "opencode-core",
- "opencode-types",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "opencode-tool"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-process",
- "async-trait",
- "base64",
- "chrono",
- "content_inspector",
- "dirs",
- "futures",
- "glob",
- "html2md",
- "lsp-types",
- "opencode-config",
- "opencode-core",
- "opencode-grep",
- "opencode-lsp",
- "opencode-permission",
- "opencode-plugin",
- "opencode-util",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "tree-sitter",
- "tree-sitter-bash",
- "urlencoding",
- "uuid",
- "walkdir",
- "which",
-]
-
-[[package]]
-name = "opencode-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "atty",
- "base64",
- "chrono",
- "crossterm",
- "dirs",
- "futures",
- "nucleo-matcher",
- "once_cell",
- "opencode-agent",
- "opencode-config",
- "opencode-core",
- "opencode-mcp",
- "opencode-provider",
- "opencode-session",
- "opencode-tool",
- "opencode-util",
- "parking_lot",
- "pulldown-cmark",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "similar",
- "syntect",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tracing",
- "unicode-width 0.1.14",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "opencode-types"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "opencode-util"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "glob",
- "notify",
- "opencode-core",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "walkdir",
-]
-
-[[package]]
-name = "opencode-watcher"
-version = "0.1.0"
-dependencies = [
- "dashmap",
- "glob",
- "notify",
- "parking_lot",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "openssl"
 version = "0.10.75"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3127,6 +2693,441 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rocode-agent"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "rocode-config",
+ "rocode-core",
+ "rocode-permission",
+ "rocode-plugin",
+ "rocode-provider",
+ "rocode-tool",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rocode-cli"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs",
+ "futures",
+ "reqwest",
+ "rocode-agent",
+ "rocode-command",
+ "rocode-config",
+ "rocode-core",
+ "rocode-grep",
+ "rocode-lsp",
+ "rocode-permission",
+ "rocode-plugin",
+ "rocode-provider",
+ "rocode-server",
+ "rocode-session",
+ "rocode-storage",
+ "rocode-tool",
+ "rocode-tui",
+ "rocode-types",
+ "rocode-util",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "which",
+]
+
+[[package]]
+name = "rocode-command"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "glob",
+ "regex",
+ "rocode-plugin",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rocode-config"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "jsonc-parser",
+ "regex",
+ "reqwest",
+ "rocode-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "rocode-core"
+version = "2026.2.24"
+dependencies = [
+ "chrono",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rocode-grep"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "regex",
+ "rocode-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "walkdir",
+]
+
+[[package]]
+name = "rocode-lsp"
+version = "2026.2.24"
+dependencies = [
+ "async-trait",
+ "futures",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "rocode-mcp"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "chrono",
+ "dirs",
+ "futures",
+ "hex",
+ "oauth2",
+ "rand 0.8.5",
+ "reqwest",
+ "reqwest-eventsource",
+ "rocode-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "rocode-permission"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "glob",
+ "lazy_static",
+ "rocode-core",
+ "rocode-plugin",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "rocode-plugin"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dirs",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "which",
+]
+
+[[package]]
+name = "rocode-provider"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dirs",
+ "futures",
+ "hex",
+ "hmac",
+ "once_cell",
+ "pin-project-lite",
+ "regex",
+ "reqwest",
+ "reqwest-eventsource",
+ "rocode-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "rocode-server"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "axum-extra",
+ "chrono",
+ "dirs",
+ "futures",
+ "once_cell",
+ "portable-pty",
+ "rocode-agent",
+ "rocode-config",
+ "rocode-core",
+ "rocode-mcp",
+ "rocode-plugin",
+ "rocode-provider",
+ "rocode-session",
+ "rocode-storage",
+ "rocode-tool",
+ "rocode-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.26.2",
+ "tower",
+ "tower-http",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rocode-session"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "dirs",
+ "futures",
+ "glob",
+ "regex",
+ "reqwest",
+ "rocode-core",
+ "rocode-lsp",
+ "rocode-mcp",
+ "rocode-plugin",
+ "rocode-provider",
+ "rocode-storage",
+ "rocode-tool",
+ "rocode-types",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "rocode-storage"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "rocode-core",
+ "rocode-types",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rocode-tool"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "async-process",
+ "async-trait",
+ "base64",
+ "chrono",
+ "content_inspector",
+ "dirs",
+ "futures",
+ "glob",
+ "html2md",
+ "lsp-types",
+ "regex",
+ "reqwest",
+ "rocode-config",
+ "rocode-core",
+ "rocode-grep",
+ "rocode-lsp",
+ "rocode-permission",
+ "rocode-plugin",
+ "rocode-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "urlencoding",
+ "uuid",
+ "walkdir",
+ "which",
+]
+
+[[package]]
+name = "rocode-tui"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "atty",
+ "base64",
+ "chrono",
+ "crossterm",
+ "dirs",
+ "futures",
+ "nucleo-matcher",
+ "once_cell",
+ "parking_lot",
+ "pulldown-cmark",
+ "ratatui",
+ "reqwest",
+ "rocode-agent",
+ "rocode-config",
+ "rocode-core",
+ "rocode-mcp",
+ "rocode-provider",
+ "rocode-session",
+ "rocode-tool",
+ "rocode-util",
+ "serde",
+ "serde_json",
+ "similar",
+ "syntect",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "unicode-width 0.1.14",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "rocode-types"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "rocode-util"
+version = "2026.2.24"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "glob",
+ "notify",
+ "regex",
+ "rocode-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "walkdir",
+]
+
+[[package]]
+name = "rocode-watcher"
+version = "2026.2.24"
+dependencies = [
+ "dashmap",
+ "glob",
+ "notify",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

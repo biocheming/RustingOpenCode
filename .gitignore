@@ -1,9 +1,11 @@
 /target
+target/
 *.swp
 *.swo
 *~
 .DS_Store
 
 /vendor/
+/.cargo/
 /.cargo/config.toml
 /.cargo/config.toml.bak
