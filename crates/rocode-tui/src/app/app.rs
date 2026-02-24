@@ -16,9 +16,9 @@ use crate::app::state::AppState;
 use crate::app::terminal;
 use crate::command::CommandAction;
 use crate::components::{
-    Agent, AgentSelectDialog, AlertDialog, CommandPalette, ForkDialog, ForkEntry, HelpDialog,
-    HomeView, McpDialog, McpItem, Model, ModelSelectDialog, PermissionAction, PermissionPrompt,
-    Prompt, PromptStashDialog, ProviderDialog, QuestionPrompt,
+    exit_logo_lines, Agent, AgentSelectDialog, AlertDialog, CommandPalette, ForkDialog, ForkEntry,
+    HelpDialog, HomeView, McpDialog, McpItem, Model, ModelSelectDialog, PermissionAction,
+    PermissionPrompt, Prompt, PromptStashDialog, ProviderDialog, QuestionPrompt,
     SessionDeleteState, SessionExportDialog, SessionItem, SessionListDialog, SessionRenameDialog,
     SessionView, SkillListDialog, SlashCommandPopup, StashItem, StatusDialog, StatusLine,
     SubagentDialog, TagDialog, TaskKind, ThemeListDialog, ThemeOption, TimelineDialog,
@@ -31,11 +31,14 @@ use crate::context::{
 };
 use crate::event::{CustomEvent, Event, StateChange};
 use crate::router::Route;
-use crate::ui::{Clipboard, Selection};
+use crate::ui::{line_from_cells, strip_session_gutter, truncate, Clipboard, Selection};
 
 // TS parity: renderer targetFps is 60, ~16ms frame budget.
 const TICK_RATE_MS: u64 = 16;
 const MAX_EVENTS_PER_FRAME: usize = 256;
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_DIM: &str = "\x1b[90m";
+const ANSI_BOLD: &str = "\x1b[1m";
 
 pub struct App {
     context: Arc<AppContext>,
@@ -302,6 +305,33 @@ impl App {
 
         terminal::restore()?;
         Ok(())
+    }
+
+    pub fn exit_summary(&self) -> Option<String> {
+        let Route::Session { session_id } = self.context.current_route() else {
+            return None;
+        };
+        let session_ctx = self.context.session.read();
+        let session = session_ctx.sessions.get(&session_id)?;
+        let title = truncate(&session.title.replace(['\r', '\n'], " "), 50);
+        let pad_label = |label: &str| format!("{ANSI_DIM}{:<10}{ANSI_RESET}", label);
+
+        let mut lines = Vec::new();
+        lines.push(String::new());
+        lines.extend(exit_logo_lines("  "));
+        lines.push(String::new());
+        lines.push(format!(
+            "  {}{ANSI_BOLD}{}{ANSI_RESET}",
+            pad_label("Session"),
+            title
+        ));
+        lines.push(format!(
+            "  {}{ANSI_BOLD}rocode -s {}{ANSI_RESET}",
+            pad_label("Continue"),
+            session.id
+        ));
+        lines.push(String::new());
+        Some(lines.join("\n"))
     }
 
     fn handle_event(&mut self, event: &Event) -> anyhow::Result<()> {
@@ -1820,9 +1850,12 @@ impl App {
             return;
         }
         let lines = self.screen_lines.clone();
-        let text = self
+        let mut text = self
             .selection
             .get_selected_text(|row| lines.get(row as usize).cloned());
+        if matches!(self.context.current_route(), Route::Session { .. }) {
+            text = strip_session_gutter(&text);
+        }
         if !text.is_empty() {
             match Clipboard::write_text(&text) {
                 Ok(()) => {
@@ -2087,6 +2120,7 @@ impl App {
                             MessageRole::User => "user",
                             MessageRole::Assistant => "assistant",
                             MessageRole::System => "system",
+                            MessageRole::Tool => "tool",
                         };
                         let preview = m
                             .content
@@ -2125,6 +2159,7 @@ impl App {
                             MessageRole::User => "user",
                             MessageRole::Assistant => "assistant",
                             MessageRole::System => "system",
+                            MessageRole::Tool => "tool",
                         };
                         let preview = m
                             .content
@@ -2167,6 +2202,7 @@ impl App {
                 MessageRole::User => "User",
                 MessageRole::Assistant => "Assistant",
                 MessageRole::System => "System",
+                MessageRole::Tool => "Tool",
             };
             output.push_str(&format!("## {}\n\n", role));
             if message.content.trim().is_empty() {
@@ -3121,6 +3157,7 @@ impl App {
             MessageRole::User => TaskKind::LlmRequest,
             MessageRole::Assistant => infer_task_kind_from_message(last_message),
             MessageRole::System => TaskKind::LlmResponse,
+            MessageRole::Tool => TaskKind::ToolCall,
         }
     }
 
@@ -3269,11 +3306,8 @@ impl App {
             let buf = frame.buffer_mut();
             captured_lines.clear();
             for y in area.y..area.y + area.height {
-                let mut line = String::with_capacity(area.width as usize);
-                for x in area.x..area.x + area.width {
-                    let cell = buf.get(x, y);
-                    line.push_str(cell.symbol());
-                }
+                let line =
+                    line_from_cells((area.x..area.x + area.width).map(|x| buf.get(x, y).symbol()));
                 let trimmed = line.trim_end().to_string();
                 captured_lines.push(trimmed);
             }
@@ -3354,6 +3388,7 @@ fn map_api_message(message: &MessageInfo) -> Message {
         role: match message.role.as_str() {
             "assistant" => MessageRole::Assistant,
             "system" => MessageRole::System,
+            "tool" => MessageRole::Tool,
             _ => MessageRole::User,
         },
         content: parts
@@ -3488,7 +3523,7 @@ fn infer_task_kind_from_message(message: &Message) -> TaskKind {
 }
 
 fn task_kind_from_tool_name(name: &str) -> TaskKind {
-    let normalized = name.trim().to_ascii_lowercase();
+    let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
     if normalized.is_empty() {
         return TaskKind::ToolCall;
     }
@@ -3497,6 +3532,7 @@ fn task_kind_from_tool_name(name: &str) -> TaskKind {
         || normalized.contains("grep")
         || normalized.contains("glob")
         || normalized.contains("list")
+        || normalized == "ls"
     {
         return TaskKind::FileRead;
     }

@@ -39,6 +39,7 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
+    Tool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

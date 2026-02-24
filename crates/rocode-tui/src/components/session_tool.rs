@@ -202,6 +202,17 @@ pub fn render_tool_call(
                         Style::default().fg(theme.text_muted),
                     ));
                 }
+            } else if let Some(first_line) =
+                result_text.lines().find(|line| !line.trim().is_empty())
+            {
+                main_spans.push(Span::styled(
+                    format!(
+                        " — {} (+{} lines)",
+                        format_preview_line(first_line, 72),
+                        line_count.saturating_sub(1)
+                    ),
+                    Style::default().fg(theme.text_muted),
+                ));
             }
         }
     }
@@ -285,6 +296,7 @@ fn normalize_tool_name(name: &str) -> String {
 fn tool_argument_preview(normalized_name: &str, arguments: &str) -> Option<String> {
     let raw = arguments.trim();
     let parsed = serde_json::from_str::<Value>(raw).ok();
+    let object = parsed.as_ref().and_then(|v| v.as_object());
 
     if normalized_name == "bash" || normalized_name == "shell" {
         let command = parsed
@@ -302,6 +314,16 @@ fn tool_argument_preview(normalized_name: &str, arguments: &str) -> Option<Strin
 
     if matches!(
         normalized_name,
+        "list" | "ls" | "listdir" | "list_dir" | "list_directory"
+    ) {
+        if let Some(path) = parsed.as_ref().and_then(extract_path) {
+            return Some(format!("→ {}", path));
+        }
+        return Some("→ .".to_string());
+    }
+
+    if matches!(
+        normalized_name,
         "write" | "writefile" | "write_file" | "edit" | "editfile" | "edit_file"
     ) {
         if let Some(path) = parsed.as_ref().and_then(extract_path) {
@@ -309,8 +331,145 @@ fn tool_argument_preview(normalized_name: &str, arguments: &str) -> Option<Strin
         }
     }
 
+    if normalized_name == "glob" {
+        if let Some(pattern) = parsed
+            .as_ref()
+            .and_then(|value| extract_string_key(value, &["pattern"]))
+        {
+            let target = parsed.as_ref().and_then(extract_path);
+            return Some(match target {
+                Some(path) => format!("\"{}\" in {}", pattern, path),
+                None => format!("\"{}\"", pattern),
+            });
+        }
+    }
+
+    if normalized_name == "grep" {
+        if let Some(pattern) = parsed
+            .as_ref()
+            .and_then(|value| extract_string_key(value, &["pattern", "query"]))
+        {
+            let target = parsed.as_ref().and_then(extract_path);
+            return Some(match target {
+                Some(path) => format!("\"{}\" in {}", pattern, path),
+                None => format!("\"{}\"", pattern),
+            });
+        }
+    }
+
+    if matches!(normalized_name, "webfetch" | "web_fetch") {
+        if let Some(url) = parsed
+            .as_ref()
+            .and_then(|value| extract_string_key(value, &["url"]))
+        {
+            return Some(url);
+        }
+    }
+
+    if matches!(
+        normalized_name,
+        "codesearch" | "code_search" | "websearch" | "web_search"
+    ) {
+        if let Some(query) = parsed
+            .as_ref()
+            .and_then(|value| extract_string_key(value, &["query"]))
+        {
+            return Some(format!("\"{}\"", query));
+        }
+    }
+
+    if normalized_name == "task" {
+        let kind = parsed
+            .as_ref()
+            .and_then(|value| extract_string_key(value, &["subagent_type"]));
+        let description = parsed
+            .as_ref()
+            .and_then(|value| extract_string_key(value, &["description"]));
+
+        return match (kind, description) {
+            (Some(kind), Some(description)) => Some(format!("{kind} task {description}")),
+            (Some(kind), None) => Some(format!("{kind} task")),
+            (None, Some(description)) => Some(description),
+            (None, None) => None,
+        };
+    }
+
+    if normalized_name == "question" {
+        if let Some(count) = object
+            .and_then(|value| value.get("questions"))
+            .and_then(|value| value.as_array())
+            .map(Vec::len)
+        {
+            return Some(format!(
+                "Asked {} question{}",
+                count,
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    if matches!(normalized_name, "todowrite" | "todo_write") {
+        if let Some(count) = object
+            .and_then(|value| value.get("todos"))
+            .and_then(|value| value.as_array())
+            .map(Vec::len)
+        {
+            return Some(format!(
+                "Update {} todo{}",
+                count,
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+        return Some("Update todos".to_string());
+    }
+
+    if normalized_name == "skill" {
+        if let Some(name) = parsed
+            .as_ref()
+            .and_then(|value| extract_string_key(value, &["name"]))
+        {
+            return Some(format!("\"{}\"", name));
+        }
+    }
+
+    if matches!(normalized_name, "apply_patch" | "applypatch") {
+        return Some("Patch".to_string());
+    }
+
+    if normalized_name == "lsp" {
+        if let Some(operation) = parsed
+            .as_ref()
+            .and_then(|value| extract_string_key(value, &["operation"]))
+        {
+            let target = parsed
+                .as_ref()
+                .and_then(|value| extract_string_key(value, &["filePath", "file_path", "path"]));
+            return Some(match target {
+                Some(path) => format!("{} {}", operation, path),
+                None => operation,
+            });
+        }
+    }
+
     if raw.is_empty() {
         return None;
+    }
+
+    if let Some(preview) = object.and_then(|value| {
+        format_primitive_arguments(
+            value,
+            &[
+                "content",
+                "new_string",
+                "old_string",
+                "patch",
+                "prompt",
+                "questions",
+                "todos",
+            ],
+        )
+    }) {
+        return Some(preview);
     }
 
     let first = raw.lines().next().unwrap_or(raw).trim();
@@ -338,9 +497,13 @@ fn extract_path(value: &Value) -> Option<String> {
     let object = value.as_object()?;
     for key in [
         "path",
+        "file_path",
+        "filePath",
         "file",
         "filename",
         "filepath",
+        "absolute_path",
+        "absolutePath",
         "target",
         "destination",
         "to",
@@ -354,6 +517,53 @@ fn extract_path(value: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_string_key(value: &Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    for key in keys {
+        if let Some(content) = object.get(*key).and_then(|value| value.as_str()) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn format_primitive_arguments(
+    object: &serde_json::Map<String, Value>,
+    omit: &[&str],
+) -> Option<String> {
+    let mut parts = Vec::new();
+
+    for (key, value) in object {
+        if omit.contains(&key.as_str()) {
+            continue;
+        }
+
+        let rendered = match value {
+            Value::String(content) => {
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                format_preview_line(trimmed, 28)
+            }
+            Value::Number(number) => number.to_string(),
+            Value::Bool(flag) => flag.to_string(),
+            _ => continue,
+        };
+
+        parts.push(format!("{key}={rendered}"));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("[{}]", parts.join(", ")))
+    }
 }
 
 fn is_denied_result(result_text: &str) -> bool {
@@ -371,4 +581,33 @@ fn format_preview_line(line: &str, max_chars: usize) -> String {
     }
     let truncated: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{}…", truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_argument_preview;
+
+    #[test]
+    fn list_tool_preview_shows_path() {
+        let preview = tool_argument_preview("ls", r#"{"path":"."}"#);
+        assert_eq!(preview.as_deref(), Some("→ ."));
+    }
+
+    #[test]
+    fn read_tool_preview_supports_file_path_keys() {
+        let preview = tool_argument_preview("read", r#"{"file_path":"/tmp/a.txt"}"#);
+        assert_eq!(preview.as_deref(), Some("→ /tmp/a.txt"));
+    }
+
+    #[test]
+    fn generic_preview_compacts_json_to_key_values() {
+        let preview = tool_argument_preview("unknown", r#"{"path":".","recursive":true}"#);
+        assert_eq!(preview.as_deref(), Some("[path=., recursive=true]"));
+    }
+
+    #[test]
+    fn apply_patch_preview_hides_patch_body() {
+        let preview = tool_argument_preview("apply_patch", "*** Begin Patch\n...");
+        assert_eq!(preview.as_deref(), Some("Patch"));
+    }
 }

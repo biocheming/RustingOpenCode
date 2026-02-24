@@ -799,8 +799,7 @@ fn part_to_info(part: &rocode_session::MessagePart) -> PartInfo {
         } else {
             None
         },
-        tool_call: if let rocode_session::PartType::ToolCall { id, name, input } = &part.part_type
-        {
+        tool_call: if let rocode_session::PartType::ToolCall { id, name, input } = &part.part_type {
             Some(ToolCallInfo {
                 id: id.clone(),
                 name: name.clone(),

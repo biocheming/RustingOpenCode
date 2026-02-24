@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
@@ -315,10 +315,7 @@ impl OpenAIProvider {
         self.legacy_only
     }
 
-    fn parse_legacy_sse_data(
-        data: &str,
-        state: &mut LegacySseParserState,
-    ) -> Vec<StreamEvent> {
+    fn parse_legacy_sse_data(data: &str, state: &mut LegacySseParserState) -> Vec<StreamEvent> {
         let mut events = Vec::new();
 
         if data == "[DONE]" {
@@ -396,8 +393,7 @@ impl OpenAIProvider {
                             });
                         }
                         for tc in tool_calls {
-                            let index =
-                                tc.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                            let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
                             let id = if let Some(id) = tc.get("id").and_then(Value::as_str) {
                                 let id = id.to_string();
                                 state.tool_call_ids.insert(index, id.clone());
@@ -508,11 +504,193 @@ impl OpenAIProvider {
         events
     }
 
+    fn to_openai_compatible_chat_messages(messages: &[Message]) -> Vec<Value> {
+        let mut converted = Vec::new();
+
+        for message in messages {
+            match message.role {
+                Role::System => {
+                    converted.push(json!({
+                        "role": "system",
+                        "content": Self::content_text_lossy(&message.content),
+                    }));
+                }
+                Role::User => {
+                    converted.push(json!({
+                        "role": "user",
+                        "content": Self::user_content_to_openai(&message.content),
+                    }));
+                }
+                Role::Assistant => {
+                    converted.push(Self::assistant_message_to_openai(&message.content));
+                }
+                Role::Tool => {
+                    converted.extend(Self::tool_messages_to_openai(&message.content));
+                }
+            }
+        }
+
+        converted
+    }
+
+    fn content_text_lossy(content: &crate::Content) -> String {
+        match content {
+            crate::Content::Text(text) => text.clone(),
+            crate::Content::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| part.text.clone())
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    fn user_content_to_openai(content: &crate::Content) -> Value {
+        match content {
+            crate::Content::Text(text) => Value::String(text.clone()),
+            crate::Content::Parts(parts) => {
+                if parts.len() == 1 && parts[0].content_type == "text" && parts[0].text.is_some() {
+                    return Value::String(parts[0].text.clone().unwrap_or_default());
+                }
+
+                let mut converted_parts = Vec::new();
+                for part in parts {
+                    if let Some(text) = &part.text {
+                        converted_parts.push(json!({
+                            "type": "text",
+                            "text": text,
+                        }));
+                        continue;
+                    }
+
+                    if let Some(image) = &part.image_url {
+                        converted_parts.push(json!({
+                            "type": "image_url",
+                            "image_url": { "url": image.url },
+                        }));
+                    }
+                }
+
+                if converted_parts.is_empty() {
+                    Value::String(String::new())
+                } else {
+                    Value::Array(converted_parts)
+                }
+            }
+        }
+    }
+
+    fn assistant_message_to_openai(content: &crate::Content) -> Value {
+        match content {
+            crate::Content::Text(text) => json!({
+                "role": "assistant",
+                "content": text,
+            }),
+            crate::Content::Parts(parts) => {
+                let mut text = String::new();
+                let mut tool_calls = Vec::new();
+
+                for part in parts {
+                    match part.content_type.as_str() {
+                        "text" => {
+                            if let Some(part_text) = &part.text {
+                                text.push_str(part_text);
+                            }
+                        }
+                        "tool_use" => {
+                            if let Some(tool_use) = &part.tool_use {
+                                let args = serde_json::to_string(&tool_use.input)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                tool_calls.push(json!({
+                                    "id": tool_use.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_use.name,
+                                        "arguments": args,
+                                    }
+                                }));
+                            }
+                        }
+                        _ => {
+                            if let Some(part_text) = &part.text {
+                                text.push_str(part_text);
+                            }
+                        }
+                    }
+                }
+
+                let mut message = Map::new();
+                message.insert("role".to_string(), Value::String("assistant".to_string()));
+                if tool_calls.is_empty() {
+                    message.insert("content".to_string(), Value::String(text));
+                } else {
+                    message.insert(
+                        "content".to_string(),
+                        if text.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::String(text)
+                        },
+                    );
+                    message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+                }
+                Value::Object(message)
+            }
+        }
+    }
+
+    fn tool_messages_to_openai(content: &crate::Content) -> Vec<Value> {
+        match content {
+            crate::Content::Text(text) => {
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![json!({
+                        "role": "user",
+                        "content": text,
+                    })]
+                }
+            }
+            crate::Content::Parts(parts) => {
+                let mut messages = Vec::new();
+                for part in parts {
+                    if let Some(tool_result) = &part.tool_result {
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_result.tool_use_id,
+                            "content": tool_result.content,
+                        }));
+                    } else if let Some(text) = &part.text {
+                        if !text.is_empty() {
+                            messages.push(json!({
+                                "role": "user",
+                                "content": text,
+                            }));
+                        }
+                    }
+                }
+                messages
+            }
+        }
+    }
+
     fn build_request_body(request: &ChatRequest) -> Result<Value, ProviderError> {
         let mut value = serde_json::to_value(request)
             .map_err(|e| ProviderError::InvalidRequest(e.to_string()))?;
 
         if let Value::Object(obj) = &mut value {
+            let mut prompt = request.messages.clone();
+            if let Some(system) = &request.system {
+                let has_system = prompt.iter().any(|m| matches!(m.role, Role::System));
+                if !has_system {
+                    prompt.insert(0, Message::system(system.clone()));
+                }
+            }
+            obj.insert(
+                "messages".to_string(),
+                Value::Array(Self::to_openai_compatible_chat_messages(&prompt)),
+            );
+            obj.remove("system");
+
             // Merge provider_options into the top-level body (matching TS SDK behavior).
             // The TS SDK spreads provider options directly into the request body so that
             // provider-specific fields like `thinking`, `enable_thinking`, etc. are sent
@@ -749,19 +927,16 @@ impl OpenAIProvider {
             return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| {
-                let mut msg = e.to_string();
-                let mut source = std::error::Error::source(&e);
-                while let Some(cause) = source {
-                    msg.push_str(": ");
-                    msg.push_str(&cause.to_string());
-                    source = cause.source();
-                }
-                ProviderError::ApiError(msg)
-            })?;
+        let body = response.text().await.map_err(|e| {
+            let mut msg = e.to_string();
+            let mut source = std::error::Error::source(&e);
+            while let Some(cause) = source {
+                msg.push_str(": ");
+                msg.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            ProviderError::ApiError(msg)
+        })?;
 
         // Some OpenAI-compatible providers (e.g. ZhipuAI) return SSE-formatted
         // streaming data even for non-streaming requests. Detect and reassemble.
@@ -822,8 +997,10 @@ impl OpenAIProvider {
                         }
                         if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                             for tc in tcs {
-                                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                let entry = tool_calls.entry(idx).or_insert((None, None, String::new()));
+                                let idx =
+                                    tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let entry =
+                                    tool_calls.entry(idx).or_insert((None, None, String::new()));
                                 if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                                     entry.0 = Some(id.to_string());
                                 }
@@ -831,7 +1008,9 @@ impl OpenAIProvider {
                                     if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
                                         entry.1 = Some(name.to_string());
                                     }
-                                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                    if let Some(args) =
+                                        func.get("arguments").and_then(|v| v.as_str())
+                                    {
                                         entry.2.push_str(args);
                                     }
                                 }
@@ -874,9 +1053,17 @@ impl OpenAIProvider {
                 index: Some(0),
                 message: Some(RawMessage {
                     role: Some("assistant".to_string()),
-                    content: if content.is_empty() { None } else { Some(content) },
+                    content: if content.is_empty() {
+                        None
+                    } else {
+                        Some(content)
+                    },
                     tool_calls: raw_tool_calls,
-                    _reasoning_text: if reasoning.is_empty() { None } else { Some(reasoning) },
+                    _reasoning_text: if reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(reasoning)
+                    },
                 }),
                 finish_reason,
             }],
@@ -1240,5 +1427,55 @@ mod tests {
             delta.first(),
             Some(StreamEvent::ToolCallDelta { id, input }) if id == "tool-call-0" && input == "{\"cmd\":\"ls\"}"
         ));
+    }
+
+    #[test]
+    fn converts_tool_roundtrip_messages_to_openai_compatible_shape() {
+        let assistant = Message {
+            role: Role::Assistant,
+            content: crate::Content::Parts(vec![
+                crate::ContentPart {
+                    content_type: "text".to_string(),
+                    text: Some("Running command".to_string()),
+                    ..Default::default()
+                },
+                crate::ContentPart {
+                    content_type: "tool_use".to_string(),
+                    tool_use: Some(crate::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({ "cmd": "ls" }),
+                    }),
+                    ..Default::default()
+                },
+            ]),
+            cache_control: None,
+            provider_options: None,
+        };
+
+        let tool_result = Message {
+            role: Role::Tool,
+            content: crate::Content::Parts(vec![crate::ContentPart {
+                content_type: "tool_result".to_string(),
+                tool_result: Some(crate::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "ok".to_string(),
+                    is_error: Some(false),
+                }),
+                ..Default::default()
+            }]),
+            cache_control: None,
+            provider_options: None,
+        };
+
+        let converted =
+            OpenAIProvider::to_openai_compatible_chat_messages(&[assistant, tool_result]);
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0]["role"], "assistant");
+        assert_eq!(converted[0]["tool_calls"][0]["type"], "function");
+        assert_eq!(converted[0]["tool_calls"][0]["function"]["name"], "bash");
+        assert_eq!(converted[1]["role"], "tool");
+        assert_eq!(converted[1]["tool_call_id"], "call_1");
+        assert_eq!(converted[1]["content"], "ok");
     }
 }

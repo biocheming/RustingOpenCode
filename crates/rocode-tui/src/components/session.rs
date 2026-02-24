@@ -110,9 +110,11 @@ impl SessionView {
         frame.render_widget(underlay, sidebar_area);
 
         self.sidebar_close_button_area = Some(Rect {
-            x: sidebar_area
-                .x
-                .saturating_add(sidebar_area.width.saturating_sub(SIDEBAR_CLOSE_BUTTON_WIDTH)),
+            x: sidebar_area.x.saturating_add(
+                sidebar_area
+                    .width
+                    .saturating_sub(SIDEBAR_CLOSE_BUTTON_WIDTH),
+            ),
             y: sidebar_area.y,
             width: SIDEBAR_CLOSE_BUTTON_WIDTH.min(sidebar_area.width),
             height: 1,
@@ -137,7 +139,10 @@ impl SessionView {
             x: area
                 .x
                 .saturating_add(area.width.saturating_sub(SIDEBAR_OPEN_BUTTON_WIDTH)),
-            y: area.y.saturating_add(1).min(area.y + area.height.saturating_sub(1)),
+            y: area
+                .y
+                .saturating_add(1)
+                .min(area.y + area.height.saturating_sub(1)),
             width: SIDEBAR_OPEN_BUTTON_WIDTH.min(area.width),
             height: 1,
         };
@@ -167,7 +172,11 @@ impl SessionView {
 
         let show_header = {
             let user_pref = *self.context.show_header.read();
-            if !user_pref { false } else { true }
+            if !user_pref {
+                false
+            } else {
+                true
+            }
         };
         let header_height = if show_header {
             if area.width < HEADER_NARROW_THRESHOLD {
@@ -533,6 +542,7 @@ impl SessionView {
         let mut lines = Vec::new();
         let mut line_to_message: Vec<Option<String>> = Vec::new();
         let mut message_first_lines: HashMap<String, usize> = HashMap::new();
+        let mut last_visible_role: Option<MessageRole> = None;
 
         if let Some(revert) = revert_info.as_ref() {
             let card_lines = super::revert_card::render_revert_card(revert, &theme);
@@ -549,10 +559,12 @@ impl SessionView {
         }
 
         for (idx, msg) in messages.iter().enumerate() {
+            if is_tool_result_carrier(msg) {
+                continue;
+            }
             // Smart spacing: role transitions always get a blank line;
             // cozy mode adds an extra blank line for breathing room
-            if idx > 0 {
-                let prev_role = &messages[idx - 1].role;
+            if let Some(prev_role) = &last_visible_role {
                 if *prev_role != msg.role || matches!(msg.role, MessageRole::User) {
                     push_spacing_lines(&mut lines, &mut line_to_message, message_gap_lines);
                 }
@@ -583,17 +595,7 @@ impl SessionView {
                     let message_border = assistant_border;
                     let message_thinking_bg = thinking_bg;
                     let message_thinking_border = thinking_border;
-                    let mut tool_results: HashMap<String, (String, bool)> = HashMap::new();
-                    for part in &msg.parts {
-                        if let MessagePart::ToolResult {
-                            id,
-                            result,
-                            is_error,
-                        } = part
-                        {
-                            tool_results.insert(id.clone(), (result.clone(), *is_error));
-                        }
-                    }
+                    let tool_results = collect_assistant_tool_results(&messages, idx);
                     let is_active_assistant = last_assistant_idx == Some(idx)
                         && msg.finish.is_none()
                         && msg.error.is_none();
@@ -615,8 +617,11 @@ impl SessionView {
                     };
 
                     if msg.parts.is_empty() {
-                        let mut text_lines =
-                            super::session_text::render_text_part(&msg.content, &theme, assistant_marker);
+                        let mut text_lines = super::session_text::render_text_part(
+                            &msg.content,
+                            &theme,
+                            assistant_marker,
+                        );
                         if semantic_hl {
                             text_lines =
                                 super::semantic_highlight::highlight_lines(text_lines, &theme);
@@ -647,12 +652,11 @@ impl SessionView {
                                             vec![Line::from("")],
                                         );
                                     }
-                                    let mut text_lines =
-                                        super::session_text::render_text_part(
-                                            text,
-                                            &theme,
-                                            assistant_marker,
-                                        );
+                                    let mut text_lines = super::session_text::render_text_part(
+                                        text,
+                                        &theme,
+                                        assistant_marker,
+                                    );
                                     if semantic_hl {
                                         text_lines = super::semantic_highlight::highlight_lines(
                                             text_lines, &theme,
@@ -772,10 +776,7 @@ impl SessionView {
                                 MessagePart::ToolResult { .. } => {}
                                 MessagePart::File { path, mime } => {
                                     let file_line = Line::from(vec![
-                                        Span::styled(
-                                            "▸ ",
-                                            Style::default().fg(assistant_marker),
-                                        ),
+                                        Span::styled("▸ ", Style::default().fg(assistant_marker)),
                                         Span::styled("[file] ", Style::default().fg(theme.info)),
                                         Span::styled(path.clone(), Style::default().fg(theme.text)),
                                         Span::styled(
@@ -797,10 +798,7 @@ impl SessionView {
                                 }
                                 MessagePart::Image { url } => {
                                     let image_line = Line::from(vec![
-                                        Span::styled(
-                                            "▸ ",
-                                            Style::default().fg(assistant_marker),
-                                        ),
+                                        Span::styled("▸ ", Style::default().fg(assistant_marker)),
                                         Span::styled("[image] ", Style::default().fg(theme.info)),
                                         Span::styled(
                                             url.clone(),
@@ -857,7 +855,23 @@ impl SessionView {
                         .collect();
                     append_message_lines(&mut lines, &mut line_to_message, &msg.id, system_lines);
                 }
+                MessageRole::Tool => {
+                    // Carrier tool-result messages are rendered inline with the originating
+                    // assistant tool call above, so only render non-carrier tool messages.
+                    let tool_lines: Vec<Line<'static>> = msg
+                        .content
+                        .lines()
+                        .map(|line_text| {
+                            Line::from(Span::styled(
+                                line_text.to_string(),
+                                Style::default().fg(theme.text_muted),
+                            ))
+                        })
+                        .collect();
+                    append_message_lines(&mut lines, &mut line_to_message, &msg.id, tool_lines);
+                }
             }
+            last_visible_role = Some(msg.role.clone());
         }
 
         self.expanded_reasoning
@@ -1253,6 +1267,50 @@ fn push_merged_span(line: &mut Vec<Span<'static>>, ch: char, style: Style) {
     line.push(Span::styled(ch.to_string(), style));
 }
 
+fn is_tool_result_carrier(message: &Message) -> bool {
+    if !matches!(message.role, MessageRole::Tool) {
+        return false;
+    }
+
+    let mut has_tool_result = false;
+    for part in &message.parts {
+        match part {
+            MessagePart::ToolResult { .. } => has_tool_result = true,
+            MessagePart::Text { text } | MessagePart::Reasoning { text }
+                if text.trim().is_empty() => {}
+            _ => return false,
+        }
+    }
+
+    has_tool_result
+}
+
+fn collect_assistant_tool_results(
+    messages: &[Message],
+    assistant_idx: usize,
+) -> HashMap<String, (String, bool)> {
+    let mut tool_results = HashMap::new();
+
+    for (idx, message) in messages.iter().enumerate().skip(assistant_idx) {
+        if idx > assistant_idx && matches!(message.role, MessageRole::Assistant) {
+            break;
+        }
+
+        for part in &message.parts {
+            if let MessagePart::ToolResult {
+                id,
+                result,
+                is_error,
+            } = part
+            {
+                tool_results.insert(id.clone(), (result.clone(), *is_error));
+            }
+        }
+    }
+
+    tool_results
+}
+
 fn assistant_footer(
     messages: &[Message],
     idx: usize,
@@ -1403,4 +1461,90 @@ fn format_number(value: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_assistant_tool_results, is_tool_result_carrier};
+    use crate::context::{Message, MessagePart, MessageRole, TokenUsage};
+    use chrono::Utc;
+
+    fn message(id: &str, role: MessageRole, parts: Vec<MessagePart>) -> Message {
+        Message {
+            id: id.to_string(),
+            role,
+            content: String::new(),
+            created_at: Utc::now(),
+            agent: None,
+            model: None,
+            mode: None,
+            finish: None,
+            error: None,
+            completed_at: None,
+            cost: 0.0,
+            tokens: TokenUsage::default(),
+            parts,
+        }
+    }
+
+    #[test]
+    fn tool_result_carrier_is_detected() {
+        let msg = message(
+            "tool-msg",
+            MessageRole::Tool,
+            vec![MessagePart::ToolResult {
+                id: "call-1".to_string(),
+                result: "ok".to_string(),
+                is_error: false,
+            }],
+        );
+        assert!(is_tool_result_carrier(&msg));
+    }
+
+    #[test]
+    fn assistant_collects_tool_results_until_next_assistant() {
+        let messages = vec![
+            message("user-1", MessageRole::User, vec![]),
+            message(
+                "assistant-1",
+                MessageRole::Assistant,
+                vec![MessagePart::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "ls".to_string(),
+                    arguments: r#"{"path":"."}"#.to_string(),
+                }],
+            ),
+            message(
+                "tool-1",
+                MessageRole::Tool,
+                vec![MessagePart::ToolResult {
+                    id: "call-1".to_string(),
+                    result: "file_a\nfile_b".to_string(),
+                    is_error: false,
+                }],
+            ),
+            message(
+                "assistant-2",
+                MessageRole::Assistant,
+                vec![MessagePart::ToolCall {
+                    id: "call-2".to_string(),
+                    name: "read".to_string(),
+                    arguments: r#"{"file_path":"README.md"}"#.to_string(),
+                }],
+            ),
+            message(
+                "tool-2",
+                MessageRole::Tool,
+                vec![MessagePart::ToolResult {
+                    id: "call-2".to_string(),
+                    result: "readme".to_string(),
+                    is_error: false,
+                }],
+            ),
+        ];
+
+        let first_results = collect_assistant_tool_results(&messages, 1);
+        assert!(first_results.contains_key("call-1"));
+        assert!(!first_results.contains_key("call-2"));
+    }
 }

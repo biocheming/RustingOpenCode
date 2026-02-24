@@ -8,19 +8,13 @@ fn create_test_registry() -> ProviderRegistry {
     ));
     registry.register(rocode_provider::openai::OpenAIProvider::new("test-key"));
     registry.register(rocode_provider::google::GoogleProvider::new("test-key"));
-    registry.register(rocode_provider::deepseek::DeepSeekProvider::new(
-        "test-key",
-    ));
+    registry.register(rocode_provider::deepseek::DeepSeekProvider::new("test-key"));
     registry.register(rocode_provider::mistral::MistralProvider::new("test-key"));
     registry.register(rocode_provider::groq::GroqProvider::new("test-key"));
     registry.register(rocode_provider::xai::XaiProvider::new("test-key"));
     registry.register(rocode_provider::cohere::CohereProvider::new("test-key"));
-    registry.register(rocode_provider::cerebras::CerebrasProvider::new(
-        "test-key",
-    ));
-    registry.register(rocode_provider::together::TogetherProvider::new(
-        "test-key",
-    ));
+    registry.register(rocode_provider::cerebras::CerebrasProvider::new("test-key"));
+    registry.register(rocode_provider::together::TogetherProvider::new("test-key"));
     registry.register(rocode_provider::perplexity::PerplexityProvider::new(
         "test-key",
     ));

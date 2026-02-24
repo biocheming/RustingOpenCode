@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use crate::anthropic::AnthropicProvider;
 use crate::auth::AuthInfo;
 use crate::azure::AzureProvider;
@@ -23,6 +22,7 @@ use crate::together::TogetherProvider;
 use crate::vercel::VercelProvider;
 use crate::vertex::GoogleVertexProvider;
 use crate::xai::XaiProvider;
+use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -306,9 +306,7 @@ impl CustomLoader for OpenCodeLoader {
 
         let has_key = provider.env.iter().any(|e| std::env::var(e).is_ok())
             || provider_state
-                .and_then(|state| {
-                    provider_option_string(state, &["apiKey", "api_key", "apikey"])
-                })
+                .and_then(|state| provider_option_string(state, &["apiKey", "api_key", "apikey"]))
                 .is_some();
 
         if !has_key {
@@ -2170,21 +2168,22 @@ fn provider_secret(provider: &ProviderState, fallback_env: &[&str]) -> Option<St
 }
 
 fn provider_base_url(provider: &ProviderState) -> Option<String> {
-    provider_option_string(provider, &["baseURL", "baseUrl", "url", "api"]).or_else(|| {
-        provider
-            .models
-            .values()
-            .find_map(|model| (!model.api.url.trim().is_empty()).then(|| model.api.url.clone()))
-    })
-    .or_else(|| {
-        // GLM Coding Plan requires a dedicated endpoint instead of the generic API.
-        // TS users commonly configure this as provider id `zhipuai-coding-plan`.
-        if provider.id == "zhipuai-coding-plan" {
-            Some("https://open.bigmodel.cn/api/coding/paas/v4".to_string())
-        } else {
-            None
-        }
-    })
+    provider_option_string(provider, &["baseURL", "baseUrl", "url", "api"])
+        .or_else(|| {
+            provider
+                .models
+                .values()
+                .find_map(|model| (!model.api.url.trim().is_empty()).then(|| model.api.url.clone()))
+        })
+        .or_else(|| {
+            // GLM Coding Plan requires a dedicated endpoint instead of the generic API.
+            // TS users commonly configure this as provider id `zhipuai-coding-plan`.
+            if provider.id == "zhipuai-coding-plan" {
+                Some("https://open.bigmodel.cn/api/coding/paas/v4".to_string())
+            } else {
+                None
+            }
+        })
 }
 
 fn create_concrete_provider(
@@ -2211,7 +2210,9 @@ fn create_concrete_provider(
         "opencode" => {
             let api_key = provider_secret(provider, &["OPENCODE_API_KEY"])?;
             let base_url = provider_base_url(provider)?;
-            Some(Arc::new(OpenAIProvider::openai_compatible(base_url, api_key)))
+            Some(Arc::new(OpenAIProvider::openai_compatible(
+                base_url, api_key,
+            )))
         }
         "google" => {
             let api_key = provider_secret(
@@ -2340,7 +2341,9 @@ fn create_concrete_provider(
 
             let api_key = provider_secret(provider, &[])?;
             let base_url = provider_base_url(provider)?;
-            Some(Arc::new(OpenAIProvider::openai_compatible(base_url, api_key)))
+            Some(Arc::new(OpenAIProvider::openai_compatible(
+                base_url, api_key,
+            )))
         }
     }
 }
@@ -2392,7 +2395,10 @@ impl RuntimeProvider for AliasedProvider {
         self.model_index.get(id)
     }
 
-    async fn chat(&self, request: crate::ChatRequest) -> Result<crate::ChatResponse, crate::ProviderError> {
+    async fn chat(
+        &self,
+        request: crate::ChatRequest,
+    ) -> Result<crate::ChatResponse, crate::ProviderError> {
         self.inner.chat(request).await
     }
 

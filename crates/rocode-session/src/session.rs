@@ -7,9 +7,9 @@ use uuid::Uuid;
 use rocode_core::bus::{Bus, BusEventDef};
 use rocode_plugin::{HookContext, HookEvent};
 
-use crate::{MessagePart, MessageRole, SessionMessage};
 #[cfg(test)]
 use crate::MessageUsage;
+use crate::{MessagePart, MessageRole, SessionMessage};
 
 // ============================================================================
 // Bus Event Definitions (matches TS Session.Event)

@@ -1304,19 +1304,16 @@ impl OpenAIResponsesLanguageModel {
                 .await
                 .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
             let status = response.status().as_u16();
-            let body = response
-                .text()
-                .await
-                .map_err(|e| {
-                    let mut msg = e.to_string();
-                    let mut source = std::error::Error::source(&e);
-                    while let Some(cause) = source {
-                        msg.push_str(": ");
-                        msg.push_str(&cause.to_string());
-                        source = cause.source();
-                    }
-                    ProviderError::ApiError(msg)
-                })?;
+            let body = response.text().await.map_err(|e| {
+                let mut msg = e.to_string();
+                let mut source = std::error::Error::source(&e);
+                while let Some(cause) = source {
+                    msg.push_str(": ");
+                    msg.push_str(&cause.to_string());
+                    source = cause.source();
+                }
+                ProviderError::ApiError(msg)
+            })?;
             (status, body)
         };
         if status_code >= 400 {

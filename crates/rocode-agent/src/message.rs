@@ -140,13 +140,14 @@ impl Conversation {
                 MessageRole::User => rocode_provider::Message::user(&m.content),
                 MessageRole::Assistant => rocode_provider::Message::assistant(&m.content),
                 MessageRole::Tool => {
-                    let tool_result = m.tool_result.as_ref().map(|result| {
-                        rocode_provider::ToolResult {
-                            tool_use_id: result.tool_call_id.clone(),
-                            content: result.content.clone(),
-                            is_error: Some(result.is_error),
-                        }
-                    });
+                    let tool_result =
+                        m.tool_result
+                            .as_ref()
+                            .map(|result| rocode_provider::ToolResult {
+                                tool_use_id: result.tool_call_id.clone(),
+                                content: result.content.clone(),
+                                is_error: Some(result.is_error),
+                            });
 
                     rocode_provider::Message {
                         role: rocode_provider::Role::Tool,

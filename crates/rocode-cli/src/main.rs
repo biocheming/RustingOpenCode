@@ -855,9 +855,9 @@ async fn run_tui(
         std::env::set_var("OPENCODE_TUI_SESSION", session_id);
     }
 
-    let run_result = tokio::task::spawn_blocking(|| {
-        rocode_tui::run_tui()
-    }).await.map_err(|e| anyhow::anyhow!("TUI task panicked: {}", e))?;
+    let run_result = tokio::task::spawn_blocking(|| rocode_tui::run_tui())
+        .await
+        .map_err(|e| anyhow::anyhow!("TUI task panicked: {}", e))?;
 
     std::env::remove_var("OPENCODE_TUI_BASE_URL");
     std::env::remove_var("OPENCODE_TUI_MODEL");
@@ -1730,7 +1730,10 @@ fn provider_to_bootstrap(provider: &rocode_config::ProviderConfig) -> BootstrapC
 fn model_to_bootstrap(id: &str, model: &rocode_config::ModelConfig) -> BootstrapConfigModel {
     let mut options = HashMap::new();
     if let Some(api_key) = &model.api_key {
-        options.insert("apiKey".to_string(), serde_json::Value::String(api_key.clone()));
+        options.insert(
+            "apiKey".to_string(),
+            serde_json::Value::String(api_key.clone()),
+        );
     }
 
     let variants = model.variants.as_ref().map(|variants| {
@@ -1743,13 +1746,12 @@ fn model_to_bootstrap(id: &str, model: &rocode_config::ModelConfig) -> Bootstrap
     BootstrapConfigModel {
         id: model.model.clone().or_else(|| Some(id.to_string())),
         name: model.name.clone(),
-        provider: model
-            .base_url
-            .as_ref()
-            .map(|url| rocode_provider::bootstrap::ConfigModelProvider {
+        provider: model.base_url.as_ref().map(|url| {
+            rocode_provider::bootstrap::ConfigModelProvider {
                 api: Some(url.clone()),
                 npm: None,
-            }),
+            }
+        }),
         options: (!options.is_empty()).then_some(options),
         variants,
         ..Default::default()
@@ -2491,12 +2493,7 @@ fn detect_install_method() -> InstallMethod {
             &["list", "-g", "--depth=0"],
             "rocode-ai",
         ),
-        (
-            InstallMethod::Bun,
-            "bun",
-            &["pm", "ls", "-g"],
-            "rocode-ai",
-        ),
+        (InstallMethod::Bun, "bun", &["pm", "ls", "-g"], "rocode-ai"),
         (
             InstallMethod::Brew,
             "brew",
@@ -2509,12 +2506,7 @@ fn detect_install_method() -> InstallMethod {
             &["list", "--limit-output", "rocode"],
             "rocode",
         ),
-        (
-            InstallMethod::Scoop,
-            "scoop",
-            &["list", "rocode"],
-            "rocode",
-        ),
+        (InstallMethod::Scoop, "scoop", &["list", "rocode"], "rocode"),
     ];
 
     for (method, program, args, marker) in checks {

@@ -35,5 +35,11 @@ pub fn run_tui() -> anyhow::Result<()> {
     setup_panic_hook();
 
     let mut app = App::new()?;
-    app.run()
+    let result = app.run();
+    if result.is_ok() {
+        if let Some(summary) = app.exit_summary() {
+            println!("{summary}");
+        }
+    }
+    result
 }

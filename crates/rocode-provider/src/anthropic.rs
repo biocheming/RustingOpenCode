@@ -4,8 +4,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ChatRequest, ChatResponse, Choice, Message, ModelInfo,
-    Provider, ProviderError, StreamEvent, StreamResult, Usage,
+    ChatRequest, ChatResponse, Choice, Message, ModelInfo, Provider, ProviderError, StreamEvent,
+    StreamResult, Usage,
 };
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";

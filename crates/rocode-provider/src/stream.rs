@@ -369,7 +369,10 @@ mod tests {
     fn parse_openai_sse_does_not_end_on_tool_calls_finish_reason() {
         let data = r#"{"choices":[{"finish_reason":"tool_calls"}]}"#;
         let event = parse_openai_sse(data);
-        assert!(event.is_none(), "tool_calls finish_reason should not end stream");
+        assert!(
+            event.is_none(),
+            "tool_calls finish_reason should not end stream"
+        );
     }
 
     #[test]
@@ -387,8 +390,7 @@ mod tests {
 
     #[test]
     fn parse_anthropic_sse_uses_index_for_tool_delta_id() {
-        let data =
-            r#"{"type":"content_block_delta","index":3,"delta":{"partial_json":"{\"cmd\":\"ls\"}"}}"#;
+        let data = r#"{"type":"content_block_delta","index":3,"delta":{"partial_json":"{\"cmd\":\"ls\"}"}}"#;
         let event = parse_anthropic_sse(data).expect("event should parse");
         match event {
             StreamEvent::ToolCallDelta { id, input } => {

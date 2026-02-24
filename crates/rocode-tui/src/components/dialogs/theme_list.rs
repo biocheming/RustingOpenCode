@@ -209,7 +209,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     super::centered_rect(width, height, area)
 }
 
-
 fn canonical_theme_id(name: &str) -> String {
     let trimmed = name.trim();
     if trimmed.is_empty() {

@@ -360,7 +360,10 @@ impl Prompt {
 
         let status_line = Paragraph::new(self.render_status_line(&theme))
             .style(Style::default().bg(theme.background));
-        frame.render_widget(status_line, inset_horizontal(chunks[3], PROMPT_LINE_H_INSET));
+        frame.render_widget(
+            status_line,
+            inset_horizontal(chunks[3], PROMPT_LINE_H_INSET),
+        );
     }
 
     pub fn tick_spinner(&mut self, delta_ms: u64) -> bool {

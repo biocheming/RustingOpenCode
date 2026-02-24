@@ -18,6 +18,26 @@ const LOGO_RIGHT: [&str; 4] = [
 const MARKS: &str = "_^~";
 const SHADOW_TINT_FACTOR: f32 = 0.25;
 
+fn plain_logo_line(line: &str) -> String {
+    line.chars()
+        .map(|ch| match ch {
+            '_' => ' ',
+            '^' | '~' => '▀',
+            _ => ch,
+        })
+        .collect()
+}
+
+pub fn exit_logo_lines(pad: &str) -> Vec<String> {
+    (0..4)
+        .map(|i| {
+            let left = plain_logo_line(LOGO_LEFT[i]);
+            let right = plain_logo_line(LOGO_RIGHT[i]);
+            format!("{pad}{left} {right}")
+        })
+        .collect()
+}
+
 fn blend_colors(fg: Color, bg: Color) -> Color {
     match (fg, bg) {
         (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {

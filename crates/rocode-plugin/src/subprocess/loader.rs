@@ -578,11 +578,7 @@ fn ensure_array(map: &mut Map<String, Value>, key: &str) {
 fn seed_hook_output(event: HookEvent, output: &mut Map<String, Value>) {
     match event {
         HookEvent::ToolDefinition => {
-            ensure_default(
-                output,
-                "description",
-                Value::String(String::new()),
-            );
+            ensure_default(output, "description", Value::String(String::new()));
             ensure_object(output, "parameters");
         }
         HookEvent::ToolExecuteBefore => {

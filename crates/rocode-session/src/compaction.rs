@@ -418,8 +418,7 @@ When constructing the summary, try to stick to this template:
 
         // TS: const msg = await Session.updateMessage({ ... role: "assistant", summary: true, ... })
         // Create the assistant message with full metadata.
-        let assistant_id =
-            rocode_core::id::create(rocode_core::id::Prefix::Message, false, None);
+        let assistant_id = rocode_core::id::create(rocode_core::id::Prefix::Message, false, None);
         let assistant_info = MessageInfo::Assistant {
             id: assistant_id.clone(),
             session_id: input.session_id.clone(),
@@ -578,11 +577,8 @@ When constructing the summary, try to stick to this template:
                 if input.auto {
                     if let Some(ops) = session_ops {
                         // Create a synthetic user message for auto-continue.
-                        let continue_msg_id = rocode_core::id::create(
-                            rocode_core::id::Prefix::Message,
-                            false,
-                            None,
-                        );
+                        let continue_msg_id =
+                            rocode_core::id::create(rocode_core::id::Prefix::Message, false, None);
                         let continue_user = MessageInfo::User {
                             id: continue_msg_id.clone(),
                             session_id: input.session_id.clone(),
@@ -1388,12 +1384,10 @@ mod tests {
             "default prompt".to_string(),
             Some("custom prompt".to_string()),
             Some(vec!["input ctx".to_string()]),
-            vec![rocode_plugin::HookOutput::with_payload(
-                serde_json::json!({
-                    "prompt": "hook prompt",
-                    "context": ["hook ctx"]
-                }),
-            )],
+            vec![rocode_plugin::HookOutput::with_payload(serde_json::json!({
+                "prompt": "hook prompt",
+                "context": ["hook ctx"]
+            }))],
         );
 
         assert_eq!(prompt, "hook prompt");
@@ -1405,11 +1399,9 @@ mod tests {
             "default prompt".to_string(),
             None,
             Some(vec!["input ctx".to_string()]),
-            vec![rocode_plugin::HookOutput::with_payload(
-                serde_json::json!({
-                    "context": ["hook ctx 1", "hook ctx 2"]
-                }),
-            )],
+            vec![rocode_plugin::HookOutput::with_payload(serde_json::json!({
+                "context": ["hook ctx 1", "hook ctx 2"]
+            }))],
         );
 
         assert!(prompt.contains("default prompt"));

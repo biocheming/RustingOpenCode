@@ -10,9 +10,7 @@ use rocode_provider::{
 };
 
 use crate::compaction::{CompactionConfig, CompactionEngine, ModelLimits, TokenUsage};
-use crate::message_v2::{
-    CompletedTime, ErrorTime, RunningTime, ToolState,
-};
+use crate::message_v2::{CompletedTime, ErrorTime, RunningTime, ToolState};
 use crate::retry::{self, ApiErrorInfo};
 use crate::snapshot::{Snapshot, SnapshotPatch};
 use crate::{MessageError, MessageInfo, MessageUsage, MessageWithParts, Part};
@@ -1044,8 +1042,7 @@ fn apply_chat_system_hook_outputs(
 }
 
 fn rejoin_system_prompt_if_needed(system_prompt: &mut Vec<String>, original_header: &str) {
-    if system_prompt.len() > 2
-        && system_prompt.first().map(|s| s.as_str()) == Some(original_header)
+    if system_prompt.len() > 2 && system_prompt.first().map(|s| s.as_str()) == Some(original_header)
     {
         let header = system_prompt.first().cloned().unwrap_or_default();
         let rest = system_prompt[1..].join("\n");

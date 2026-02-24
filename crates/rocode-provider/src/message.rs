@@ -1,3 +1,4 @@
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -135,11 +136,37 @@ pub struct ToolResult {
     pub is_error: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: Option<String>,
     pub parameters: serde_json::Value,
+}
+
+impl Serialize for ToolDefinition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut root = serializer.serialize_struct("ToolDefinition", 2)?;
+        root.serialize_field("type", "function")?;
+
+        #[derive(Serialize)]
+        struct Function<'a> {
+            name: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            description: Option<&'a str>,
+            parameters: &'a serde_json::Value,
+        }
+
+        let function = Function {
+            name: &self.name,
+            description: self.description.as_deref(),
+            parameters: &self.parameters,
+        };
+        root.serialize_field("function", &function)?;
+        root.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,5 +280,31 @@ impl ChatRequest {
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.tools = Some(tools);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_definition_serializes_to_openai_compatible_format() {
+        let tool = ToolDefinition {
+            name: "bash".to_string(),
+            description: Some("Execute shell commands".to_string()),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string"}
+                },
+                "required": ["cmd"]
+            }),
+        };
+
+        let value = serde_json::to_value(&tool).expect("serialize tool");
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["function"]["name"], "bash");
+        assert_eq!(value["function"]["description"], "Execute shell commands");
+        assert_eq!(value["function"]["parameters"]["type"], "object");
     }
 }

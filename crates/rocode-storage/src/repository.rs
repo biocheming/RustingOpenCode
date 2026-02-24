@@ -6,8 +6,8 @@ use sqlx::{FromRow, SqlitePool};
 use std::collections::HashMap;
 
 use rocode_types::{
-    MessagePart, MessageRole, Session, SessionMessage,
-    SessionShare, SessionStatus, SessionSummary, SessionTime, SessionUsage,
+    MessagePart, MessageRole, Session, SessionMessage, SessionShare, SessionStatus, SessionSummary,
+    SessionTime, SessionUsage,
 };
 
 use crate::database::DatabaseError;
