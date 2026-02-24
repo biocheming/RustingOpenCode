@@ -91,7 +91,11 @@ impl Tool for GrepTool {
 
         let glob_filter: Option<String> = args["glob"].as_str().map(|s| s.to_string());
 
-        let ignore_case: bool = args["ignore_case"].as_bool().unwrap_or(false);
+        let ignore_case: bool = args
+            .get("ignore_case")
+            .or_else(|| args.get("ignoreCase"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let include_hidden: bool = args["hidden"].as_bool().unwrap_or(false);
 

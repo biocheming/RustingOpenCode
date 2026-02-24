@@ -11,10 +11,12 @@ use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 #[serde(rename_all = "camelCase")]
 pub struct LspParams {
     pub operation: LspOperation,
+    #[serde(alias = "file_path")]
     pub file_path: String,
     pub line: Option<u32>,
     pub character: Option<u32>,
     pub query: Option<String>,
+    #[serde(alias = "new_name")]
     pub new_name: Option<String>,
 }
 

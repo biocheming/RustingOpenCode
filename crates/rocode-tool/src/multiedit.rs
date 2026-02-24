@@ -13,15 +13,18 @@ struct MultiEditInput {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FileEdit {
+    #[serde(alias = "filePath")]
     file_path: String,
     edits: Vec<EditOperation>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EditOperation {
+    #[serde(alias = "oldString")]
     old_string: String,
+    #[serde(alias = "newString")]
     new_string: String,
-    #[serde(default)]
+    #[serde(default, alias = "replaceAll")]
     replace_all: bool,
 }
 

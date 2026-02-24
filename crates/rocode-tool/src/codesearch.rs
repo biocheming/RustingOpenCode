@@ -10,7 +10,7 @@ const EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 #[serde(rename_all = "camelCase")]
 pub struct CodeSearchParams {
     pub query: String,
-    #[serde(default = "default_tokens")]
+    #[serde(default = "default_tokens", alias = "tokens_num")]
     pub tokens_num: u32,
 }
 

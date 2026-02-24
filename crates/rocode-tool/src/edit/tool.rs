@@ -66,22 +66,32 @@ impl Tool for EditTool {
         args: serde_json::Value,
         ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let file_path: String = args["file_path"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("file_path is required".into()))?
+        let file_path: String = args
+            .get("file_path")
+            .or_else(|| args.get("filePath"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidArguments("file_path (or filePath) is required".into()))?
             .to_string();
 
-        let old_string: String = args["old_string"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("old_string is required".into()))?
+        let old_string: String = args
+            .get("old_string")
+            .or_else(|| args.get("oldString"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidArguments("old_string (or oldString) is required".into()))?
             .to_string();
 
-        let new_string: String = args["new_string"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("new_string is required".into()))?
+        let new_string: String = args
+            .get("new_string")
+            .or_else(|| args.get("newString"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidArguments("new_string (or newString) is required".into()))?
             .to_string();
 
-        let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+        let replace_all = args
+            .get("replace_all")
+            .or_else(|| args.get("replaceAll"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let base_dir = if ctx.directory.is_empty() {
             &self.directory

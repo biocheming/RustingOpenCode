@@ -9,13 +9,14 @@ pub struct TodoWriteTool;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TodoReadInput {
-    #[serde(default)]
+    #[serde(default, alias = "sessionId")]
     session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TodoWriteInput {
     todos: Vec<TodoWriteItem>,
+    #[serde(alias = "sessionId")]
     session_id: Option<String>,
 }
 

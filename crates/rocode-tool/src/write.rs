@@ -59,9 +59,11 @@ impl Tool for WriteTool {
         args: serde_json::Value,
         ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let file_path: String = args["file_path"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("file_path is required".into()))?
+        let file_path: String = args
+            .get("file_path")
+            .or_else(|| args.get("filePath"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidArguments("file_path (or filePath) is required".into()))?
             .to_string();
 
         let content: String = args["content"]

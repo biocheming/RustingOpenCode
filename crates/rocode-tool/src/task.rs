@@ -21,11 +21,14 @@ impl Default for TaskTool {
 struct TaskInput {
     description: String,
     prompt: String,
+    #[serde(alias = "subagentType")]
     subagent_type: String,
+    #[serde(alias = "taskId")]
     task_id: Option<String>,
     command: Option<String>,
+    #[serde(alias = "loadSkills")]
     load_skills: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, alias = "runInBackground")]
     run_in_background: bool,
 }
 

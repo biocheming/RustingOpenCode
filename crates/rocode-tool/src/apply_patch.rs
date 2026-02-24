@@ -12,7 +12,7 @@ const MAX_DIAGNOSTICS_PER_FILE: usize = 20;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ApplyPatchInput {
-    #[serde(rename = "patchText")]
+    #[serde(rename = "patchText", alias = "patch_text")]
     patch_text: String,
 }
 

@@ -10,6 +10,7 @@ const DISALLOWED_TOOLS: &[&str] = &["batch"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchParams {
+    #[serde(default, alias = "toolCalls")]
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -334,5 +335,29 @@ impl Tool for BatchTool {
             metadata,
             truncated: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BatchParams;
+
+    #[test]
+    fn batch_params_accepts_camel_case_tool_calls() {
+        let value = serde_json::json!({
+            "toolCalls": [
+                { "tool": "read", "parameters": { "file_path": "index.html" } }
+            ]
+        });
+        let parsed: BatchParams = serde_json::from_value(value).expect("should parse toolCalls");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].tool, "read");
+    }
+
+    #[test]
+    fn batch_params_defaults_tool_calls_when_missing() {
+        let parsed: BatchParams =
+            serde_json::from_value(serde_json::json!({})).expect("should parse empty object");
+        assert!(parsed.tool_calls.is_empty());
     }
 }

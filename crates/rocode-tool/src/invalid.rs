@@ -5,8 +5,11 @@ use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvalidParams {
+    #[serde(alias = "toolName")]
     pub tool_name: String,
+    #[serde(alias = "errorMessage")]
     pub error_message: String,
+    #[serde(alias = "receivedArgs")]
     pub received_args: Option<serde_json::Value>,
 }
 
