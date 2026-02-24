@@ -160,7 +160,7 @@ impl Provider for CerebrasProvider {
                                     continue;
                                 }
 
-                                if let Some(event) = crate::stream::parse_openai_sse(data) {
+                                for event in crate::stream::parse_openai_sse(data) {
                                     events.push(Ok(event));
                                 }
                             }
@@ -173,6 +173,6 @@ impl Provider for CerebrasProvider {
             })
             .flat_map(|events| futures::stream::iter(events));
 
-        Ok(Box::pin(stream))
+        Ok(crate::stream::assemble_tool_calls(Box::pin(stream)))
     }
 }

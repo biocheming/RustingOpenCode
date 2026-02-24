@@ -1,6 +1,7 @@
 use crate::provider::ProviderError;
-use futures::Stream;
+use futures::{stream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,18 +184,160 @@ fn anthropic_tool_call_id(index: Option<u32>, explicit_id: Option<&str>) -> Stri
     explicit_id.unwrap_or_default().to_string()
 }
 
-pub fn parse_openai_sse(data: &str) -> Option<StreamEvent> {
-    if data == "[DONE]" {
-        return Some(StreamEvent::Done);
+/// Returns true when the input is a complete and parseable JSON value.
+pub fn is_parsable_json(s: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(s).is_ok()
+}
+
+#[derive(Debug, Clone)]
+struct ToolCallAssembler {
+    id: String,
+    name: String,
+    arguments: String,
+    finished: bool,
+}
+
+impl ToolCallAssembler {
+    fn new(id: String, name: String) -> Self {
+        Self {
+            id,
+            name,
+            arguments: String::new(),
+            finished: false,
+        }
     }
 
-    let event: OpenAISSEvent = serde_json::from_str(data).ok()?;
+    fn append(&mut self, delta: &str) {
+        if !self.finished {
+            self.arguments.push_str(delta);
+        }
+    }
+
+    fn try_emit(&mut self) -> Option<StreamEvent> {
+        if self.finished || self.arguments.is_empty() {
+            return None;
+        }
+
+        let input: serde_json::Value = serde_json::from_str(&self.arguments).ok()?;
+        self.finished = true;
+        Some(StreamEvent::ToolCallEnd {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            input,
+        })
+    }
+
+    fn flush(self) -> Option<StreamEvent> {
+        if self.arguments.is_empty() || self.finished {
+            return None;
+        }
+
+        let input = serde_json::from_str(&self.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        Some(StreamEvent::ToolCallEnd {
+            id: self.id,
+            name: self.name,
+            input,
+        })
+    }
+}
+
+fn flush_tool_call_assemblers(
+    assemblers: &mut HashMap<String, ToolCallAssembler>,
+    out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
+) {
+    let mut pending: Vec<ToolCallAssembler> = assemblers.drain().map(|(_, asm)| asm).collect();
+    pending.sort_by(|a, b| a.id.cmp(&b.id));
+
+    for assembler in pending {
+        if let Some(event) = assembler.flush() {
+            out.push_back(Ok(event));
+        }
+    }
+}
+
+/// Wraps a stream and assembles `ToolCallStart`/`ToolCallDelta` fragments into
+/// `ToolCallEnd` events. Existing `ToolCallEnd` events are passed through.
+pub fn assemble_tool_calls(inner: StreamResult) -> StreamResult {
+    let state = (
+        inner,
+        HashMap::<String, ToolCallAssembler>::new(),
+        VecDeque::<Result<StreamEvent, ProviderError>>::new(),
+        false,
+    );
+
+    Box::pin(stream::unfold(
+        state,
+        |(mut inner, mut assemblers, mut pending, mut eof)| async move {
+            loop {
+                if let Some(item) = pending.pop_front() {
+                    return Some((item, (inner, assemblers, pending, eof)));
+                }
+
+                if eof {
+                    return None;
+                }
+
+                match inner.next().await {
+                    Some(Ok(event)) => match event {
+                        StreamEvent::ToolCallStart { id, name } => {
+                            assemblers.insert(
+                                id.clone(),
+                                ToolCallAssembler::new(id.clone(), name.clone()),
+                            );
+                            pending.push_back(Ok(StreamEvent::ToolCallStart { id, name }));
+                        }
+                        StreamEvent::ToolCallDelta { id, input } => {
+                            if let Some(assembler) = assemblers.get_mut(&id) {
+                                assembler.append(&input);
+                                pending.push_back(Ok(StreamEvent::ToolCallDelta {
+                                    id: id.clone(),
+                                    input,
+                                }));
+                                if let Some(end_event) = assembler.try_emit() {
+                                    pending.push_back(Ok(end_event));
+                                }
+                            } else {
+                                pending.push_back(Ok(StreamEvent::ToolCallDelta { id, input }));
+                            }
+                        }
+                        StreamEvent::ToolCallEnd { id, name, input } => {
+                            assemblers.remove(&id);
+                            pending.push_back(Ok(StreamEvent::ToolCallEnd { id, name, input }));
+                        }
+                        StreamEvent::Done => {
+                            flush_tool_call_assemblers(&mut assemblers, &mut pending);
+                            pending.push_back(Ok(StreamEvent::Done));
+                        }
+                        other => pending.push_back(Ok(other)),
+                    },
+                    Some(Err(err)) => pending.push_back(Err(err)),
+                    None => {
+                        flush_tool_call_assemblers(&mut assemblers, &mut pending);
+                        eof = true;
+                    }
+                }
+            }
+        },
+    ))
+}
+
+pub fn parse_openai_sse(data: &str) -> Vec<StreamEvent> {
+    if data == "[DONE]" {
+        return vec![StreamEvent::Done];
+    }
+
+    let event: OpenAISSEvent = match serde_json::from_str(data) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+
+    let mut events = Vec::new();
 
     for choice in event.choices {
         if let Some(delta) = &choice.delta {
             if let Some(content) = &delta.content {
                 if !content.is_empty() {
-                    return Some(StreamEvent::TextDelta(content.clone()));
+                    events.push(StreamEvent::TextDelta(content.clone()));
                 }
             }
 
@@ -207,13 +350,13 @@ pub fn parse_openai_sse(data: &str) -> Option<StreamEvent> {
                         let has_args = func.arguments.as_deref().is_some_and(|a| !a.is_empty());
 
                         if has_name {
-                            return Some(StreamEvent::ToolCallStart {
+                            events.push(StreamEvent::ToolCallStart {
                                 id: openai_tool_call_id(tc),
                                 name: func.name.clone().unwrap_or_default(),
                             });
                         }
                         if has_args {
-                            return Some(StreamEvent::ToolCallDelta {
+                            events.push(StreamEvent::ToolCallDelta {
                                 id: openai_tool_call_id(tc),
                                 input: func.arguments.clone().unwrap_or_default(),
                             });
@@ -224,20 +367,21 @@ pub fn parse_openai_sse(data: &str) -> Option<StreamEvent> {
         }
 
         if let Some(reason) = &choice.finish_reason {
-            if reason == "stop" {
-                return Some(StreamEvent::Done);
+            match reason.as_str() {
+                "stop" | "tool_calls" => events.push(StreamEvent::Done),
+                _ => {}
             }
         }
     }
 
     if let Some(usage) = event.usage {
-        return Some(StreamEvent::Usage {
+        events.push(StreamEvent::Usage {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
         });
     }
 
-    None
+    events
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,13 +486,130 @@ pub fn parse_anthropic_sse(data: &str) -> Option<StreamEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    fn mock_stream(events: Vec<StreamEvent>) -> StreamResult {
+        Box::pin(futures::stream::iter(
+            events
+                .into_iter()
+                .map(|event| Ok::<_, ProviderError>(event)),
+        ))
+    }
+
+    async fn collect_events(stream: StreamResult) -> Vec<StreamEvent> {
+        stream
+            .map(|item| item.expect("expected Ok stream event"))
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    #[test]
+    fn is_parsable_json_checks_complete_json() {
+        assert!(is_parsable_json(r#"{"key":"value"}"#));
+        assert!(!is_parsable_json(r#"{"key":"#));
+        assert!(!is_parsable_json(""));
+    }
+
+    #[test]
+    fn tool_call_assembler_emits_when_json_is_complete() {
+        let mut assembler = ToolCallAssembler::new("tool-call-0".into(), "read".into());
+        assembler.append("{\"path\":\"");
+        assert!(assembler.try_emit().is_none());
+
+        assembler.append("/tmp/a\"}");
+        let event = assembler.try_emit().expect("should emit ToolCallEnd");
+        match event {
+            StreamEvent::ToolCallEnd { id, name, input } => {
+                assert_eq!(id, "tool-call-0");
+                assert_eq!(name, "read");
+                assert_eq!(input, serde_json::json!({"path": "/tmp/a"}));
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_tool_calls_emits_mid_stream_tool_call_end() {
+        let stream = mock_stream(vec![
+            StreamEvent::ToolCallStart {
+                id: "tool-call-0".into(),
+                name: "read".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                id: "tool-call-0".into(),
+                input: "{\"path\":\"".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                id: "tool-call-0".into(),
+                input: "/tmp/a\"}".into(),
+            },
+            StreamEvent::TextDelta("after-tool-call".into()),
+            StreamEvent::Done,
+        ]);
+
+        let events = collect_events(assemble_tool_calls(stream)).await;
+        assert!(matches!(events[0], StreamEvent::ToolCallStart { .. }));
+        assert!(matches!(events[1], StreamEvent::ToolCallDelta { .. }));
+        assert!(matches!(events[2], StreamEvent::ToolCallDelta { .. }));
+        assert!(matches!(events[3], StreamEvent::ToolCallEnd { .. }));
+        assert!(matches!(events[4], StreamEvent::TextDelta(_)));
+        assert!(matches!(events[5], StreamEvent::Done));
+    }
+
+    #[tokio::test]
+    async fn assemble_tool_calls_flushes_unfinished_tool_call_on_done() {
+        let stream = mock_stream(vec![
+            StreamEvent::ToolCallStart {
+                id: "tool-call-0".into(),
+                name: "read".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                id: "tool-call-0".into(),
+                input: r#"{"path":"incomplete""#.into(),
+            },
+            StreamEvent::Done,
+        ]);
+
+        let events = collect_events(assemble_tool_calls(stream)).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallEnd {
+                id,
+                name,
+                input
+            } if id == "tool-call-0" && name == "read" && input == &serde_json::json!({})
+        )));
+    }
+
+    #[tokio::test]
+    async fn assemble_tool_calls_passthrough_existing_tool_call_end() {
+        let stream = mock_stream(vec![
+            StreamEvent::ToolCallEnd {
+                id: "tool-call-9".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "/tmp/z"}),
+            },
+            StreamEvent::Done,
+        ]);
+
+        let events = collect_events(assemble_tool_calls(stream)).await;
+        let end_count = events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+            .count();
+        assert_eq!(
+            end_count, 1,
+            "existing ToolCallEnd should not be duplicated"
+        );
+    }
 
     #[test]
     fn parse_openai_sse_uses_fallback_id_for_tool_start() {
         let data =
             r#"{"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"name":"bash"}}]}}]}"#;
-        let event = parse_openai_sse(data).expect("event should parse");
-        match event {
+        let events = parse_openai_sse(data);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::ToolCallStart { id, name } => {
                 assert_eq!(id, "tool-call-2");
                 assert_eq!(name, "bash");
@@ -360,8 +621,9 @@ mod tests {
     #[test]
     fn parse_openai_sse_uses_fallback_id_for_tool_delta() {
         let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"arguments":"{\"x\":1}"}}]}}]}"#;
-        let event = parse_openai_sse(data).expect("event should parse");
-        match event {
+        let events = parse_openai_sse(data);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::ToolCallDelta { id, input } => {
                 assert_eq!(id, "tool-call-2");
                 assert_eq!(input, "{\"x\":1}");
@@ -371,12 +633,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_openai_sse_does_not_end_on_tool_calls_finish_reason() {
+    fn parse_openai_sse_ends_on_tool_calls_finish_reason() {
         let data = r#"{"choices":[{"finish_reason":"tool_calls"}]}"#;
-        let event = parse_openai_sse(data);
+        let events = parse_openai_sse(data);
+        assert_eq!(events.len(), 1);
         assert!(
-            event.is_none(),
-            "tool_calls finish_reason should not end stream"
+            matches!(events[0], StreamEvent::Done),
+            "tool_calls finish_reason should emit Done"
         );
     }
 
@@ -410,16 +673,17 @@ mod tests {
     fn parse_openai_sse_skips_empty_tool_name() {
         // Ollama models sometimes send an empty tool name string.
         let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":""}}]}}]}"#;
-        let event = parse_openai_sse(data);
-        assert!(event.is_none(), "empty tool name should be ignored");
+        let events = parse_openai_sse(data);
+        assert!(events.is_empty(), "empty tool name should be ignored");
     }
 
     #[test]
     fn parse_openai_sse_skips_null_tool_name_emits_args() {
         // When name is absent but arguments are present, emit ToolCallDelta.
         let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"path\":\".\"}"}}]}}]}"#;
-        let event = parse_openai_sse(data).expect("event should parse");
-        match event {
+        let events = parse_openai_sse(data);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::ToolCallDelta { id, input } => {
                 assert_eq!(id, "tool-call-1");
                 assert_eq!(input, r#"{"path":"."}"#);
@@ -434,13 +698,37 @@ mod tests {
         // use the index-based ID so that subsequent delta chunks (which lack
         // the explicit id) produce matching IDs.
         let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc123","function":{"name":"read"}}]}}]}"#;
-        let event = parse_openai_sse(data).expect("event should parse");
-        match event {
+        let events = parse_openai_sse(data);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::ToolCallStart { id, name } => {
                 assert_eq!(id, "tool-call-0", "should use index, not explicit id");
                 assert_eq!(name, "read");
             }
             other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_openai_sse_emits_both_start_and_delta_in_same_event() {
+        // When both name and arguments arrive in the same SSE event,
+        // both ToolCallStart and ToolCallDelta should be emitted.
+        let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_xyz","function":{"name":"read","arguments":"{\"file_path\":\"/tmp/test\"}"}}]}}]}"#;
+        let events = parse_openai_sse(data);
+        assert_eq!(events.len(), 2, "should emit both start and delta");
+        match &events[0] {
+            StreamEvent::ToolCallStart { id, name } => {
+                assert_eq!(id, "tool-call-0");
+                assert_eq!(name, "read");
+            }
+            other => panic!("expected ToolCallStart, got: {:?}", other),
+        }
+        match &events[1] {
+            StreamEvent::ToolCallDelta { id, input } => {
+                assert_eq!(id, "tool-call-0");
+                assert_eq!(input, r#"{"file_path":"/tmp/test"}"#);
+            }
+            other => panic!("expected ToolCallDelta, got: {:?}", other),
         }
     }
 }

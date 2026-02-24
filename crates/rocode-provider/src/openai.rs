@@ -1154,7 +1154,7 @@ impl OpenAIProvider {
             },
         );
 
-        Ok(Box::pin(stream))
+        Ok(crate::stream::assemble_tool_calls(Box::pin(stream)))
     }
 }
 

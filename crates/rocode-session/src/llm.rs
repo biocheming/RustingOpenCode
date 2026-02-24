@@ -1432,7 +1432,6 @@ pub async fn collect_stream(
 ) -> anyhow::Result<StreamResult> {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
-    let mut current_tool: Option<ToolCallResult> = None;
     let mut finish_reason = None;
 
     while let Some(event) = output.events.recv().await {
@@ -1450,46 +1449,13 @@ pub async fn collect_stream(
             StreamEvent::ReasoningStart { .. } => {}
             StreamEvent::ReasoningDelta { .. } => {}
             StreamEvent::ReasoningEnd { .. } => {}
-            StreamEvent::ToolInputStart { id, tool_name } => {
-                current_tool = Some(ToolCallResult {
-                    id,
-                    name: tool_name,
-                    input: serde_json::Value::Null,
-                });
-            }
-            StreamEvent::ToolInputDelta { delta, .. } => {
-                if let Some(ref mut tool) = current_tool {
-                    if tool.input.is_null() {
-                        tool.input = serde_json::Value::String(delta);
-                    } else if let Some(s) = tool.input.as_str() {
-                        let mut existing = s.to_string();
-                        existing.push_str(&delta);
-                        tool.input = serde_json::Value::String(existing);
-                    }
-                }
-            }
+            StreamEvent::ToolInputStart { .. } => {}
+            StreamEvent::ToolInputDelta { .. } => {}
             StreamEvent::ToolInputEnd { .. } => {}
-            StreamEvent::ToolCallStart { id, name } => {
-                current_tool = Some(ToolCallResult {
-                    id,
-                    name,
-                    input: serde_json::Value::Null,
-                });
-            }
-            StreamEvent::ToolCallDelta { input, .. } => {
-                if let Some(ref mut tool) = current_tool {
-                    if tool.input.is_null() {
-                        tool.input = serde_json::Value::String(input);
-                    } else if let Some(s) = tool.input.as_str() {
-                        let mut existing = s.to_string();
-                        existing.push_str(&input);
-                        tool.input = serde_json::Value::String(existing);
-                    }
-                }
-            }
+            StreamEvent::ToolCallStart { .. } => {}
+            StreamEvent::ToolCallDelta { .. } => {}
             StreamEvent::ToolCallEnd { id, name, input } => {
                 tool_calls.push(ToolCallResult { id, name, input });
-                current_tool = None;
             }
             StreamEvent::ToolResult { .. } => {}
             StreamEvent::ToolError { .. } => {}
@@ -1853,5 +1819,86 @@ mod tests {
             Some(StreamToolErrorKind::ExecutionError),
             "anything"
         ));
+    }
+
+    /// Helper: send events through a channel and collect the stream result.
+    async fn run_collect_stream(events: Vec<StreamEvent>) -> StreamResult {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        for event in events {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx); // close channel so recv() returns None
+        let output = StreamOutput { events: rx };
+        let abort = tokio_util::sync::CancellationToken::new();
+        collect_stream(output, abort).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_collects_tool_call_end_events() {
+        let result = run_collect_stream(vec![
+            StreamEvent::ToolCallEnd {
+                id: "tool-call-0".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "/tmp"}),
+            },
+            StreamEvent::ToolCallEnd {
+                id: "tool-call-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"cmd": "ls"}),
+            },
+            StreamEvent::Done,
+        ])
+        .await;
+
+        assert_eq!(result.tool_calls.len(), 2);
+        let read_tc = result.tool_calls.iter().find(|t| t.name == "read").unwrap();
+        assert_eq!(read_tc.input, serde_json::json!({"path": "/tmp"}));
+        let bash_tc = result.tool_calls.iter().find(|t| t.name == "bash").unwrap();
+        assert_eq!(bash_tc.input, serde_json::json!({"cmd": "ls"}));
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_ignores_partial_tool_calls_without_end() {
+        let result = run_collect_stream(vec![
+            StreamEvent::ToolCallStart {
+                id: "tool-call-0".into(),
+                name: "read".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                id: "tool-call-0".into(),
+                input: r#"{"file":"/a"}"#.into(),
+            },
+        ])
+        .await;
+
+        assert!(result.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_tool_call_end_is_authoritative() {
+        // When ToolCallEnd arrives, it should override any accumulated data.
+        let result = run_collect_stream(vec![
+            StreamEvent::ToolCallStart {
+                id: "tool-call-0".into(),
+                name: "read".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                id: "tool-call-0".into(),
+                input: r#"{"partial"#.into(),
+            },
+            StreamEvent::ToolCallEnd {
+                id: "tool-call-0".into(),
+                name: "read".into(),
+                input: serde_json::json!({"complete": true}),
+            },
+            StreamEvent::Done,
+        ])
+        .await;
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].input,
+            serde_json::json!({"complete": true})
+        );
     }
 }

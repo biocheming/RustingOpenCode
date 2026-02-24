@@ -178,7 +178,8 @@ impl AgentExecutor {
             self.conversation.add_assistant_message(&response);
 
             for tool_call in tool_calls {
-                let result = self.execute_tool(&tool_call).await;
+                let effective_tool_call = self.repair_tool_call(tool_call).await;
+                let result = self.execute_tool(&effective_tool_call).await;
 
                 let (content, is_error) = match result {
                     Ok(output) => (output, false),
@@ -186,8 +187,8 @@ impl AgentExecutor {
                 };
 
                 self.conversation.add_tool_result(
-                    &tool_call.id,
-                    &tool_call.name,
+                    &effective_tool_call.id,
+                    &effective_tool_call.name,
                     content,
                     is_error,
                 );
@@ -240,7 +241,10 @@ impl AgentExecutor {
             self.conversation.add_assistant_message(&response);
 
             for tool_call in tool_calls {
-                let result = self.execute_tool_without_subsessions(&tool_call).await;
+                let effective_tool_call = self.repair_tool_call(tool_call).await;
+                let result = self
+                    .execute_tool_without_subsessions(&effective_tool_call)
+                    .await;
 
                 let (content, is_error) = match result {
                     Ok(output) => (output, false),
@@ -248,8 +252,8 @@ impl AgentExecutor {
                 };
 
                 self.conversation.add_tool_result(
-                    &tool_call.id,
-                    &tool_call.name,
+                    &effective_tool_call.id,
+                    &effective_tool_call.name,
                     content,
                     is_error,
                 );
@@ -318,33 +322,17 @@ impl AgentExecutor {
                 Ok(StreamEvent::TextDelta(text)) => {
                     content.push_str(&text);
                 }
-                Ok(StreamEvent::ToolCallStart { id, name }) => {
+                Ok(StreamEvent::ToolCallStart { .. }) => {}
+                Ok(StreamEvent::ToolCallDelta { .. }) => {}
+                Ok(StreamEvent::ToolInputStart { .. }) => {}
+                Ok(StreamEvent::ToolInputDelta { .. }) => {}
+                Ok(StreamEvent::ToolInputEnd { .. }) => {}
+                Ok(StreamEvent::ToolCallEnd { id, name, input }) => {
                     tool_calls.push(ToolCall {
                         id,
                         name,
-                        arguments: serde_json::Value::Null,
+                        arguments: input,
                     });
-                }
-                Ok(StreamEvent::ToolCallDelta { id, input }) => {
-                    // Find matching tool call by id, or fall back to the last one
-                    // (Anthropic streams send empty id in deltas, using block index instead)
-                    let tc = if id.is_empty() {
-                        tool_calls.last_mut()
-                    } else {
-                        tool_calls.iter_mut().find(|t| t.id == id)
-                    };
-                    if let Some(tc) = tc {
-                        if tc.arguments.is_null() {
-                            tc.arguments =
-                                serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
-                        } else if let Some(existing) = tc.arguments.as_str() {
-                            // Append partial JSON fragments
-                            let mut combined = existing.to_string();
-                            combined.push_str(&input);
-                            tc.arguments = serde_json::from_str(&combined)
-                                .unwrap_or(serde_json::Value::String(combined));
-                        }
-                    }
                 }
                 Ok(StreamEvent::Done) => break,
                 Ok(StreamEvent::Error(e)) => {
@@ -524,6 +512,22 @@ impl AgentExecutor {
         Some(format!("{}:{}", provider.id(), model_id))
     }
 
+    async fn repair_tool_call(&self, tool_call: ToolCall) -> ToolCall {
+        let available_tools = self.tools.list_ids().await;
+        let repaired_name = repair_tool_call_name(&tool_call.name, &available_tools)
+            .unwrap_or_else(|| tool_call.name.clone());
+
+        if repaired_name == tool_call.name {
+            return tool_call;
+        }
+
+        ToolCall {
+            id: tool_call.id,
+            name: repaired_name,
+            arguments: tool_call.arguments,
+        }
+    }
+
     fn ensure_tool_allowed(&self, tool_name: &str) -> Result<(), ToolError> {
         match self.agent.tool_permission_decision(tool_name) {
             crate::PermissionDecision::Allow => Ok(()),
@@ -537,6 +541,23 @@ impl AgentExecutor {
             ))),
         }
     }
+}
+
+fn repair_tool_call_name(name: &str, available_tools: &[String]) -> Option<String> {
+    if available_tools.iter().any(|tool| tool == name) {
+        return None;
+    }
+
+    let lower = name.to_ascii_lowercase();
+    if lower != name && available_tools.iter().any(|tool| tool == &lower) {
+        return Some(lower);
+    }
+
+    if available_tools.iter().any(|tool| tool == "invalid") {
+        return Some("invalid".to_string());
+    }
+
+    None
 }
 
 fn parse_model_string(raw: Option<&str>) -> Option<(String, String)> {
@@ -631,5 +652,106 @@ mod tests {
             matches!(denied, ToolError::PermissionDenied(_)),
             "expected permission denied, got: {denied}"
         );
+    }
+
+    #[test]
+    fn repair_tool_call_name_fixes_case_when_lower_tool_exists() {
+        let available = vec!["read".to_string(), "invalid".to_string()];
+        let repaired = repair_tool_call_name("Read", &available);
+        assert_eq!(repaired.as_deref(), Some("read"));
+    }
+
+    #[test]
+    fn repair_tool_call_name_falls_back_to_invalid_tool() {
+        let available = vec!["read".to_string(), "invalid".to_string()];
+        let repaired = repair_tool_call_name("missing_tool", &available);
+        assert_eq!(repaired.as_deref(), Some("invalid"));
+    }
+
+    /// Build a mock stream from a sequence of StreamEvents.
+    fn mock_stream(events: Vec<StreamEvent>) -> rocode_provider::StreamResult {
+        let stream = futures::stream::iter(
+            events
+                .into_iter()
+                .map(|e| Ok::<_, rocode_provider::ProviderError>(e)),
+        );
+        Box::pin(stream)
+    }
+
+    #[tokio::test]
+    async fn process_stream_uses_tool_call_end_as_authoritative() {
+        let mut executor = build_executor(AgentInfo::general());
+        let stream = mock_stream(vec![
+            StreamEvent::ToolCallStart {
+                id: "tool-call-0".into(),
+                name: "read".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                id: "tool-call-0".into(),
+                input: r#"{"partial":true"#.into(),
+            },
+            StreamEvent::ToolCallEnd {
+                id: "tool-call-0".into(),
+                name: "read".into(),
+                input: serde_json::json!({"file_path": "/tmp/test"}),
+            },
+            StreamEvent::Done,
+        ]);
+
+        let (_, tool_calls) = executor.process_stream(stream).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "read");
+        assert_eq!(
+            tool_calls[0].arguments,
+            serde_json::json!({"file_path": "/tmp/test"})
+        );
+    }
+
+    #[tokio::test]
+    async fn process_stream_ignores_partial_tool_call_without_end() {
+        let mut executor = build_executor(AgentInfo::general());
+        let stream = mock_stream(vec![
+            StreamEvent::ToolCallStart {
+                id: "tool-call-0".into(),
+                name: "bash".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                id: "tool-call-0".into(),
+                input: r#"{"command":"ls"}"#.into(),
+            },
+        ]);
+
+        let (_, tool_calls) = executor.process_stream(stream).await.unwrap();
+        assert!(tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_stream_handles_multiple_tool_call_end_events() {
+        let mut executor = build_executor(AgentInfo::general());
+        let stream = mock_stream(vec![
+            StreamEvent::ToolCallEnd {
+                id: "tool-call-0".into(),
+                name: "read".into(),
+                input: serde_json::json!({"file_path": "/tmp/a"}),
+            },
+            StreamEvent::ToolCallEnd {
+                id: "tool-call-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+            StreamEvent::Done,
+        ]);
+
+        let (_, tool_calls) = executor.process_stream(stream).await.unwrap();
+        assert_eq!(tool_calls.len(), 2);
+
+        let read_tc = tool_calls.iter().find(|t| t.name == "read").unwrap();
+        assert_eq!(
+            read_tc.arguments,
+            serde_json::json!({"file_path": "/tmp/a"})
+        );
+
+        let bash_tc = tool_calls.iter().find(|t| t.name == "bash").unwrap();
+        assert_eq!(bash_tc.arguments, serde_json::json!({"command": "ls"}));
     }
 }

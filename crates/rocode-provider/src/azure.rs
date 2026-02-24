@@ -194,25 +194,26 @@ impl Provider for AzureProvider {
             return Err(ProviderError::ApiError(format!("{}: {}", status, body)));
         }
 
-        let stream = response
-            .bytes_stream()
-            .map(move |chunk_result| match chunk_result {
+        let stream = response.bytes_stream().flat_map(move |chunk_result| {
+            let events: Vec<Result<StreamEvent, ProviderError>> = match chunk_result {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
+                    let mut events = Vec::new();
                     for line in text.lines() {
                         if line.starts_with("data: ") {
                             let data = &line[6..];
-                            if let Some(event) = crate::stream::parse_openai_sse(data) {
-                                return Ok(event);
-                            }
+                            events
+                                .extend(crate::stream::parse_openai_sse(data).into_iter().map(Ok));
                         }
                     }
-                    Ok(StreamEvent::TextDelta(String::new()))
+                    events
                 }
-                Err(e) => Err(ProviderError::StreamError(e.to_string())),
-            });
+                Err(e) => vec![Err(ProviderError::StreamError(e.to_string()))],
+            };
+            futures::stream::iter(events)
+        });
 
-        Ok(Box::pin(stream))
+        Ok(crate::stream::assemble_tool_calls(Box::pin(stream)))
     }
 }
 
