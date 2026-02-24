@@ -234,8 +234,8 @@ mod tests {
     fn test_instructions() {
         let inst = SystemPrompt::instructions();
         assert!(!inst.is_empty());
-        // codex_header.txt starts with "You are OpenCode"
-        assert!(inst.starts_with("You are OpenCode"));
+        // codex_header.txt starts with "You are ROCode"
+        assert!(inst.starts_with("You are ROCode"));
     }
 
     #[test]
