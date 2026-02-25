@@ -1,5 +1,7 @@
 /target
 target/
+/test
+test/
 *.swp
 *.swo
 *~
