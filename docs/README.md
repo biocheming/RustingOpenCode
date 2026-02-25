@@ -1,6 +1,13 @@
 # RustingOpenCode 文档索引
 
-本文档集合对应 `RustingOpenCode (ROCode)` 当前代码状态（版本标识：`2026.02.24`）。
+文档基线：v2026.2.25（更新日期：2026-02-25）
+
+本文档集合对应 `RustingOpenCode (ROCode)` 当前代码状态（版本标识：`v2026.2.25`）。
+
+## 本轮重点同步（2026-02-25）
+
+- 已按源码更新核心模块文档：`rocode-cli`、`rocode-core`、`rocode-agent`、`rocode-plugin`、`rocode-provider`、`rocode-server`、`rocode-session`、`rocode-tool`、`rocode-mcp`、`rocode-tui`。
+- `rocode-session` 文档已移除过时的 `llm.rs` 描述，并补充 `mcp_bridge` 与 compaction hook 新行为。
 
 ## 快速入口
 

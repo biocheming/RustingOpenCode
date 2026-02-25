@@ -5,6 +5,8 @@ description: Structured folder purpose analysis with concise evidence.
 
 # Folder Inspector Skill
 
+文档基线：v2026.2.25（更新日期：2026-02-25）
+
 When user asks what a folder does, follow this workflow:
 
 1. Run `ls` for top-level files.

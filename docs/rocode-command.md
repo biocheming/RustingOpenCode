@@ -1,5 +1,7 @@
 # rocode-command
 
+文档基线：v2026.2.25（更新日期：2026-02-25）
+
 `rocode-command` 实现 Slash Command 系统，支持内置命令、文件命令、MCP 命令与技能命令。
 
 ## 主要职责

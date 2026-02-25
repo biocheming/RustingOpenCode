@@ -1,5 +1,7 @@
 # rocode-lsp
 
+文档基线：v2026.2.25（更新日期：2026-02-25）
+
 `rocode-lsp` 提供 Language Server Protocol 客户端能力，用于代码智能分析与编辑辅助。
 
 ## 主要职责
