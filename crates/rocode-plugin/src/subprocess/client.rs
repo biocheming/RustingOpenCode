@@ -293,7 +293,7 @@ impl PluginSubprocess {
         });
 
         let rpc_guard = self.rpc_lock.clone().lock_owned().await;
-        self.write_request(id, "auth.fetch.stream", Some(params))
+        self.write_request_with_timeout(id, "auth.fetch.stream", Some(params))
             .await?;
 
         let (start_tx, start_rx) = oneshot::channel::<
@@ -434,7 +434,7 @@ impl PluginSubprocess {
     ) -> Result<T, PluginSubprocessError> {
         let _rpc_guard = self.rpc_lock.lock().await;
         let id = self.next_id();
-        self.write_request(id, method, params).await?;
+        self.write_request_with_timeout(id, method, params).await?;
 
         // Read response with timeout
         let response = tokio::time::timeout(self.timeout, self.read_response_for_id(id))
@@ -463,6 +463,17 @@ impl PluginSubprocess {
         stdin.write_all(frame.as_bytes()).await?;
         stdin.flush().await?;
         Ok(())
+    }
+
+    async fn write_request_with_timeout(
+        &self,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<(), PluginSubprocessError> {
+        tokio::time::timeout(self.timeout, self.write_request(id, method, params))
+            .await
+            .map_err(|_| PluginSubprocessError::Timeout)?
     }
 
     async fn read_response_for_id(
