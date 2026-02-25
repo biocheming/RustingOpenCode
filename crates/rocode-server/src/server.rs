@@ -556,7 +556,12 @@ fn cors_layer() -> CorsLayer {
 }
 
 pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
-    let state = Arc::new(ServerState::new_with_storage_for_url(format!("http://{}", addr)).await?);
+    let server_url = if addr.ip().is_unspecified() {
+        format!("http://127.0.0.1:{}", addr.port())
+    } else {
+        format!("http://{}", addr)
+    };
+    let state = Arc::new(ServerState::new_with_storage_for_url(server_url).await?);
 
     let app = routes::router()
         .layer(cors_layer())

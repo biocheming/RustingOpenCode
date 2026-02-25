@@ -38,6 +38,9 @@ interface PluginContext {
   serverUrl: string;
 }
 
+const LOCAL_NO_PROXY_ENTRIES = ["127.0.0.1", "localhost", "::1", "0.0.0.0"];
+const LOCAL_SDK_REQUEST_TIMEOUT_MS = 8000;
+
 type UnknownRecord = Record<string, unknown>;
 
 interface Hooks {
@@ -259,10 +262,56 @@ function createNoopClientProxy(path: string[] = []): unknown {
   });
 }
 
+function normalizeServerUrl(raw: string): string {
+  try {
+    const parsed = new URL(raw);
+    if (parsed.hostname === "0.0.0.0") {
+      parsed.hostname = "127.0.0.1";
+    } else if (parsed.hostname === "::" || parsed.hostname === "[::]") {
+      parsed.hostname = "localhost";
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return raw;
+  }
+}
+
+function ensureLocalNoProxy(): void {
+  const existing = process.env.NO_PROXY ?? process.env.no_proxy ?? "";
+  const merged = new Set(
+    existing
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  );
+  for (const host of LOCAL_NO_PROXY_ENTRIES) {
+    merged.add(host);
+  }
+  const value = Array.from(merged).join(",");
+  process.env.NO_PROXY = value;
+  process.env.no_proxy = value;
+}
+
+function createSdkFetch() {
+  return async (request: Request): Promise<Response> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), LOCAL_SDK_REQUEST_TIMEOUT_MS);
+    try {
+      const reqWithSignal = new Request(request, { signal: controller.signal });
+      return await fetch(reqWithSignal);
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+}
+
 async function createPluginClient(
   context: PluginContext,
   pluginPath: string,
 ): Promise<unknown> {
+  ensureLocalNoProxy();
+  const normalizedServerUrl = normalizeServerUrl(context.serverUrl);
+  const sdkFetch = createSdkFetch();
   const candidateUrls = new Set<string>();
   const addCandidate = (url: string) => {
     candidateUrls.add(url);
@@ -273,8 +322,9 @@ async function createPluginClient(
     const createOpencodeClient = sdk["createOpencodeClient"];
     if (typeof createOpencodeClient === "function") {
       return (createOpencodeClient as (config: UnknownRecord) => unknown)({
-        baseUrl: context.serverUrl,
+        baseUrl: normalizedServerUrl,
         directory: context.directory,
+        fetch: sdkFetch,
       });
     }
   } catch {
@@ -355,8 +405,9 @@ async function createPluginClient(
       const createOpencodeClient = sdk["createOpencodeClient"];
       if (typeof createOpencodeClient === "function") {
         return (createOpencodeClient as (config: UnknownRecord) => unknown)({
-          baseUrl: context.serverUrl,
+          baseUrl: normalizedServerUrl,
           directory: context.directory,
+          fetch: sdkFetch,
         });
       }
     } catch {
