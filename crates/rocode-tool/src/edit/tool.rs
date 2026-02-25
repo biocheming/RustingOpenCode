@@ -70,21 +70,27 @@ impl Tool for EditTool {
             .get("file_path")
             .or_else(|| args.get("filePath"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments("file_path (or filePath) is required".into()))?
+            .ok_or_else(|| {
+                ToolError::InvalidArguments("file_path (or filePath) is required".into())
+            })?
             .to_string();
 
         let old_string: String = args
             .get("old_string")
             .or_else(|| args.get("oldString"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments("old_string (or oldString) is required".into()))?
+            .ok_or_else(|| {
+                ToolError::InvalidArguments("old_string (or oldString) is required".into())
+            })?
             .to_string();
 
         let new_string: String = args
             .get("new_string")
             .or_else(|| args.get("newString"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments("new_string (or newString) is required".into()))?
+            .ok_or_else(|| {
+                ToolError::InvalidArguments("new_string (or newString) is required".into())
+            })?
             .to_string();
 
         let replace_all = args

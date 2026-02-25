@@ -117,6 +117,15 @@ impl Conversation {
         self.messages.push(AgentMessage::assistant(content));
     }
 
+    pub fn add_assistant_message_with_tools(
+        &mut self,
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) {
+        self.messages
+            .push(AgentMessage::assistant_with_tools(content, tool_calls));
+    }
+
     pub fn add_tool_result(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -138,7 +147,49 @@ impl Conversation {
             .map(|m| match &m.role {
                 MessageRole::System => rocode_provider::Message::system(&m.content),
                 MessageRole::User => rocode_provider::Message::user(&m.content),
-                MessageRole::Assistant => rocode_provider::Message::assistant(&m.content),
+                MessageRole::Assistant => {
+                    if m.tool_calls.is_empty() {
+                        rocode_provider::Message::assistant(&m.content)
+                    } else {
+                        let mut parts = Vec::new();
+                        if !m.content.is_empty() {
+                            parts.push(rocode_provider::ContentPart {
+                                content_type: "text".to_string(),
+                                text: Some(m.content.clone()),
+                                image_url: None,
+                                tool_use: None,
+                                tool_result: None,
+                                cache_control: None,
+                                filename: None,
+                                media_type: None,
+                                provider_options: None,
+                            });
+                        }
+                        for call in &m.tool_calls {
+                            parts.push(rocode_provider::ContentPart {
+                                content_type: "tool_use".to_string(),
+                                text: None,
+                                image_url: None,
+                                tool_use: Some(rocode_provider::ToolUse {
+                                    id: call.id.clone(),
+                                    name: call.name.clone(),
+                                    input: call.arguments.clone(),
+                                }),
+                                tool_result: None,
+                                cache_control: None,
+                                filename: None,
+                                media_type: None,
+                                provider_options: None,
+                            });
+                        }
+                        rocode_provider::Message {
+                            role: rocode_provider::Role::Assistant,
+                            content: rocode_provider::Content::Parts(parts),
+                            cache_control: None,
+                            provider_options: None,
+                        }
+                    }
+                }
                 MessageRole::Tool => {
                     let tool_result =
                         m.tool_result
@@ -178,5 +229,46 @@ impl Conversation {
 impl Default for Conversation {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_with_tool_calls_serializes_tool_use_parts() {
+        let mut conversation = Conversation::new();
+        conversation.add_assistant_message_with_tools(
+            "",
+            vec![ToolCall {
+                id: "tool-call-0".to_string(),
+                name: "ls".to_string(),
+                arguments: serde_json::json!({"path":"."}),
+            }],
+        );
+
+        let provider_messages = conversation.to_provider_messages();
+        assert_eq!(provider_messages.len(), 1);
+        let message = &provider_messages[0];
+        match &message.content {
+            rocode_provider::Content::Parts(parts) => {
+                assert!(parts.iter().any(|part| {
+                    part.content_type == "tool_use"
+                        && part
+                            .tool_use
+                            .as_ref()
+                            .map(|tool| {
+                                tool.name == "ls"
+                                    && tool.id == "tool-call-0"
+                                    && tool.input == serde_json::json!({"path":"."})
+                            })
+                            .unwrap_or(false)
+                }));
+            }
+            rocode_provider::Content::Text(_) => {
+                panic!("assistant message with tool calls must serialize as parts");
+            }
+        }
     }
 }

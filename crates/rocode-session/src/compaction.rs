@@ -2,18 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use rocode_core::bus::{Bus, BusEventDef};
 use rocode_plugin::{HookContext, HookEvent};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{
-    collect_stream, to_model_messages, LlmAgent, LlmModelRef, LlmProcessor, StreamInput,
-};
 use crate::message_v2::{
     AssistantTime, AssistantTokens, CacheTokens, CompletedTime, MessageInfo, MessagePath,
     MessageWithParts, ModelRef, Part, TextTime, ToolState, UserTime,
 };
-use rocode_provider::{Message, Provider};
+use rocode_provider::{ChatRequest, Content, ContentPart, ImageUrl, Message, Provider, Role, StreamResult};
 
 const COMPACTION_BUFFER: u64 = 20_000;
 const PRUNE_MINIMUM: u64 = 20_000;
@@ -51,7 +49,7 @@ pub struct CompactionInput {
     /// Messages to summarize (already converted to provider messages).
     /// Used as fallback when `messages_with_parts` is empty.
     pub messages: Vec<Message>,
-    /// Full messages with parts for conversion via `to_model_messages()`.
+    /// Full messages with parts for conversion to provider messages.
     /// Mirrors TS `MessageV2.toModelMessages(input.messages, model)`.
     pub messages_with_parts: Vec<MessageWithParts>,
     /// Cancellation token.
@@ -59,7 +57,7 @@ pub struct CompactionInput {
     /// Whether this was auto-triggered.
     pub auto: bool,
     /// Model to use for summarization.
-    pub model: LlmModelRef,
+    pub model: ModelRef,
     /// Optional custom prompt (e.g. from a plugin hook).
     pub custom_prompt: Option<String>,
     /// Optional context strings injected by plugins.
@@ -168,6 +166,27 @@ pub trait SessionOps: Send + Sync {
         message_id: &str,
         part: Part,
     ) -> anyhow::Result<()>;
+}
+
+/// No-op implementation of `SessionOps` for callers that handle persistence
+/// externally (e.g. the prompt loop which manages the `Session` struct directly).
+pub struct NoopSessionOps;
+
+impl SessionOps for NoopSessionOps {
+    async fn messages(&self, _session_id: &str) -> anyhow::Result<Vec<MessageWithParts>> {
+        Ok(vec![])
+    }
+    async fn update_message(&self, info: MessageInfo) -> anyhow::Result<MessageInfo> {
+        Ok(info)
+    }
+    async fn update_part(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+        _part: Part,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Input for the `create()` function (mirrors TS `SessionCompaction.create`).
@@ -400,7 +419,8 @@ When constructing the summary, try to stick to this template:
     /// Mirrors TS `SessionCompaction.process`. Creates an assistant message
     /// with full metadata, fires the `experimental.session.compacting` plugin
     /// hook (with context injection), converts messages via
-    /// `to_model_messages()`, runs the LLM, and handles auto-continue.
+    /// Converts message parts to provider messages, streams compaction output,
+    /// and handles auto-continue.
     pub async fn process<S: SessionOps>(
         &self,
         input: CompactionInput,
@@ -472,70 +492,41 @@ When constructing the summary, try to stick to this template:
             hook_outputs,
         );
 
-        // Compaction agent: low temperature, no tools, capped output.
-        let agent = LlmAgent {
-            name: "compaction".to_string(),
-            system_prompt: None,
-            temperature: Some(0.0),
-            top_p: None,
-            max_tokens: Some(4096),
-        };
-
         // TS: messages: [...MessageV2.toModelMessages(input.messages, model), { role: "user", ... }]
         // Convert MessageWithParts to provider messages, then append the compaction prompt.
-        let mut llm_messages = if !input.messages_with_parts.is_empty() {
-            to_model_messages(&input.messages_with_parts)
+        let mut provider_messages = if !input.messages_with_parts.is_empty() {
+            to_provider_messages_for_compaction(&input.messages_with_parts)
         } else {
             input.messages
         };
-        llm_messages.push(Message::user(prompt_text));
+        provider_messages.push(Message::user(prompt_text));
 
-        // Build a synthetic MessageInfo::User for the stream input.
-        let user_info = MessageInfo::User {
-            id: rocode_core::id::create(rocode_core::id::Prefix::Message, false, None),
-            session_id: input.session_id.clone(),
-            time: UserTime { created: now_ms },
-            agent: "compaction".to_string(),
-            model: ModelRef {
-                provider_id: input.model.provider_id.clone(),
-                model_id: input.model.model_id.clone(),
-            },
-            format: None,
-            summary: None,
+        let request = ChatRequest {
+            model: input.model.model_id.clone(),
+            messages: provider_messages,
+            max_tokens: Some(4096),
+            temperature: Some(0.0),
             system: None,
             tools: None,
+            stream: Some(true),
+            top_p: None,
             variant: input.variant.clone(),
+            provider_options: None,
         };
 
-        let stream_input = StreamInput {
-            user: user_info,
-            session_id: input.session_id.clone(),
-            model: input.model.clone(),
-            agent,
-            system: vec![],
-            abort: input.abort.clone(),
-            messages: llm_messages,
-            small: false,
-            tools: HashMap::new(),
-            retries: Some(1),
-            tool_choice: None,
-            cost_rates: None,
-            work_dir: None,
-        };
-
-        match LlmProcessor::stream(stream_input, provider).await {
-            Ok(output) => {
-                let result = collect_stream(output, input.abort.clone()).await?;
+        match provider.chat_stream(request).await {
+            Ok(stream) => {
+                let text = collect_compaction_text(stream, input.abort.clone()).await?;
 
                 tracing::info!(
                     session_id = %input.session_id,
-                    summary_length = result.text.len(),
+                    summary_length = text.len(),
                     "Compaction summary generated"
                 );
 
                 // TS: if (processor.message.error) return "stop"
                 // If the LLM returned empty text, treat it as an error.
-                if result.text.is_empty() {
+                if text.is_empty() {
                     tracing::warn!(
                         session_id = %input.session_id,
                         "Compaction produced empty summary"
@@ -553,7 +544,7 @@ When constructing the summary, try to stick to this template:
                         id: rocode_core::id::create(rocode_core::id::Prefix::Part, false, None),
                         session_id: input.session_id.clone(),
                         message_id: assistant_id.clone(),
-                        text: result.text.clone(),
+                        text: text.clone(),
                         synthetic: Some(true),
                         ignored: None,
                         time: Some(TextTime {
@@ -653,7 +644,7 @@ When constructing the summary, try to stick to this template:
                 tracing::error!(
                     session_id = %input.session_id,
                     error = %e,
-                    "Compaction LLM call failed"
+                    "Compaction provider stream failed"
                 );
                 Ok(CompactionResult::Stop)
             }
@@ -896,12 +887,129 @@ fn resolve_compaction_prompt(
     })
 }
 
-/// Convenience function to run the full LLM-based compaction for a session.
+fn to_provider_messages_for_compaction(messages: &[MessageWithParts]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter_map(|msg| message_to_provider_for_compaction(&msg.info, &msg.parts))
+        .collect()
+}
+
+fn message_to_provider_for_compaction(info: &MessageInfo, parts: &[Part]) -> Option<Message> {
+    let role = match info {
+        MessageInfo::User { .. } => Role::User,
+        MessageInfo::Assistant { .. } => Role::Assistant,
+    };
+
+    let content = if parts.len() == 1 {
+        match &parts[0] {
+            Part::Text { text, .. } => Content::Text(text.clone()),
+            _ => Content::Parts(
+                parts
+                    .iter()
+                    .filter_map(part_to_content_part_for_compaction)
+                    .collect(),
+            ),
+        }
+    } else {
+        Content::Parts(
+            parts
+                .iter()
+                .filter_map(part_to_content_part_for_compaction)
+                .collect(),
+        )
+    };
+
+    Some(Message {
+        role,
+        content,
+        cache_control: None,
+        provider_options: None,
+    })
+}
+
+fn part_to_content_part_for_compaction(part: &Part) -> Option<ContentPart> {
+    match part {
+        Part::Text { text, .. } => Some(ContentPart {
+            content_type: "text".to_string(),
+            text: Some(text.clone()),
+            image_url: None,
+            tool_use: None,
+            tool_result: None,
+            cache_control: None,
+            filename: None,
+            media_type: None,
+            provider_options: None,
+        }),
+        Part::File(file_part) => Some(ContentPart {
+            content_type: "file".to_string(),
+            text: None,
+            image_url: Some(ImageUrl {
+                url: file_part.url.clone(),
+            }),
+            tool_use: None,
+            tool_result: None,
+            cache_control: None,
+            filename: file_part.filename.clone(),
+            media_type: Some(file_part.mime.clone()),
+            provider_options: None,
+        }),
+        Part::Tool(tool_part) => {
+            if let crate::ToolState::Completed { output, .. } = &tool_part.state {
+                Some(ContentPart {
+                    content_type: "tool_result".to_string(),
+                    text: Some(output.clone()),
+                    image_url: None,
+                    tool_use: None,
+                    tool_result: Some(rocode_provider::ToolResult {
+                        tool_use_id: tool_part.call_id.clone(),
+                        content: output.clone(),
+                        is_error: Some(false),
+                    }),
+                    cache_control: None,
+                    filename: None,
+                    media_type: None,
+                    provider_options: None,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn collect_compaction_text(
+    mut stream: StreamResult,
+    abort: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<String> {
+    let mut text = String::new();
+
+    while let Some(event_result) = stream.next().await {
+        if abort.is_cancelled() {
+            break;
+        }
+        match event_result {
+            Ok(rocode_provider::StreamEvent::TextDelta(delta)) => text.push_str(&delta),
+            Ok(rocode_provider::StreamEvent::Done) => break,
+            Ok(rocode_provider::StreamEvent::Error(err)) => {
+                return Err(anyhow::anyhow!("Compaction stream error: {}", err));
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!("Compaction provider stream failed: {}", err));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(text)
+}
+
+/// Convenience function to run the full provider-stream compaction for a session.
 pub async fn run_compaction<S: SessionOps>(
     session_id: &str,
     parent_id: &str,
     messages: Vec<Message>,
-    model: LlmModelRef,
+    model: ModelRef,
     provider: Arc<dyn Provider>,
     abort: tokio_util::sync::CancellationToken,
     auto: bool,
@@ -1123,7 +1231,7 @@ mod tests {
             messages_with_parts: vec![],
             abort: tokio_util::sync::CancellationToken::new(),
             auto: false,
-            model: LlmModelRef {
+            model: ModelRef {
                 model_id: model_id.to_string(),
                 provider_id: "mock".to_string(),
             },
@@ -1237,7 +1345,7 @@ mod tests {
             messages_with_parts: vec![],
             abort,
             auto: true,
-            model: LlmModelRef {
+            model: ModelRef {
                 model_id: "claude-3".to_string(),
                 provider_id: "anthropic".to_string(),
             },
@@ -1430,7 +1538,7 @@ mod tests {
             "mock-model",
             8192,
             1024,
-            "summary from llm",
+            "summary from stream",
         ));
         let ops = MockSessionOps::default();
         let input = make_input("mock-model", None, None);
@@ -1448,7 +1556,7 @@ mod tests {
             _ => None,
         });
         let (text, metadata) = summary_text.expect("summary text part should be persisted");
-        assert_eq!(text, "summary from llm");
+        assert_eq!(text, "summary from stream");
         assert_eq!(
             metadata
                 .as_ref()
@@ -1474,7 +1582,7 @@ mod tests {
             "mock-model",
             8192,
             1024,
-            "summary from llm",
+            "summary from stream",
         ));
         let input = make_input(
             "mock-model",

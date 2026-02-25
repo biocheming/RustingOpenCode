@@ -81,6 +81,7 @@ pub struct App {
     pending_session_sync: Option<String>,
     last_session_sync: Instant,
     last_aux_sync: Instant,
+    last_process_refresh: Instant,
     event_caused_change: bool,
 }
 
@@ -219,6 +220,7 @@ impl App {
             pending_session_sync: None,
             last_session_sync: Instant::now(),
             last_aux_sync: Instant::now(),
+            last_process_refresh: Instant::now(),
             event_caused_change: true,
         };
 
@@ -439,9 +441,59 @@ impl App {
                 }
 
                 if key.code == KeyCode::Esc {
+                    if let Some(ref mut sv) = self.session_view {
+                        if sv.sidebar_state_mut().process_focus {
+                            sv.sidebar_state_mut().process_focus = false;
+                            return Ok(());
+                        }
+                    }
                     if self.selection.is_active() {
                         self.selection.clear();
                         return Ok(());
+                    }
+                }
+
+                // Process panel keyboard handling (when focused)
+                if let Some(ref mut sv) = self.session_view {
+                    let ss = sv.sidebar_state_mut();
+                    if ss.process_focus {
+                        let proc_count = self.context.processes.read().len();
+                        match key.code {
+                            KeyCode::Up => {
+                                ss.process_select_up();
+                                return Ok(());
+                            }
+                            KeyCode::Down => {
+                                ss.process_select_down(proc_count);
+                                return Ok(());
+                            }
+                            KeyCode::Char('d') | KeyCode::Delete => {
+                                let procs = self.context.processes.read().clone();
+                                if let Some(proc) = procs.get(ss.process_selected) {
+                                    let _ = rocode_core::process_registry::global_registry()
+                                        .kill(proc.pid);
+                                    *self.context.processes.write() =
+                                        rocode_core::process_registry::global_registry().list();
+                                    ss.clamp_process_selected(
+                                        self.context.processes.read().len(),
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // 'p' toggles process panel focus when sidebar is visible
+                if key.code == KeyCode::Char('p') && key.modifiers.is_empty() {
+                    let sidebar_visible = *self.context.show_sidebar.read();
+                    if sidebar_visible {
+                        if let Some(ref mut sv) = self.session_view {
+                            let ss = sv.sidebar_state_mut();
+                            ss.process_focus = !ss.process_focus;
+                            return Ok(());
+                        }
                     }
                 }
 
@@ -698,7 +750,13 @@ impl App {
             }
             Event::Paste(text) => {
                 if !text.is_empty() {
-                    self.prompt.insert_text(text);
+                    if self.provider_dialog.is_open() && self.provider_dialog.is_input_mode() {
+                        for c in text.chars() {
+                            self.provider_dialog.push_char(c);
+                        }
+                    } else {
+                        self.prompt.insert_text(text);
+                    }
                 }
             }
             Event::Custom(event) => match event {
@@ -775,6 +833,13 @@ impl App {
                     let _ = self.refresh_lsp_status();
                     let _ = self.refresh_mcp_dialog();
                     self.last_aux_sync = Instant::now();
+                    tick_changed = true;
+                }
+                if self.last_process_refresh.elapsed() >= Duration::from_secs(2) {
+                    rocode_core::process_registry::global_registry().refresh_stats();
+                    *self.context.processes.write() =
+                        rocode_core::process_registry::global_registry().list();
+                    self.last_process_refresh = Instant::now();
                     tick_changed = true;
                 }
                 self.event_caused_change = tick_changed;
@@ -1601,17 +1666,38 @@ impl App {
         }
 
         if self.provider_dialog.is_open() {
-            match key.code {
-                KeyCode::Esc => self.provider_dialog.close(),
-                KeyCode::Up => self.provider_dialog.move_up(),
-                KeyCode::Down => self.provider_dialog.move_down(),
-                KeyCode::Enter => {
-                    if let Some(provider) = self.provider_dialog.selected_provider() {
-                        self.provider_dialog.selected_provider = Some(provider.clone());
-                        self.provider_dialog.input_mode = true;
+            if self.provider_dialog.is_input_mode() {
+                // API key input mode
+                match key.code {
+                    KeyCode::Esc => self.provider_dialog.exit_input_mode(),
+                    KeyCode::Backspace => {
+                        self.provider_dialog.pop_char();
                     }
+                    KeyCode::Enter => {
+                        if let Some((provider_id, api_key)) = self.provider_dialog.pending_submit()
+                        {
+                            self.submit_provider_auth(&provider_id, &api_key);
+                        }
+                    }
+                    KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.paste_clipboard_to_provider_dialog();
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.provider_dialog.push_char(c);
+                    }
+                    _ => {}
                 }
-                _ => {}
+            } else {
+                // Provider list selection mode
+                match key.code {
+                    KeyCode::Esc => self.provider_dialog.close(),
+                    KeyCode::Up => self.provider_dialog.move_up(),
+                    KeyCode::Down => self.provider_dialog.move_down(),
+                    KeyCode::Enter => {
+                        self.provider_dialog.enter_input_mode();
+                    }
+                    _ => {}
+                }
             }
             return Ok(true);
         }
@@ -1739,6 +1825,7 @@ impl App {
             }
             CommandAction::ExternalEditor => {}
             CommandAction::ConnectProvider => {
+                self.populate_provider_dialog();
                 self.provider_dialog.open();
             }
             CommandAction::ShareSession => {
@@ -1814,6 +1901,20 @@ impl App {
                 self.alert_dialog
                     .set_message(&format!("Failed to read clipboard:\n{}", err));
                 self.alert_dialog.open();
+            }
+        }
+    }
+
+    fn paste_clipboard_to_provider_dialog(&mut self) {
+        match Clipboard::read_text() {
+            Ok(text) => {
+                for c in text.trim().chars() {
+                    self.provider_dialog.push_char(c);
+                }
+            }
+            Err(err) => {
+                self.toast
+                    .show(ToastVariant::Error, &format!("Paste failed: {}", err), 3000);
             }
         }
     }
@@ -3104,6 +3205,61 @@ impl App {
     fn set_session_status(&mut self, session_id: &str, status: SessionStatus) {
         let mut session_ctx = self.context.session.write();
         session_ctx.set_status(session_id, status);
+    }
+
+    /// Fetch the provider list from the server and populate the dialog.
+    fn populate_provider_dialog(&mut self) {
+        let Some(client) = self.context.get_api_client() else {
+            return;
+        };
+        // Try the dynamic models.dev catalogue first
+        if let Ok(resp) = client.get_known_providers() {
+            self.provider_dialog.populate_from_known(resp.providers);
+            return;
+        }
+        // Fallback: use the connected-only list from /provider/
+        let connected: std::collections::HashSet<String> = match client.get_all_providers() {
+            Ok(resp) => resp.connected.into_iter().collect(),
+            Err(_) => match client.get_config_providers() {
+                Ok(resp) => resp.providers.iter().map(|p| p.id.clone()).collect(),
+                Err(_) => std::collections::HashSet::new(),
+            },
+        };
+        self.provider_dialog.populate(&connected);
+    }
+
+    /// Submit an API key for a provider and update the dialog state.
+    fn submit_provider_auth(&mut self, provider_id: &str, api_key: &str) {
+        use crate::components::SubmitResult;
+        let Some(client) = self.context.get_api_client() else {
+            self.provider_dialog
+                .set_submit_result(SubmitResult::Failed("No API connection".to_string()));
+            return;
+        };
+        match client.set_auth(provider_id, api_key) {
+            Ok(()) => {
+                self.provider_dialog
+                    .set_submit_result(SubmitResult::Success);
+                self.toast.show(
+                    crate::components::ToastVariant::Success,
+                    &format!("Connected to {}", provider_id),
+                    3000,
+                );
+                // Refresh the provider list to update connected status
+                let connected: std::collections::HashSet<String> = match client.get_all_providers()
+                {
+                    Ok(resp) => resp.connected.into_iter().collect(),
+                    Err(_) => std::collections::HashSet::new(),
+                };
+                self.provider_dialog.populate(&connected);
+                // Also refresh the model list so the new provider's models appear
+                self.refresh_model_dialog();
+            }
+            Err(e) => {
+                self.provider_dialog
+                    .set_submit_result(SubmitResult::Failed(e.to_string()));
+            }
+        }
     }
 
     fn sync_prompt_spinner_style(&mut self) {

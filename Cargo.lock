@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-agent"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2718,7 +2718,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-cli"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2754,7 +2754,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-command"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2769,7 +2769,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-config"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2787,10 +2787,13 @@ dependencies = [
 
 [[package]]
 name = "rocode-core"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "chrono",
  "hex",
+ "libc",
+ "once_cell",
+ "parking_lot",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -2802,7 +2805,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-grep"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "regex",
@@ -2815,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-lsp"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "async-trait",
  "futures",
@@ -2831,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-mcp"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2859,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-permission"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2881,6 +2884,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "dirs",
+ "futures",
+ "rocode-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2891,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-provider"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2919,7 +2924,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-server"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2954,7 +2959,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-session"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2987,7 +2992,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-storage"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3006,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-tool"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "async-process",
@@ -3045,7 +3050,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-tui"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3084,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-types"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3096,7 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-util"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3116,7 +3121,7 @@ dependencies = [
 
 [[package]]
 name = "rocode-watcher"
-version = "2026.2.24"
+version = "2026.2.25"
 dependencies = [
  "dashmap",
  "glob",

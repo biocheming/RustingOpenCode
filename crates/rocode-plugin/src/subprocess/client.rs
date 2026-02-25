@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::protocol::{RpcError, RpcRequest, RpcResponse};
 use super::runtime::JsRuntime;
+use rocode_core::process_registry::{global_registry, ProcessKind};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -198,6 +199,11 @@ impl PluginSubprocess {
         this.name = result.name;
         this.hooks = result.hooks;
         this.auth_meta = result.auth;
+
+        // Register in global process registry for TUI visibility
+        if let Some(pid) = this.process.lock().await.id() {
+            global_registry().register(pid, this.name.clone(), ProcessKind::Plugin);
+        }
 
         Ok(this)
     }
@@ -412,6 +418,10 @@ impl PluginSubprocess {
 
     /// Gracefully shut down the plugin subprocess.
     pub async fn shutdown(&self) -> Result<(), PluginSubprocessError> {
+        // Unregister from process registry before shutdown
+        if let Some(pid) = self.process.lock().await.id() {
+            global_registry().unregister(pid);
+        }
         let _: Value = self.call("shutdown", None).await?;
         // Give the process a moment to exit, then kill if needed
         let mut proc = self.process.lock().await;

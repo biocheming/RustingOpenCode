@@ -87,7 +87,15 @@ impl AnthropicProvider {
     }
 
     fn convert_request(&self, request: ChatRequest) -> AnthropicRequest {
-        let max_tokens = request.max_tokens.unwrap_or(4096);
+        let model_max = self
+            .models
+            .iter()
+            .find(|m| m.id == request.model)
+            .map(|m| m.max_output_tokens)
+            .unwrap_or(16000);
+        let max_tokens = request
+            .max_tokens
+            .unwrap_or_else(|| model_max.min(32_000));
         let mut messages = Vec::new();
         let mut system = request.system;
 
@@ -108,7 +116,15 @@ impl AnthropicProvider {
                         }
                         crate::Content::Parts(parts) => {
                             for part in parts {
-                                if let Some(text) = part.text {
+                                if part.content_type == "reasoning" {
+                                    if let Some(text) = part.text {
+                                        if !text.is_empty() {
+                                            content.push(AnthropicContent::Thinking {
+                                                thinking: text,
+                                            });
+                                        }
+                                    }
+                                } else if let Some(text) = part.text {
                                     if !text.is_empty() {
                                         content.push(AnthropicContent::Text { text });
                                     }
@@ -309,6 +325,8 @@ struct AnthropicTool {
 enum AnthropicContent {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,

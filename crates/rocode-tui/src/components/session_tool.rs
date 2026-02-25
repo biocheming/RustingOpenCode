@@ -249,6 +249,14 @@ pub fn render_tool_call(
         Span::styled(name.to_string(), name_style),
     ];
 
+    // Argument preview on the same line as tool name (e.g. "◯ → ls → .")
+    if let Some(argument_preview) = tool_argument_preview(&normalized, arguments) {
+        main_spans.push(Span::styled(
+            format!("  {}", argument_preview),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+
     // Inline result summary for completed non-block tools
     if let Some((result_text, is_error)) = result {
         if *is_error {
@@ -291,15 +299,6 @@ pub fn render_tool_call(
     }
 
     lines.push(Line::from(main_spans));
-
-    if show_tool_details {
-        if let Some(argument_preview) = tool_argument_preview(&normalized, arguments) {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", argument_preview),
-                Style::default().fg(theme.text_muted),
-            )));
-        }
-    }
 
     lines
 }

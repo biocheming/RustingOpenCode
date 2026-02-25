@@ -5,6 +5,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{timeout, Duration};
 
 use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
+use rocode_core::process_registry::{global_registry, ProcessKind};
 use rocode_permission::BashArity;
 use rocode_plugin::{HookContext, HookEvent};
 
@@ -205,6 +206,12 @@ impl Tool for BashTool {
 
         let child_pid = child.id();
 
+        // Register in global process registry
+        if let Some(pid) = child_pid {
+            let label = command.split_whitespace().next().unwrap_or("bash").to_string();
+            global_registry().register(pid, format!("bash: {}", label), ProcessKind::Bash);
+        }
+
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
@@ -289,6 +296,11 @@ impl Tool for BashTool {
             .wait()
             .await
             .map_err(|e| ToolError::ExecutionError(format!("Failed to wait for process: {}", e)))?;
+
+        // Unregister from process registry
+        if let Some(pid) = child_pid {
+            global_registry().unregister(pid);
+        }
 
         let exit_code = status.code().unwrap_or(-1);
 

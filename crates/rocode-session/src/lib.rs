@@ -2,7 +2,7 @@
 
 pub mod compaction;
 pub mod instruction;
-pub mod llm;
+pub mod mcp_bridge;
 pub mod message;
 pub mod message_v2;
 pub mod prompt;
@@ -17,7 +17,6 @@ pub mod todo;
 
 pub use compaction::*;
 pub use instruction::*;
-pub use llm::*;
 pub use message::*;
 pub use message_v2::*;
 pub use prompt::*;

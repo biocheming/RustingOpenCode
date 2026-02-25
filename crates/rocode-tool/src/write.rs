@@ -63,7 +63,9 @@ impl Tool for WriteTool {
             .get("file_path")
             .or_else(|| args.get("filePath"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments("file_path (or filePath) is required".into()))?
+            .ok_or_else(|| {
+                ToolError::InvalidArguments("file_path (or filePath) is required".into())
+            })?
             .to_string();
 
         let content: String = args["content"]

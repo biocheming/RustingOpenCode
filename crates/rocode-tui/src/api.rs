@@ -79,6 +79,12 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub input: serde_json::Value,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub raw: Option<String>,
+    #[serde(default)]
+    pub state: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +94,12 @@ pub struct ToolResult {
     pub content: String,
     #[serde(alias = "isError")]
     pub is_error: bool,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub attachments: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +174,36 @@ pub struct ProviderListResponse {
     pub providers: Vec<ProviderInfo>,
     #[serde(rename = "default")]
     pub default_model: HashMap<String, String>,
+}
+
+/// Response from `GET /provider/` — includes the full provider catalogue
+/// together with a list of provider IDs that are currently connected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullProviderListResponse {
+    pub all: Vec<ProviderInfo>,
+    #[serde(rename = "default")]
+    pub default_model: HashMap<String, String>,
+    #[serde(default)]
+    pub connected: Vec<String>,
+}
+
+/// A single entry from the `GET /provider/known` catalogue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownProviderEntry {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub model_count: usize,
+    #[serde(default)]
+    pub connected: bool,
+}
+
+/// Response from `GET /provider/known`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownProvidersResponse {
+    pub providers: Vec<KnownProviderEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,6 +499,50 @@ impl ApiClient {
 
         let providers: ProviderListResponse = response.json()?;
         Ok(providers)
+    }
+
+    /// Fetch the full provider catalogue from `GET /provider/`.
+    /// Returns all known providers plus which ones are connected.
+    pub fn get_all_providers(&self) -> anyhow::Result<FullProviderListResponse> {
+        let url = format!("{}/provider", self.base_url);
+        let response = self.client.get(&url).send()?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            anyhow::bail!("Failed to get all providers: {} - {}", status, text);
+        }
+        Ok(response.json()?)
+    }
+
+    /// Fetch all known providers from `models.dev` via `GET /provider/known`.
+    /// Returns every provider in the catalogue with connected status.
+    pub fn get_known_providers(&self) -> anyhow::Result<KnownProvidersResponse> {
+        let url = format!("{}/provider/known", self.base_url);
+        let response = self.client.get(&url).send()?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            anyhow::bail!("Failed to get known providers: {} - {}", status, text);
+        }
+        Ok(response.json()?)
+    }
+
+    /// Set an API key for a provider via `PUT /auth/{id}`.
+    pub fn set_auth(&self, provider_id: &str, api_key: &str) -> anyhow::Result<()> {
+        let url = format!("{}/auth/{}", self.base_url, provider_id);
+        let body = serde_json::json!({ "key": api_key });
+        let response = self.client.put(&url).json(&body).send()?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            anyhow::bail!(
+                "Failed to set auth for `{}`: {} - {}",
+                provider_id,
+                status,
+                text
+            );
+        }
+        Ok(())
     }
 
     pub fn list_agents(&self) -> anyhow::Result<Vec<AgentInfo>> {

@@ -761,6 +761,12 @@ pub struct ToolCallInfo {
     pub id: String,
     pub name: String,
     pub input: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -768,6 +774,12 @@ pub struct ToolResultInfo {
     pub tool_call_id: String,
     pub content: String,
     pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<serde_json::Value>>,
 }
 
 fn message_role_name(role: &rocode_session::MessageRole) -> &'static str {
@@ -826,11 +838,33 @@ fn part_to_info(part: &rocode_session::MessagePart) -> PartInfo {
         } else {
             None
         },
-        tool_call: if let rocode_session::PartType::ToolCall { id, name, input } = &part.part_type {
+        tool_call: if let rocode_session::PartType::ToolCall {
+            id,
+            name,
+            input,
+            status,
+            raw,
+            state,
+            ..
+        } = &part.part_type
+        {
             Some(ToolCallInfo {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
+                status: Some(
+                    match status {
+                        rocode_session::ToolCallStatus::Pending => "pending",
+                        rocode_session::ToolCallStatus::Running => "running",
+                        rocode_session::ToolCallStatus::Completed => "completed",
+                        rocode_session::ToolCallStatus::Error => "error",
+                    }
+                    .to_string(),
+                ),
+                raw: raw.clone(),
+                state: state
+                    .as_ref()
+                    .and_then(|s| serde_json::to_value(s).ok()),
             })
         } else {
             None
@@ -839,12 +873,18 @@ fn part_to_info(part: &rocode_session::MessagePart) -> PartInfo {
             tool_call_id,
             content,
             is_error,
+            title,
+            metadata,
+            attachments,
         } = &part.part_type
         {
             Some(ToolResultInfo {
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
                 is_error: *is_error,
+                title: title.clone(),
+                metadata: metadata.clone(),
+                attachments: attachments.clone(),
             })
         } else {
             None
@@ -956,7 +996,9 @@ fn session_parts_to_provider_content(
                 media_type: None,
                 provider_options: None,
             }),
-            rocode_session::PartType::ToolCall { id, name, input } => {
+            rocode_session::PartType::ToolCall {
+                id, name, input, ..
+            } => {
                 Some(rocode_provider::ContentPart {
                     content_type: "tool_use".to_string(),
                     text: None,
@@ -977,6 +1019,7 @@ fn session_parts_to_provider_content(
                 tool_call_id,
                 content,
                 is_error,
+                ..
             } => Some(rocode_provider::ContentPart {
                 content_type: "tool_result".to_string(),
                 text: None,
@@ -1021,15 +1064,15 @@ fn session_messages_to_provider_messages(
         .collect()
 }
 
-fn resolve_provider_and_model(
+async fn resolve_provider_and_model(
     state: &ServerState,
     request_model: Option<&str>,
     config_model: Option<&str>,
     config_provider: Option<&str>,
 ) -> Result<(Arc<dyn rocode_provider::Provider>, String, String)> {
+    let providers = state.providers.read().await;
     let resolve_from_model = |model: &str| -> Result<(String, String)> {
-        state
-            .providers
+        providers
             .parse_model_string(model)
             .ok_or_else(|| ApiError::BadRequest(format!("Model not found: {}", model)))
     };
@@ -1043,8 +1086,7 @@ fn resolve_provider_and_model(
             resolve_from_model(model)?
         }
     } else {
-        let first = state
-            .providers
+        let first = providers
             .list_models()
             .into_iter()
             .next()
@@ -1052,8 +1094,7 @@ fn resolve_provider_and_model(
         (first.provider, first.id)
     };
 
-    let provider = state
-        .providers
+    let provider = providers
         .get_provider(&provider_id)
         .map_err(|e| ApiError::ProviderError(e.to_string()))?;
     if provider.get_model(&model_id).is_none() {
@@ -1127,8 +1168,13 @@ pub struct AddPartRequest {
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
     pub tool_input: Option<serde_json::Value>,
+    pub tool_status: Option<String>,
+    pub tool_raw_input: Option<String>,
     pub content: Option<String>,
     pub is_error: Option<bool>,
+    pub title: Option<String>,
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+    pub attachments: Option<Vec<serde_json::Value>>,
 }
 
 fn build_message_part(req: AddPartRequest, msg_id: &str) -> Result<rocode_session::MessagePart> {
@@ -1157,6 +1203,20 @@ fn build_message_part(req: AddPartRequest, msg_id: &str) -> Result<rocode_sessio
                 )
             })?,
             input: req.tool_input.unwrap_or_else(|| serde_json::json!({})),
+            status: match req
+                .tool_status
+                .as_deref()
+                .unwrap_or("pending")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "running" => rocode_session::ToolCallStatus::Running,
+                "completed" => rocode_session::ToolCallStatus::Completed,
+                "error" => rocode_session::ToolCallStatus::Error,
+                _ => rocode_session::ToolCallStatus::Pending,
+            },
+            raw: req.tool_raw_input,
+            state: None,
         },
         "tool_result" => rocode_session::PartType::ToolResult {
             tool_call_id: req.tool_call_id.ok_or_else(|| {
@@ -1170,6 +1230,9 @@ fn build_message_part(req: AddPartRequest, msg_id: &str) -> Result<rocode_sessio
                 )
             })?,
             is_error: req.is_error.unwrap_or(false),
+            title: req.title,
+            metadata: req.metadata,
+            attachments: req.attachments,
         },
         unsupported => {
             return Err(ApiError::BadRequest(format!(
@@ -1292,17 +1355,17 @@ async fn stream_message(
 {
     let config = CONFIG_STATE.read().await;
     let (provider, provider_id, model_id) =
-        resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)?;
+        resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)
+            .await?;
     drop(config);
 
-    let (history, msg_id, selected_variant) = {
+    let selected_variant = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
             .get_mut(&session_id)
             .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
 
         session.add_user_message(&req.content);
-        let history = session.messages.clone();
         let selected_variant = req.variant.clone().or_else(|| {
             session
                 .metadata
@@ -1322,291 +1385,492 @@ async fn stream_message(
         session
             .metadata
             .insert("model_id".to_string(), serde_json::json!(model_id.clone()));
-
-        let assistant_msg = session.add_assistant_message();
-        (history, assistant_msg.id.clone(), selected_variant)
+        selected_variant
     };
 
-    let provider_messages = session_messages_to_provider_messages(&history);
-    let variant = selected_variant.clone();
-    let temperature = temperature_for_model(&model_id).or(Some(0.7));
-    let top_p = top_p_for_model(&model_id);
-    let max_tokens = max_tokens_for_variant(4096, variant.as_deref());
-    let request = rocode_provider::ChatRequest {
-        model: model_id.clone(),
-        messages: provider_messages,
-        max_tokens: Some(max_tokens),
-        temperature,
-        top_p,
-        system: None,
-        tools: None,
-        stream: Some(true),
-        variant,
-        provider_options: None,
-    };
+    let tool_defs = rocode_session::resolve_tools(state.tool_registry.as_ref()).await;
 
     let (tx, rx) = mpsc::channel::<std::result::Result<Event, Infallible>>(128);
     let stream_state = state.clone();
     let stream_session_id = session_id.clone();
-    let stream_msg_id = msg_id.clone();
+    let stream_variant = selected_variant.clone();
+    let stream_provider = provider.clone();
+    let stream_provider_id = provider_id.clone();
+    let stream_model_id = model_id.clone();
 
     tokio::spawn(async move {
-        send_sse_event(
-            &tx,
-            "message_start",
-            StreamEvent {
-                event_type: "message_start".to_string(),
-                content: None,
-                message_id: Some(stream_msg_id.clone()),
-                done: None,
-                tool_call_id: None,
-                tool_name: None,
-                input: None,
-                prompt_tokens: None,
-                completion_tokens: None,
-                error: None,
-            },
-        )
-        .await;
-
-        let mut final_text = String::new();
-        let mut pending_tool_calls: HashMap<String, PendingToolCall> = HashMap::new();
         let mut stream_failed: Option<String> = None;
+        let available_tool_ids: std::collections::HashSet<String> = stream_state
+            .tool_registry
+            .list_ids()
+            .await
+            .into_iter()
+            .collect();
+        const MAX_STEPS: u32 = 100;
 
-        match provider.chat_stream(request).await {
-            Ok(mut provider_stream) => {
-                while let Some(item) = provider_stream.next().await {
-                    match item {
-                        Ok(rocode_provider::StreamEvent::TextDelta(delta)) => {
-                            if delta.is_empty() {
-                                continue;
+        for _step in 0..MAX_STEPS {
+            let (history, stream_msg_id, session_directory) = {
+                let mut sessions = stream_state.sessions.lock().await;
+                let Some(session) = sessions.get_mut(&stream_session_id) else {
+                    return;
+                };
+                let history = session.messages.clone();
+                let assistant_msg = session.add_assistant_message();
+                assistant_msg.metadata.insert(
+                    "model_provider".to_string(),
+                    serde_json::json!(&stream_provider_id),
+                );
+                assistant_msg
+                    .metadata
+                    .insert("model_id".to_string(), serde_json::json!(&stream_model_id));
+                (
+                    history,
+                    assistant_msg.id.clone(),
+                    session.directory.clone(),
+                )
+            };
+
+            send_sse_event(
+                &tx,
+                "message_start",
+                StreamEvent {
+                    event_type: "message_start".to_string(),
+                    content: None,
+                    message_id: Some(stream_msg_id.clone()),
+                    done: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    input: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    error: None,
+                },
+            )
+            .await;
+
+            let provider_messages = session_messages_to_provider_messages(&history);
+            let temperature = temperature_for_model(&stream_model_id).or(Some(0.7));
+            let top_p = top_p_for_model(&stream_model_id);
+            let max_tokens = max_tokens_for_variant(4096, stream_variant.as_deref());
+            let request = rocode_provider::ChatRequest {
+                model: stream_model_id.clone(),
+                messages: provider_messages,
+                max_tokens: Some(max_tokens),
+                temperature,
+                top_p,
+                system: None,
+                tools: if tool_defs.is_empty() {
+                    None
+                } else {
+                    Some(tool_defs.clone())
+                },
+                stream: Some(true),
+                variant: stream_variant.clone(),
+                provider_options: None,
+            };
+
+            let mut final_text = String::new();
+            let mut pending_tool_calls: HashMap<String, PendingToolCall> = HashMap::new();
+            let mut provider_failed = false;
+
+            match stream_provider.chat_stream(request).await {
+                Ok(mut provider_stream) => {
+                    while let Some(item) = provider_stream.next().await {
+                        match item {
+                            Ok(rocode_provider::StreamEvent::TextDelta(delta)) => {
+                                if delta.is_empty() {
+                                    continue;
+                                }
+                                final_text.push_str(&delta);
+                                send_sse_event(
+                                    &tx,
+                                    "message_delta",
+                                    StreamEvent {
+                                        event_type: "message_delta".to_string(),
+                                        content: Some(delta),
+                                        message_id: Some(stream_msg_id.clone()),
+                                        done: None,
+                                        tool_call_id: None,
+                                        tool_name: None,
+                                        input: None,
+                                        prompt_tokens: None,
+                                        completion_tokens: None,
+                                        error: None,
+                                    },
+                                )
+                                .await;
                             }
-                            final_text.push_str(&delta);
-                            send_sse_event(
-                                &tx,
-                                "message_delta",
-                                StreamEvent {
-                                    event_type: "message_delta".to_string(),
-                                    content: Some(delta),
-                                    message_id: Some(stream_msg_id.clone()),
-                                    done: None,
-                                    tool_call_id: None,
-                                    tool_name: None,
-                                    input: None,
-                                    prompt_tokens: None,
-                                    completion_tokens: None,
-                                    error: None,
-                                },
-                            )
-                            .await;
+                            Ok(rocode_provider::StreamEvent::ToolCallStart { id, name }) => {
+                                pending_tool_calls.entry(id.clone()).or_default().name =
+                                    Some(name.clone());
+                                send_sse_event(
+                                    &tx,
+                                    "tool_call_start",
+                                    StreamEvent {
+                                        event_type: "tool_call_start".to_string(),
+                                        content: None,
+                                        message_id: Some(stream_msg_id.clone()),
+                                        done: None,
+                                        tool_call_id: Some(id),
+                                        tool_name: Some(name),
+                                        input: None,
+                                        prompt_tokens: None,
+                                        completion_tokens: None,
+                                        error: None,
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(rocode_provider::StreamEvent::ToolCallDelta { id, input }) => {
+                                pending_tool_calls
+                                    .entry(id.clone())
+                                    .or_default()
+                                    .input
+                                    .push_str(&input);
+                                send_sse_event(
+                                    &tx,
+                                    "tool_call_delta",
+                                    StreamEvent {
+                                        event_type: "tool_call_delta".to_string(),
+                                        content: None,
+                                        message_id: Some(stream_msg_id.clone()),
+                                        done: None,
+                                        tool_call_id: Some(id),
+                                        tool_name: None,
+                                        input: Some(input),
+                                        prompt_tokens: None,
+                                        completion_tokens: None,
+                                        error: None,
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(rocode_provider::StreamEvent::ToolCallEnd { id, name, input }) => {
+                                let call = pending_tool_calls.entry(id.clone()).or_default();
+                                call.name = Some(name.clone());
+                                call.input = input.to_string();
+                                send_sse_event(
+                                    &tx,
+                                    "tool_call_end",
+                                    StreamEvent {
+                                        event_type: "tool_call_end".to_string(),
+                                        content: None,
+                                        message_id: Some(stream_msg_id.clone()),
+                                        done: None,
+                                        tool_call_id: Some(id),
+                                        tool_name: Some(name),
+                                        input: Some(input.to_string()),
+                                        prompt_tokens: None,
+                                        completion_tokens: None,
+                                        error: None,
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(rocode_provider::StreamEvent::Usage {
+                                prompt_tokens,
+                                completion_tokens,
+                            }) => {
+                                send_sse_event(
+                                    &tx,
+                                    "usage",
+                                    StreamEvent {
+                                        event_type: "usage".to_string(),
+                                        content: None,
+                                        message_id: Some(stream_msg_id.clone()),
+                                        done: None,
+                                        tool_call_id: None,
+                                        tool_name: None,
+                                        input: None,
+                                        prompt_tokens: Some(prompt_tokens),
+                                        completion_tokens: Some(completion_tokens),
+                                        error: None,
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(rocode_provider::StreamEvent::Done) => break,
+                            Ok(rocode_provider::StreamEvent::Error(err)) => {
+                                stream_failed = Some(err.clone());
+                                provider_failed = true;
+                                send_sse_event(
+                                    &tx,
+                                    "error",
+                                    StreamEvent {
+                                        event_type: "error".to_string(),
+                                        content: None,
+                                        message_id: Some(stream_msg_id.clone()),
+                                        done: None,
+                                        tool_call_id: None,
+                                        tool_name: None,
+                                        input: None,
+                                        prompt_tokens: None,
+                                        completion_tokens: None,
+                                        error: Some(err),
+                                    },
+                                )
+                                .await;
+                                break;
+                            }
+                            Err(err) => {
+                                let error_message = err.to_string();
+                                stream_failed = Some(error_message.clone());
+                                provider_failed = true;
+                                send_sse_event(
+                                    &tx,
+                                    "error",
+                                    StreamEvent {
+                                        event_type: "error".to_string(),
+                                        content: None,
+                                        message_id: Some(stream_msg_id.clone()),
+                                        done: None,
+                                        tool_call_id: None,
+                                        tool_name: None,
+                                        input: None,
+                                        prompt_tokens: None,
+                                        completion_tokens: None,
+                                        error: Some(error_message),
+                                    },
+                                )
+                                .await;
+                                break;
+                            }
+                            Ok(_) => {}
                         }
-                        Ok(rocode_provider::StreamEvent::ToolCallStart { id, name }) => {
-                            pending_tool_calls.entry(id.clone()).or_default().name =
-                                Some(name.clone());
-                            send_sse_event(
-                                &tx,
-                                "tool_call_start",
-                                StreamEvent {
-                                    event_type: "tool_call_start".to_string(),
-                                    content: None,
-                                    message_id: Some(stream_msg_id.clone()),
-                                    done: None,
-                                    tool_call_id: Some(id),
-                                    tool_name: Some(name),
-                                    input: None,
-                                    prompt_tokens: None,
-                                    completion_tokens: None,
-                                    error: None,
-                                },
-                            )
-                            .await;
-                        }
-                        Ok(rocode_provider::StreamEvent::ToolCallDelta { id, input }) => {
-                            pending_tool_calls
-                                .entry(id.clone())
-                                .or_default()
-                                .input
-                                .push_str(&input);
-                            send_sse_event(
-                                &tx,
-                                "tool_call_delta",
-                                StreamEvent {
-                                    event_type: "tool_call_delta".to_string(),
-                                    content: None,
-                                    message_id: Some(stream_msg_id.clone()),
-                                    done: None,
-                                    tool_call_id: Some(id),
-                                    tool_name: None,
-                                    input: Some(input),
-                                    prompt_tokens: None,
-                                    completion_tokens: None,
-                                    error: None,
-                                },
-                            )
-                            .await;
-                        }
-                        Ok(rocode_provider::StreamEvent::ToolCallEnd { id, name, input }) => {
-                            let call = pending_tool_calls.entry(id.clone()).or_default();
-                            call.name = Some(name.clone());
-                            call.input = input.to_string();
-                            send_sse_event(
-                                &tx,
-                                "tool_call_end",
-                                StreamEvent {
-                                    event_type: "tool_call_end".to_string(),
-                                    content: None,
-                                    message_id: Some(stream_msg_id.clone()),
-                                    done: None,
-                                    tool_call_id: Some(id),
-                                    tool_name: Some(name),
-                                    input: Some(input.to_string()),
-                                    prompt_tokens: None,
-                                    completion_tokens: None,
-                                    error: None,
-                                },
-                            )
-                            .await;
-                        }
-                        Ok(rocode_provider::StreamEvent::Usage {
-                            prompt_tokens,
-                            completion_tokens,
-                        }) => {
-                            send_sse_event(
-                                &tx,
-                                "usage",
-                                StreamEvent {
-                                    event_type: "usage".to_string(),
-                                    content: None,
-                                    message_id: Some(stream_msg_id.clone()),
-                                    done: None,
-                                    tool_call_id: None,
-                                    tool_name: None,
-                                    input: None,
-                                    prompt_tokens: Some(prompt_tokens),
-                                    completion_tokens: Some(completion_tokens),
-                                    error: None,
-                                },
-                            )
-                            .await;
-                        }
-                        Ok(rocode_provider::StreamEvent::Done) => break,
-                        Ok(rocode_provider::StreamEvent::Error(err)) => {
-                            stream_failed = Some(err.clone());
-                            send_sse_event(
-                                &tx,
-                                "error",
-                                StreamEvent {
-                                    event_type: "error".to_string(),
-                                    content: None,
-                                    message_id: Some(stream_msg_id.clone()),
-                                    done: None,
-                                    tool_call_id: None,
-                                    tool_name: None,
-                                    input: None,
-                                    prompt_tokens: None,
-                                    completion_tokens: None,
-                                    error: Some(err),
-                                },
-                            )
-                            .await;
-                            break;
-                        }
-                        Err(err) => {
-                            let error_message = err.to_string();
-                            stream_failed = Some(error_message.clone());
-                            send_sse_event(
-                                &tx,
-                                "error",
-                                StreamEvent {
-                                    event_type: "error".to_string(),
-                                    content: None,
-                                    message_id: Some(stream_msg_id.clone()),
-                                    done: None,
-                                    tool_call_id: None,
-                                    tool_name: None,
-                                    input: None,
-                                    prompt_tokens: None,
-                                    completion_tokens: None,
-                                    error: Some(error_message),
-                                },
-                            )
-                            .await;
-                            break;
-                        }
-                        Ok(_) => {}
                     }
                 }
+                Err(err) => {
+                    let error_message = err.to_string();
+                    stream_failed = Some(error_message.clone());
+                    provider_failed = true;
+                    send_sse_event(
+                        &tx,
+                        "error",
+                        StreamEvent {
+                            event_type: "error".to_string(),
+                            content: None,
+                            message_id: Some(stream_msg_id.clone()),
+                            done: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            input: None,
+                            prompt_tokens: None,
+                            completion_tokens: None,
+                            error: Some(error_message),
+                        },
+                    )
+                    .await;
+                }
             }
-            Err(err) => {
-                let error_message = err.to_string();
-                stream_failed = Some(error_message.clone());
+
+            let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
+            let mut pending: Vec<(String, PendingToolCall)> = pending_tool_calls.into_iter().collect();
+            pending.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, pending) in pending {
+                let name = pending.name.unwrap_or_default();
+                if name.trim().is_empty() {
+                    continue;
+                }
+                let input = if pending.input.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&pending.input)
+                        .unwrap_or_else(|_| serde_json::Value::String(pending.input))
+                };
+                let call_id = if id.is_empty() {
+                    format!("call_{}", uuid::Uuid::new_v4().simple())
+                } else {
+                    id
+                };
+                tool_calls.push((call_id, name, input));
+            }
+
+            {
+                let mut sessions = stream_state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&stream_session_id) {
+                    if let Some(message) = session.get_message_mut(&stream_msg_id) {
+                        if !final_text.is_empty() {
+                            message.add_text(final_text);
+                        }
+                        for (call_id, name, input) in &tool_calls {
+                            message.add_tool_call(call_id.clone(), name.clone(), input.clone());
+                        }
+                        if provider_failed && message.parts.is_empty() {
+                            if let Some(error) = stream_failed.clone() {
+                                message.add_text(format!("Stream error: {}", error));
+                            }
+                        }
+                    }
+                    session.touch();
+                }
+            }
+
+            if provider_failed {
                 send_sse_event(
                     &tx,
-                    "error",
+                    "message_end",
                     StreamEvent {
-                        event_type: "error".to_string(),
+                        event_type: "message_end".to_string(),
                         content: None,
-                        message_id: Some(stream_msg_id.clone()),
-                        done: None,
+                        message_id: Some(stream_msg_id),
+                        done: Some(true),
                         tool_call_id: None,
                         tool_name: None,
                         input: None,
                         prompt_tokens: None,
                         completion_tokens: None,
-                        error: Some(error_message),
+                        error: stream_failed.clone(),
                     },
                 )
                 .await;
+                break;
             }
-        }
 
-        {
-            let mut sessions = stream_state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&stream_session_id) {
-                if let Some(message) = session.get_message_mut(&stream_msg_id) {
-                    if !final_text.is_empty() {
-                        message.add_text(final_text);
-                    }
-                    for (id, pending) in pending_tool_calls {
-                        let name = pending.name.unwrap_or_else(|| "unknown_tool".to_string());
-                        let parsed_input =
-                            serde_json::from_str::<serde_json::Value>(&pending.input)
-                                .unwrap_or_else(|_| serde_json::json!({ "raw": pending.input }));
-                        let call_id = if id.is_empty() {
-                            format!("call_{}", uuid::Uuid::new_v4().simple())
-                        } else {
-                            id
-                        };
-                        message.add_tool_call(call_id, name, parsed_input);
-                    }
-                    if let Some(error) = stream_failed {
-                        if message.parts.is_empty() {
-                            message.add_text(format!("Stream error: {}", error));
-                        }
+            if tool_calls.is_empty() {
+                send_sse_event(
+                    &tx,
+                    "message_end",
+                    StreamEvent {
+                        event_type: "message_end".to_string(),
+                        content: None,
+                        message_id: Some(stream_msg_id),
+                        done: Some(true),
+                        tool_call_id: None,
+                        tool_name: None,
+                        input: None,
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                        error: None,
+                    },
+                )
+                .await;
+                break;
+            }
+
+            let mut tool_results = rocode_session::SessionMessage::tool(stream_session_id.clone());
+            for (call_id, requested_tool, args) in tool_calls {
+                let mut effective_tool = requested_tool.clone();
+                let mut effective_args = args.clone();
+                if !available_tool_ids.contains(&effective_tool) {
+                    let lower = effective_tool.to_ascii_lowercase();
+                    if lower != effective_tool && available_tool_ids.contains(&lower) {
+                        effective_tool = lower;
+                    } else if available_tool_ids.contains("invalid") {
+                        effective_tool = "invalid".to_string();
+                        effective_args = serde_json::json!({
+                            "tool": requested_tool,
+                            "error": format!("Unknown tool requested by model: {}", requested_tool),
+                        });
                     }
                 }
-                session.touch();
-            }
-        }
-        persist_sessions_if_enabled(&stream_state).await;
 
-        send_sse_event(
-            &tx,
-            "message_end",
-            StreamEvent {
-                event_type: "message_end".to_string(),
-                content: None,
-                message_id: Some(stream_msg_id),
-                done: Some(true),
-                tool_call_id: None,
-                tool_name: None,
-                input: None,
-                prompt_tokens: None,
-                completion_tokens: None,
-                error: None,
-            },
-        )
-        .await;
+                let ctx = rocode_tool::ToolContext::new(
+                    stream_session_id.clone(),
+                    stream_msg_id.clone(),
+                    session_directory.clone(),
+                )
+                .with_registry(stream_state.tool_registry.clone());
+
+                let mut execution = stream_state
+                    .tool_registry
+                    .execute(&effective_tool, effective_args.clone(), ctx.clone())
+                    .await;
+
+                if effective_tool != "invalid"
+                    && available_tool_ids.contains("invalid")
+                    && matches!(&execution, Err(rocode_tool::ToolError::InvalidArguments(_)))
+                {
+                    let validation_error = execution
+                        .as_ref()
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "Invalid arguments".to_string());
+                    effective_tool = "invalid".to_string();
+                    effective_args = serde_json::json!({
+                        "tool": requested_tool,
+                        "error": validation_error,
+                    });
+                    execution = stream_state
+                        .tool_registry
+                        .execute(&effective_tool, effective_args.clone(), ctx)
+                        .await;
+                }
+
+                match execution {
+                    Ok(result) => {
+                        tool_results.add_tool_result(&call_id, result.output.clone(), false);
+                        send_sse_event(
+                            &tx,
+                            "tool_result",
+                            StreamEvent {
+                                event_type: "tool_result".to_string(),
+                                content: Some(result.output),
+                                message_id: Some(stream_msg_id.clone()),
+                                done: None,
+                                tool_call_id: Some(call_id.clone()),
+                                tool_name: Some(effective_tool),
+                                input: Some(effective_args.to_string()),
+                                prompt_tokens: None,
+                                completion_tokens: None,
+                                error: None,
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        tool_results.add_tool_result(&call_id, error_text.clone(), true);
+                        send_sse_event(
+                            &tx,
+                            "tool_error",
+                            StreamEvent {
+                                event_type: "tool_error".to_string(),
+                                content: None,
+                                message_id: Some(stream_msg_id.clone()),
+                                done: None,
+                                tool_call_id: Some(call_id),
+                                tool_name: Some(effective_tool),
+                                input: Some(effective_args.to_string()),
+                                prompt_tokens: None,
+                                completion_tokens: None,
+                                error: Some(error_text),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            {
+                let mut sessions = stream_state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&stream_session_id) {
+                    if !tool_results.parts.is_empty() {
+                        session.messages.push(tool_results);
+                    }
+                    session.touch();
+                }
+            }
+
+            send_sse_event(
+                &tx,
+                "message_end",
+                StreamEvent {
+                    event_type: "message_end".to_string(),
+                    content: None,
+                    message_id: Some(stream_msg_id),
+                    done: Some(false),
+                    tool_call_id: None,
+                    tool_name: None,
+                    input: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    error: None,
+                },
+            )
+            .await;
+        }
+
+        persist_sessions_if_enabled(&stream_state).await;
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)))
@@ -1650,7 +1914,8 @@ async fn session_prompt(
 
     let config = CONFIG_STATE.read().await;
     let (provider, provider_id, model_id) =
-        resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)?;
+        resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)
+            .await?;
     drop(config);
 
     let task_state = state.clone();
@@ -2129,6 +2394,7 @@ pub struct FileDiffInfo {
 fn provider_routes() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/", get(list_providers))
+        .route("/known", get(list_known_providers))
         .route("/auth", get(get_provider_auth))
         .route("/{id}/oauth/authorize", post(oauth_authorize))
         .route("/{id}/oauth/callback", post(oauth_callback))
@@ -2259,7 +2525,7 @@ fn variants_for_model(
 
 async fn list_providers(State(state): State<Arc<ServerState>>) -> Json<ProviderListResponse> {
     let variant_lookup = get_model_variant_lookup().await;
-    let models = state.providers.list_models();
+    let models = state.providers.read().await.list_models();
     let mut provider_map: HashMap<String, Vec<ModelInfo>> = HashMap::new();
     for m in models {
         let provider_id = m.provider.clone();
@@ -2293,6 +2559,51 @@ async fn list_providers(State(state): State<Arc<ServerState>>) -> Json<ProviderL
         default_model,
         connected,
     })
+}
+
+/// A lightweight provider entry for the "known providers" catalogue.
+#[derive(Debug, Serialize)]
+pub struct KnownProviderEntry {
+    pub id: String,
+    pub name: String,
+    pub env: Vec<String>,
+    pub model_count: usize,
+    pub connected: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KnownProvidersResponse {
+    pub providers: Vec<KnownProviderEntry>,
+}
+
+/// Returns all providers known to `models.dev`, regardless of whether they are
+/// currently connected.  Each entry includes the primary env var(s) and a flag
+/// indicating whether the provider is already connected.
+async fn list_known_providers(
+    State(state): State<Arc<ServerState>>,
+) -> Json<KnownProvidersResponse> {
+    let models_data = load_models_dev_data().await;
+    let connected_ids: std::collections::HashSet<String> = state
+        .providers
+        .read()
+        .await
+        .list_models()
+        .into_iter()
+        .map(|m| m.provider)
+        .collect();
+
+    let mut providers: Vec<KnownProviderEntry> = models_data
+        .into_iter()
+        .map(|(id, info)| KnownProviderEntry {
+            connected: connected_ids.contains(&id),
+            model_count: info.models.len(),
+            env: info.env,
+            name: info.name,
+            id,
+        })
+        .collect();
+    providers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Json(KnownProvidersResponse { providers })
 }
 
 #[derive(Debug, Serialize)]
@@ -2385,7 +2696,12 @@ async fn oauth_callback(
     if let Some(bridge) = loader.auth_bridge(&id).await {
         match bridge.load().await {
             Ok(load_result) => {
-                crate::server::sync_custom_fetch_proxy(&id, bridge, loader, load_result.has_custom_fetch);
+                crate::server::sync_custom_fetch_proxy(
+                    &id,
+                    bridge,
+                    loader,
+                    load_result.has_custom_fetch,
+                );
             }
             Err(error) => {
                 crate::server::sync_custom_fetch_proxy(&id, bridge, loader, false);
@@ -2441,7 +2757,7 @@ async fn get_config_providers(
     State(state): State<Arc<ServerState>>,
 ) -> Json<ConfigProvidersResponse> {
     let variant_lookup = get_model_variant_lookup().await;
-    let models = state.providers.list_models();
+    let models = state.providers.read().await.list_models();
     let mut provider_map: HashMap<String, Vec<ModelInfo>> = HashMap::new();
     for m in models {
         let provider_id = m.provider.clone();
@@ -4480,6 +4796,12 @@ async fn set_auth(
     let auth_info = parse_auth_info_payload(req.body)
         .ok_or_else(|| ApiError::BadRequest("Invalid auth payload".to_string()))?;
     state.auth_manager.set(&id, auth_info).await;
+
+    // Rebuild the provider registry so newly-connected providers are
+    // available immediately (e.g. their models show up in /provider/).
+    state.rebuild_providers().await;
+    state.broadcast("config.updated");
+
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -4488,6 +4810,8 @@ async fn delete_auth(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     state.auth_manager.remove(&id).await;
+    state.rebuild_providers().await;
+    state.broadcast("config.updated");
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 

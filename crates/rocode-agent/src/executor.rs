@@ -161,7 +161,9 @@ impl AgentExecutor {
             )
             .await;
 
-            let request = ChatRequest::new(model_id, self.conversation.to_provider_messages());
+            let tool_defs = self.resolve_tool_definitions().await;
+            let request = ChatRequest::new(model_id, self.conversation.to_provider_messages())
+                .with_tools(tool_defs);
 
             let stream = provider
                 .chat_stream(request)
@@ -175,11 +177,32 @@ impl AgentExecutor {
                 break;
             }
 
-            self.conversation.add_assistant_message(&response);
+            self.conversation
+                .add_assistant_message_with_tools(&response, tool_calls.clone());
 
             for tool_call in tool_calls {
                 let effective_tool_call = self.repair_tool_call(tool_call).await;
-                let result = self.execute_tool(&effective_tool_call).await;
+                let mut result = self.execute_tool(&effective_tool_call).await;
+
+                // Reroute InvalidArguments to the invalid tool for structured feedback
+                if effective_tool_call.name != "invalid"
+                    && matches!(&result, Err(ToolError::InvalidArguments(_)))
+                {
+                    let validation_error = result
+                        .as_ref()
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default();
+                    let invalid_call = ToolCall {
+                        id: effective_tool_call.id.clone(),
+                        name: "invalid".to_string(),
+                        arguments: serde_json::json!({
+                            "tool": effective_tool_call.name,
+                            "error": validation_error,
+                        }),
+                    };
+                    result = self.execute_tool(&invalid_call).await;
+                }
 
                 let (content, is_error) = match result {
                     Ok(output) => (output, false),
@@ -224,7 +247,9 @@ impl AgentExecutor {
 
             let provider = self.get_provider()?;
             let model_id = self.get_model_id(&provider);
-            let request = ChatRequest::new(model_id, self.conversation.to_provider_messages());
+            let tool_defs = self.resolve_tool_definitions().await;
+            let request = ChatRequest::new(model_id, self.conversation.to_provider_messages())
+                .with_tools(tool_defs);
 
             let stream = provider
                 .chat_stream(request)
@@ -238,13 +263,35 @@ impl AgentExecutor {
                 break;
             }
 
-            self.conversation.add_assistant_message(&response);
+            self.conversation
+                .add_assistant_message_with_tools(&response, tool_calls.clone());
 
             for tool_call in tool_calls {
                 let effective_tool_call = self.repair_tool_call(tool_call).await;
-                let result = self
+                let mut result = self
                     .execute_tool_without_subsessions(&effective_tool_call)
                     .await;
+
+                if effective_tool_call.name != "invalid"
+                    && matches!(&result, Err(ToolError::InvalidArguments(_)))
+                {
+                    let validation_error = result
+                        .as_ref()
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default();
+                    let invalid_call = ToolCall {
+                        id: effective_tool_call.id.clone(),
+                        name: "invalid".to_string(),
+                        arguments: serde_json::json!({
+                            "tool": effective_tool_call.name,
+                            "error": validation_error,
+                        }),
+                    };
+                    result = self
+                        .execute_tool_without_subsessions(&invalid_call)
+                        .await;
+                }
 
                 let (content, is_error) = match result {
                     Ok(output) => (output, false),
@@ -272,19 +319,149 @@ impl AgentExecutor {
         user_message: String,
     ) -> Result<BoxStream<'static, Result<StreamEvent, AgentError>>, AgentError> {
         self.conversation.add_user_message(user_message);
+        let mut steps = 0u32;
+        let mut emitted: Vec<Result<StreamEvent, AgentError>> = Vec::new();
 
-        let provider = self.get_provider()?;
-        let model_id = self.get_model_id(&provider);
-        let request = ChatRequest::new(model_id, self.conversation.to_provider_messages());
+        while steps < self.max_steps {
+            steps += 1;
 
-        let stream = provider
-            .chat_stream(request)
-            .await
-            .map_err(|e| AgentError::ProviderError(e.to_string()))?;
+            let provider = self.get_provider()?;
+            let model_id = self.get_model_id(&provider);
+            let tool_defs = self.resolve_tool_definitions().await;
+            let request = ChatRequest::new(model_id, self.conversation.to_provider_messages())
+                .with_tools(tool_defs);
 
-        Ok(stream
-            .map(|r| r.map_err(|e| AgentError::ProviderError(e.to_string())))
-            .boxed())
+            let mut stream = provider
+                .chat_stream(request)
+                .await
+                .map_err(|e| AgentError::ProviderError(e.to_string()))?;
+
+            let mut response = String::new();
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::TextDelta(text)) => {
+                        response.push_str(&text);
+                        emitted.push(Ok(StreamEvent::TextDelta(text)));
+                    }
+                    Ok(StreamEvent::ToolCallStart { id, name }) => {
+                        emitted.push(Ok(StreamEvent::ToolCallStart { id, name }));
+                    }
+                    Ok(StreamEvent::ToolCallDelta { id, input }) => {
+                        emitted.push(Ok(StreamEvent::ToolCallDelta { id, input }));
+                    }
+                    Ok(StreamEvent::ToolCallEnd { id, name, input }) => {
+                        if name.trim().is_empty() {
+                            tracing::warn!(
+                                tool_call_id = %id,
+                                "ignoring ToolCallEnd with empty tool name"
+                            );
+                            continue;
+                        }
+                        emitted.push(Ok(StreamEvent::ToolCallEnd {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        }));
+                        tool_calls.push(ToolCall {
+                            id,
+                            name,
+                            arguments: input,
+                        });
+                    }
+                    Ok(StreamEvent::ReasoningStart { id }) => {
+                        emitted.push(Ok(StreamEvent::ReasoningStart { id }));
+                    }
+                    Ok(StreamEvent::ReasoningDelta { id, text }) => {
+                        emitted.push(Ok(StreamEvent::ReasoningDelta { id, text }));
+                    }
+                    Ok(StreamEvent::ReasoningEnd { id }) => {
+                        emitted.push(Ok(StreamEvent::ReasoningEnd { id }));
+                    }
+                    Ok(StreamEvent::Done) => break,
+                    Ok(StreamEvent::Error(e)) => {
+                        return Err(AgentError::ProviderError(e));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(AgentError::ProviderError(e.to_string()));
+                    }
+                }
+            }
+
+            if tool_calls.is_empty() {
+                self.conversation.add_assistant_message(&response);
+                emitted.push(Ok(StreamEvent::Done));
+                return Ok(futures::stream::iter(emitted).boxed());
+            }
+
+            self.conversation
+                .add_assistant_message_with_tools(&response, tool_calls.clone());
+
+            for tool_call in tool_calls {
+                let effective_tool_call = self.repair_tool_call(tool_call).await;
+                let mut execution = self.execute_tool(&effective_tool_call).await;
+
+                if effective_tool_call.name != "invalid"
+                    && matches!(&execution, Err(ToolError::InvalidArguments(_)))
+                {
+                    let validation_error = execution
+                        .as_ref()
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default();
+                    let invalid_call = ToolCall {
+                        id: effective_tool_call.id.clone(),
+                        name: "invalid".to_string(),
+                        arguments: serde_json::json!({
+                            "tool": effective_tool_call.name,
+                            "error": validation_error,
+                        }),
+                    };
+                    execution = self.execute_tool(&invalid_call).await;
+                }
+
+                match execution {
+                    Ok(output) => {
+                        self.conversation.add_tool_result(
+                            &effective_tool_call.id,
+                            &effective_tool_call.name,
+                            output.clone(),
+                            false,
+                        );
+                        emitted.push(Ok(StreamEvent::ToolResult {
+                            tool_call_id: effective_tool_call.id.clone(),
+                            tool_name: effective_tool_call.name.clone(),
+                            input: Some(effective_tool_call.arguments.clone()),
+                            output: rocode_provider::ToolResultOutput {
+                                output,
+                                title: "Tool Result".to_string(),
+                                metadata: HashMap::new(),
+                                attachments: None,
+                            },
+                        }));
+                    }
+                    Err(error) => {
+                        self.conversation.add_tool_result(
+                            &effective_tool_call.id,
+                            &effective_tool_call.name,
+                            error.to_string(),
+                            true,
+                        );
+                        emitted.push(Ok(StreamEvent::ToolError {
+                            tool_call_id: effective_tool_call.id.clone(),
+                            tool_name: effective_tool_call.name.clone(),
+                            input: Some(effective_tool_call.arguments.clone()),
+                            error: error.to_string(),
+                            kind: Some(rocode_provider::ToolErrorKind::ExecutionError),
+                        }));
+                    }
+                }
+            }
+        }
+
+        Err(AgentError::MaxStepsExceeded)
     }
 
     fn get_provider(&self) -> Result<Arc<dyn Provider>, AgentError> {
@@ -322,12 +499,11 @@ impl AgentExecutor {
                 Ok(StreamEvent::TextDelta(text)) => {
                     content.push_str(&text);
                 }
-                Ok(StreamEvent::ToolCallStart { .. }) => {}
-                Ok(StreamEvent::ToolCallDelta { .. }) => {}
-                Ok(StreamEvent::ToolInputStart { .. }) => {}
-                Ok(StreamEvent::ToolInputDelta { .. }) => {}
-                Ok(StreamEvent::ToolInputEnd { .. }) => {}
                 Ok(StreamEvent::ToolCallEnd { id, name, input }) => {
+                    if name.trim().is_empty() {
+                        tracing::warn!(tool_call_id = %id, "ignoring ToolCallEnd with empty tool name");
+                        continue;
+                    }
                     tool_calls.push(ToolCall {
                         id,
                         name,
@@ -521,11 +697,34 @@ impl AgentExecutor {
             return tool_call;
         }
 
+        let arguments = if repaired_name == "invalid" && tool_call.name != "invalid" {
+            serde_json::json!({
+                "tool": tool_call.name.clone(),
+                "error": format!("Unknown tool requested by model: {}", tool_call.name),
+            })
+        } else {
+            tool_call.arguments
+        };
+
         ToolCall {
             id: tool_call.id,
             name: repaired_name,
-            arguments: tool_call.arguments,
+            arguments,
         }
+    }
+
+    async fn resolve_tool_definitions(&self) -> Vec<rocode_provider::ToolDefinition> {
+        self.tools
+            .list_schemas()
+            .await
+            .into_iter()
+            .filter(|s| !self.disabled_tools.contains(&s.name))
+            .map(|s| rocode_provider::ToolDefinition {
+                name: s.name,
+                description: Some(s.description),
+                parameters: s.parameters,
+            })
+            .collect()
     }
 
     fn ensure_tool_allowed(&self, tool_name: &str) -> Result<(), ToolError> {
@@ -753,5 +952,29 @@ mod tests {
 
         let bash_tc = tool_calls.iter().find(|t| t.name == "bash").unwrap();
         assert_eq!(bash_tc.arguments, serde_json::json!({"command": "ls"}));
+    }
+
+    #[tokio::test]
+    async fn process_stream_ignores_tool_call_end_with_empty_name() {
+        let mut executor = build_executor(AgentInfo::general());
+        let stream = mock_stream(vec![
+            StreamEvent::ToolCallEnd {
+                id: "tool-call-empty".into(),
+                name: "   ".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+            StreamEvent::ToolCallEnd {
+                id: "tool-call-1".into(),
+                name: "ls".into(),
+                input: serde_json::json!({"path": "."}),
+            },
+            StreamEvent::Done,
+        ]);
+
+        let (_, tool_calls) = executor.process_stream(stream).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "tool-call-1");
+        assert_eq!(tool_calls[0].name, "ls");
+        assert_eq!(tool_calls[0].arguments, serde_json::json!({"path": "."}));
     }
 }

@@ -20,9 +20,10 @@ use rocode_plugin::subprocess::{
 };
 use rocode_provider::{
     bootstrap_config_from_raw, create_registry_from_bootstrap_config, register_custom_fetch_proxy,
-    unregister_custom_fetch_proxy, AuthInfo, AuthManager, ConfigModel as BootstrapConfigModel,
-    ConfigProvider as BootstrapConfigProvider, CustomFetchProxy, CustomFetchRequest,
-    CustomFetchResponse, CustomFetchStreamResponse, ProviderError, ProviderRegistry,
+    unregister_custom_fetch_proxy, AuthInfo, AuthManager, BootstrapConfig,
+    ConfigModel as BootstrapConfigModel, ConfigProvider as BootstrapConfigProvider,
+    CustomFetchProxy, CustomFetchRequest, CustomFetchResponse, CustomFetchStreamResponse,
+    ProviderError, ProviderRegistry,
 };
 use rocode_session::SessionManager;
 use rocode_storage::{Database, MessageRepository, SessionRepository};
@@ -128,7 +129,12 @@ pub(crate) async fn refresh_plugin_auth_state(
         match bridge.load().await {
             Ok(result) => {
                 any_custom_fetch |= result.has_custom_fetch;
-                sync_custom_fetch_proxy(&provider_id, bridge.clone(), loader, result.has_custom_fetch);
+                sync_custom_fetch_proxy(
+                    &provider_id,
+                    bridge.clone(),
+                    loader,
+                    result.has_custom_fetch,
+                );
 
                 if let Some(api_key) = result.api_key {
                     auth_manager
@@ -197,7 +203,8 @@ fn spawn_plugin_idle_monitor(loader: Arc<PluginLoader>) {
 
 pub struct ServerState {
     pub sessions: Mutex<SessionManager>,
-    pub providers: ProviderRegistry,
+    pub providers: tokio::sync::RwLock<ProviderRegistry>,
+    pub bootstrap_config: BootstrapConfig,
     pub tool_registry: Arc<rocode_tool::ToolRegistry>,
     pub auth_manager: Arc<AuthManager>,
     pub event_bus: broadcast::Sender<String>,
@@ -210,7 +217,8 @@ impl ServerState {
         let (tx, _) = broadcast::channel(1024);
         Self {
             sessions: Mutex::new(SessionManager::new()),
-            providers: ProviderRegistry::new(),
+            providers: tokio::sync::RwLock::new(ProviderRegistry::new()),
+            bootstrap_config: BootstrapConfig::default(),
             tool_registry: Arc::new(rocode_tool::ToolRegistry::new()),
             auth_manager: Arc::new(AuthManager::new()),
             event_bus: tx,
@@ -257,12 +265,18 @@ impl ServerState {
                     tracing::info!(providers = data.len(), "models.dev cache ready");
                 }
                 Err(_) => {
-                    tracing::warn!("timed out fetching models.dev data; built-in model list may be incomplete");
+                    tracing::warn!(
+                        "timed out fetching models.dev data; built-in model list may be incomplete"
+                    );
                 }
             }
         }
 
-        state.providers = create_registry_from_bootstrap_config(&bootstrap_config, &auth_store);
+        state.providers = tokio::sync::RwLock::new(create_registry_from_bootstrap_config(
+            &bootstrap_config,
+            &auth_store,
+        ));
+        state.bootstrap_config = bootstrap_config;
         state.tool_registry = Arc::new(rocode_tool::create_default_registry().await);
         let db = Database::new().await?;
         let pool = db.pool().clone();
@@ -274,6 +288,16 @@ impl ServerState {
 
     pub fn broadcast(&self, event: &str) {
         let _ = self.event_bus.send(event.to_string());
+    }
+
+    /// Rebuild the provider registry from the stored bootstrap config and
+    /// current auth store.  Call this after `auth_manager.set()` so that newly
+    /// connected providers become available immediately.
+    pub async fn rebuild_providers(&self) {
+        let auth_store = self.auth_manager.list().await;
+        let new_registry =
+            create_registry_from_bootstrap_config(&self.bootstrap_config, &auth_store);
+        *self.providers.write().await = new_registry;
     }
 
     async fn load_sessions_from_storage(&self) -> anyhow::Result<()> {

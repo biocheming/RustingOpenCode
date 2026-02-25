@@ -46,6 +46,7 @@ pub enum StateChange {
     },
     TodoUpdated,
     DiffUpdated,
+    ProcessesUpdated,
 }
 
 pub struct EventBus {

@@ -8,6 +8,7 @@ use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 const DEFAULT_READ_LIMIT: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024;
+const DESCRIPTION: &str = include_str!("read.txt");
 
 const INSTRUCTION_FILES: &[&str] = &[
     "AGENTS.md",
@@ -50,7 +51,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Reads a file from the local filesystem. Can read text files, list directory contents, or handle binary files (images, PDFs) as base64."
+        DESCRIPTION
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -59,7 +60,8 @@ impl Tool for ReadTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file or directory to read"
+                    "minLength": 1,
+                    "description": "The absolute path to the file or directory to read."
                 },
                 "offset": {
                     "type": "number",
@@ -82,9 +84,23 @@ impl Tool for ReadTool {
         let file_path: String = args
             .get("file_path")
             .or_else(|| args.get("filePath"))
+            .or_else(|| args.get("filepath"))
+            .or_else(|| args.get("path"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments("file_path (or filePath) is required".into()))?
+            .ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "file_path is required. Got args: {}. If you are unsure of the correct path, use glob first.",
+                    serde_json::to_string(&args).unwrap_or_else(|_| format!("{:?}", args))
+                ))
+            })?
             .to_string();
+        let file_path = file_path.trim().to_string();
+        if file_path.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "file_path cannot be empty. If you do not know the path, call glob first (for example: pattern='**/*.html')."
+                    .into(),
+            ));
+        }
 
         let offset: usize = args["offset"].as_u64().unwrap_or(1) as usize;
 
@@ -547,4 +563,30 @@ async fn find_instruction_file(dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_rejects_empty_file_path() {
+        let tool = ReadTool::new();
+        let ctx = ToolContext::new(
+            "session-1".to_string(),
+            "message-1".to_string(),
+            ".".to_string(),
+        );
+        let err = tool
+            .execute(serde_json::json!({ "file_path": "   " }), ctx)
+            .await
+            .expect_err("empty file_path should be rejected");
+
+        match err {
+            ToolError::InvalidArguments(msg) => {
+                assert!(msg.contains("cannot be empty"));
+            }
+            other => panic!("unexpected error: {}", other),
+        }
+    }
 }

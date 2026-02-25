@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
-use crate::context::{AppContext, SessionStatus};
+use crate::context::{AppContext, MessageRole, SessionStatus};
 use crate::file_index::FileIndex;
 use crate::theme::Theme;
 
@@ -341,7 +341,7 @@ impl Prompt {
             Paragraph::new(info_line).style(Style::default().bg(theme.background_element));
         frame.render_widget(info_paragraph, info_row);
 
-        let spinner_row = inset_horizontal(chunks[2], PROMPT_LINE_H_INSET);
+        let spinner_row = chunks[2];
         frame.render_widget(
             Paragraph::new("").style(Style::default().bg(theme.background)),
             spinner_row,
@@ -357,12 +357,15 @@ impl Prompt {
             animations_enabled,
             theme.background,
         );
+        let token_line = Paragraph::new(self.render_token_line(&theme))
+            .style(Style::default().bg(theme.background));
+        frame.render_widget(token_line, spinner_chunks[1]);
 
         let status_line = Paragraph::new(self.render_status_line(&theme))
             .style(Style::default().bg(theme.background));
         frame.render_widget(
             status_line,
-            inset_horizontal(chunks[3], PROMPT_LINE_H_INSET),
+            chunks[3],
         );
     }
 
@@ -1052,6 +1055,37 @@ impl Prompt {
         }
     }
 
+    fn render_token_line(&self, theme: &Theme) -> Line<'static> {
+        let Some((input, output)) = self.current_session_token_io() else {
+            return Line::from("");
+        };
+        if input == 0 && output == 0 {
+            return Line::from("");
+        }
+
+        Line::from(vec![
+            Span::styled("↑", Style::default().fg(theme.text_muted)),
+            Span::styled(format_number(input), Style::default().fg(theme.text)),
+            Span::raw("  "),
+            Span::styled("↓", Style::default().fg(theme.text_muted)),
+            Span::styled(format_number(output), Style::default().fg(theme.text)),
+        ])
+    }
+
+    fn current_session_token_io(&self) -> Option<(u64, u64)> {
+        let session_id = match self.context.current_route() {
+            crate::router::Route::Session { session_id } => session_id,
+            _ => return None,
+        };
+        let session_ctx = self.context.session.read();
+        let messages = session_ctx.messages.get(&session_id)?;
+        let last_assistant = messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, MessageRole::Assistant))?;
+        Some((last_assistant.tokens.input, last_assistant.tokens.output))
+    }
+
     fn interrupt_confirmation_active(&self) -> bool {
         if self.interrupt_press_count == 0 {
             return false;
@@ -1115,6 +1149,18 @@ fn truncate_for_status(input: &str, max_chars: usize) -> String {
     }
     out.push('…');
     out
+}
+
+fn format_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + (digits.len() / 3));
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
 }
 
 fn visual_line_count(text: &str, width: usize) -> usize {

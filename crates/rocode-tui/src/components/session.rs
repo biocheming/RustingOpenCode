@@ -368,10 +368,21 @@ impl SessionView {
             vec![Line::from(title_line_spans)]
         };
 
+        let border_set = ratatui::symbols::border::Set {
+            top_left: " ",
+            top_right: " ",
+            bottom_left: " ",
+            bottom_right: " ",
+            vertical_left: "┃",
+            vertical_right: " ",
+            horizontal_top: " ",
+            horizontal_bottom: " ",
+        };
         let paragraph = Paragraph::new(content)
             .block(
                 Block::default()
                     .borders(Borders::LEFT)
+                    .border_set(border_set)
                     .border_style(Style::default().fg(theme.border)),
             )
             .style(Style::default().bg(theme.background_panel));
@@ -499,23 +510,19 @@ impl SessionView {
         let assistant_border = message_palette::assistant_border_color(&theme);
         let thinking_border = message_palette::thinking_border_color(&theme);
         let show_scrollbar = *self.context.show_scrollbar.read() && area.width > 3;
-        let messages_area = if show_scrollbar {
-            Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width.saturating_sub(1),
-                height: area.height,
-            }
-        } else {
-            area
-        };
+        // Use full width for messages; the scrollbar overlays the rightmost
+        // padding column (MESSAGE_BLOCK_RIGHT_PADDING already reserves 1 char)
+        // so that the messages area matches header/input box width.
+        let messages_area = area;
         let scrollbar_area = show_scrollbar.then_some(Rect {
             x: area.x + area.width.saturating_sub(1),
             y: area.y,
             width: 1,
             height: area.height,
         });
-        let content_width = usize::from(messages_area.width.saturating_sub(1));
+        // No subtraction — the outer Block border is removed so each message's
+        // paint_block_line fills the full area width for consistent alignment.
+        let content_width = usize::from(messages_area.width);
         let session_ctx = self.context.session.read();
         let show_thinking = *self.context.show_thinking.read();
         let show_timestamps = *self.context.show_timestamps.read();
@@ -554,7 +561,7 @@ impl SessionView {
             );
             append_non_message_lines(&mut lines, &mut line_to_message, painted);
             if !messages.is_empty() {
-                push_spacing_lines(&mut lines, &mut line_to_message, message_gap_lines);
+                push_spacing_lines(&mut lines, &mut line_to_message, message_gap_lines, theme.background, content_width);
             }
         }
 
@@ -566,7 +573,7 @@ impl SessionView {
             // cozy mode adds an extra blank line for breathing room
             if let Some(prev_role) = &last_visible_role {
                 if *prev_role != msg.role || matches!(msg.role, MessageRole::User) {
-                    push_spacing_lines(&mut lines, &mut line_to_message, message_gap_lines);
+                    push_spacing_lines(&mut lines, &mut line_to_message, message_gap_lines, theme.background, content_width);
                 }
             }
             message_first_lines
@@ -649,7 +656,7 @@ impl SessionView {
                                             &mut lines,
                                             &mut line_to_message,
                                             &msg.id,
-                                            vec![Line::from("")],
+                                            vec![paint_block_line(Line::from(""), message_bg, message_border, content_width)],
                                         );
                                     }
                                     let mut text_lines = super::session_text::render_text_part(
@@ -683,7 +690,7 @@ impl SessionView {
                                                 &mut lines,
                                                 &mut line_to_message,
                                                 &msg.id,
-                                                vec![Line::from("")],
+                                                vec![paint_block_line(Line::from(""), message_bg, message_border, content_width)],
                                             );
                                         }
                                         let reasoning_id = format!("{}:{part_idx}", msg.id);
@@ -741,7 +748,7 @@ impl SessionView {
                                             &mut lines,
                                             &mut line_to_message,
                                             &msg.id,
-                                            vec![Line::from("")],
+                                            vec![paint_block_line(Line::from(""), message_bg, message_border, content_width)],
                                         );
                                     }
                                     let state = if let Some((_, is_error)) = tool_results.get(id) {
@@ -764,11 +771,15 @@ impl SessionView {
                                         show_tool_details,
                                         &theme,
                                     );
+                                    let painted_tool: Vec<Line<'static>> = tool_lines
+                                        .into_iter()
+                                        .map(|l| paint_block_line(l, message_bg, message_border, content_width))
+                                        .collect();
                                     append_message_lines(
                                         &mut lines,
                                         &mut line_to_message,
                                         &msg.id,
-                                        tool_lines,
+                                        painted_tool,
                                     );
                                     prev_was_text = false;
                                     prev_was_tool = true;
@@ -853,7 +864,11 @@ impl SessionView {
                             ))
                         })
                         .collect();
-                    append_message_lines(&mut lines, &mut line_to_message, &msg.id, system_lines);
+                    let painted: Vec<Line<'static>> = system_lines
+                        .into_iter()
+                        .map(|l| paint_block_line(l, theme.background, theme.border, content_width))
+                        .collect();
+                    append_message_lines(&mut lines, &mut line_to_message, &msg.id, painted);
                 }
                 MessageRole::Tool => {
                     // Carrier tool-result messages are rendered inline with the originating
@@ -868,7 +883,11 @@ impl SessionView {
                             ))
                         })
                         .collect();
-                    append_message_lines(&mut lines, &mut line_to_message, &msg.id, tool_lines);
+                    let painted: Vec<Line<'static>> = tool_lines
+                        .into_iter()
+                        .map(|l| paint_block_line(l, theme.background, theme.border, content_width))
+                        .collect();
+                    append_message_lines(&mut lines, &mut line_to_message, &msg.id, painted);
                 }
             }
             last_visible_role = Some(msg.role.clone());
@@ -888,12 +907,10 @@ impl SessionView {
             self.scroll_offset = max_scroll;
         }
 
+        // No outer Block border — each message line's paint_block_line already
+        // includes its own gutter character and fills the full content_width,
+        // so the colored background spans the entire area width.
         let paragraph = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::LEFT)
-                    .border_style(Style::default().fg(theme.border)),
-            )
             .scroll((self.scroll_offset as u16, 0));
 
         frame.render_widget(paragraph, messages_area);
@@ -966,6 +983,10 @@ impl SessionView {
 
     pub fn scroll_sidebar_down_at(&mut self, col: u16, row: u16) -> bool {
         self.sidebar_state.scroll_down_at(col, row)
+    }
+
+    pub fn sidebar_state_mut(&mut self) -> &mut super::sidebar::SidebarState {
+        &mut self.sidebar_state
     }
 
     pub fn scroll_up(&mut self) {
@@ -1044,9 +1065,15 @@ fn push_spacing_lines(
     lines: &mut Vec<Line<'static>>,
     line_to_message: &mut Vec<Option<String>>,
     count: usize,
+    bg: Color,
+    width: usize,
 ) {
+    let spacing = Line::from(Span::styled(
+        " ".repeat(width),
+        Style::default().bg(bg),
+    ));
     for _ in 0..count {
-        lines.push(Line::from(""));
+        lines.push(spacing.clone());
         line_to_message.push(None);
     }
 }

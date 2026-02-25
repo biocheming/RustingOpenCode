@@ -43,6 +43,21 @@ pub struct MessagePart {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallStatus {
+    Pending,
+    Running,
+    Completed,
+    Error,
+}
+
+impl Default for ToolCallStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum PartType {
     Text {
@@ -56,11 +71,23 @@ pub enum PartType {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(default)]
+        status: ToolCallStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<crate::ToolState>,
     },
     ToolResult {
         tool_call_id: String,
         content: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<Vec<serde_json::Value>>,
     },
 
     Reasoning {
@@ -185,6 +212,9 @@ impl SessionMessage {
                 id: id.into(),
                 name: name.into(),
                 input,
+                status: ToolCallStatus::Running,
+                raw: None,
+                state: None,
             },
             created_at: Utc::now(),
             message_id: None,
@@ -203,6 +233,9 @@ impl SessionMessage {
                 tool_call_id: tool_call_id.into(),
                 content: content.into(),
                 is_error,
+                title: None,
+                metadata: None,
+                attachments: None,
             },
             created_at: Utc::now(),
             message_id: None,

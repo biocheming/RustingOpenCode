@@ -394,7 +394,7 @@ impl OpenAIProvider {
                         }
                         for tc in tool_calls {
                             let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-                            let id = if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                            let id = if let Some(id) = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                                 let id = id.to_string();
                                 state.tool_call_ids.insert(index, id.clone());
                                 id
@@ -426,9 +426,31 @@ impl OpenAIProvider {
                                     func.get("arguments").and_then(Value::as_str)
                                 {
                                     if !arguments.is_empty() {
+                                        tracing::info!(
+                                            tool_call_id = %id,
+                                            arguments_len = arguments.len(),
+                                            arguments_preview = %arguments.chars().take(200).collect::<String>(),
+                                            "[DIAG-SSE] ToolCallDelta emitted from SSE arguments string"
+                                        );
                                         events.push(StreamEvent::ToolCallDelta {
                                             id,
                                             input: arguments.to_string(),
+                                        });
+                                    }
+                                } else if let Some(arguments_value) = func.get("arguments") {
+                                    // LiteLLM or other proxies may send arguments as a JSON
+                                    // object instead of a string. Handle this case.
+                                    tracing::info!(
+                                        tool_call_id = %id,
+                                        arguments_type = %if arguments_value.is_object() { "object" } else if arguments_value.is_null() { "null" } else { "other" },
+                                        arguments_preview = %arguments_value.to_string().chars().take(200).collect::<String>(),
+                                        "[DIAG-SSE] arguments field is NOT a string"
+                                    );
+                                    if arguments_value.is_object() && !arguments_value.as_object().map_or(true, |o| o.is_empty()) {
+                                        let serialized = arguments_value.to_string();
+                                        events.push(StreamEvent::ToolCallDelta {
+                                            id,
+                                            input: serialized,
                                         });
                                     }
                                 }

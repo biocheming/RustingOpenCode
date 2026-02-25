@@ -10,6 +10,7 @@ use crate::context::{KeybindRegistry, SessionContext};
 use crate::event::EventBus;
 use crate::router::Router;
 use crate::theme::Theme;
+use rocode_core::process_registry::ProcessInfo;
 
 #[derive(Clone)]
 pub struct ProviderInfo {
@@ -116,6 +117,7 @@ pub struct AppContext {
     pub message_density: RwLock<MessageDensity>,
     pub semantic_highlight: RwLock<bool>,
     pub has_connected_provider: RwLock<bool>,
+    pub processes: RwLock<Vec<ProcessInfo>>,
     ui_kv: RwLock<UiKv>,
     pub api_client: RwLock<Option<Arc<ApiClient>>>,
 }
@@ -155,6 +157,7 @@ impl AppContext {
             )),
             semantic_highlight: RwLock::new(ui_kv.get_bool("semantic_highlight", true)),
             has_connected_provider: RwLock::new(false),
+            processes: RwLock::new(Vec::new()),
             ui_kv: RwLock::new(ui_kv),
             api_client: RwLock::new(None),
         }

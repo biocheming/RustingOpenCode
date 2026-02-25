@@ -81,6 +81,24 @@ fn slug_override(key: &str) -> Option<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
+// dedup_messages
+// ---------------------------------------------------------------------------
+
+/// Remove consecutive duplicate messages (same role and text content).
+/// This prevents redundant cache control markers and wasted tokens.
+pub fn dedup_messages(messages: &mut Vec<Message>) {
+    messages.dedup_by(|b, a| {
+        if std::mem::discriminant(&a.role) != std::mem::discriminant(&b.role) {
+            return false;
+        }
+        match (&a.content, &b.content) {
+            (Content::Text(t1), Content::Text(t2)) => t1 == t2,
+            _ => false,
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // apply_caching
 // ---------------------------------------------------------------------------
 
@@ -175,9 +193,14 @@ fn merge_deep_into(
     for (k, v) in source {
         if let Some(existing) = target.get_mut(k) {
             if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), v.as_object()) {
-                for (nk, nv) in new_obj {
-                    existing_obj.insert(nk.clone(), nv.clone());
-                }
+                let mut sub_target: HashMap<String, serde_json::Value> =
+                    existing_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let sub_source: HashMap<String, serde_json::Value> =
+                    new_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                merge_deep_into(&mut sub_target, &sub_source);
+                *existing = serde_json::Value::Object(
+                    sub_target.into_iter().collect(),
+                );
                 continue;
             }
         }
@@ -189,16 +212,20 @@ fn merge_deep_into(
 // normalize_messages_for_caching
 // ---------------------------------------------------------------------------
 
-pub fn normalize_messages_for_caching(messages: &mut [Message]) {
-    for msg in messages.iter_mut() {
-        if matches!(msg.role, crate::Role::Assistant) {
-            if let Content::Text(ref text) = msg.content {
-                if text.is_empty() {
-                    msg.content = Content::Text(" ".to_string());
-                }
-            }
+pub fn normalize_messages_for_caching(messages: &mut Vec<Message>) {
+    messages.retain(|msg| {
+        if !matches!(msg.role, crate::Role::Assistant) {
+            return true;
         }
-    }
+        match &msg.content {
+            Content::Text(text) => !text.is_empty(),
+            Content::Parts(parts) => parts.iter().any(|p| {
+                p.text.as_ref().map_or(false, |t| !t.is_empty())
+                    || p.tool_use.is_some()
+                    || p.tool_result.is_some()
+            }),
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -210,28 +237,21 @@ pub fn apply_interleaved_thinking(messages: &mut [Message], provider_type: Provi
         return;
     }
 
+    // Reasoning parts are preserved in the message content so that the
+    // provider can convert them to the appropriate format (e.g. Anthropic
+    // `thinking` blocks).  We only apply cache control hints here.
     for msg in messages.iter_mut() {
         if matches!(msg.role, crate::Role::Assistant) {
             if let Content::Parts(parts) = &mut msg.content {
-                let reasoning_parts: Vec<&ContentPart> = parts
-                    .iter()
-                    .filter(|p| p.content_type == "reasoning")
-                    .collect();
-
-                if !reasoning_parts.is_empty() {
-                    let reasoning_text: String = reasoning_parts
-                        .iter()
-                        .filter_map(|p| p.text.as_ref())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("");
-
-                    parts.retain(|p| p.content_type != "reasoning");
-
-                    if !reasoning_text.is_empty() {
-                        if let Some(part) = parts.last_mut() {
-                            part.cache_control = Some(CacheControl::ephemeral());
-                        }
+                let has_reasoning = parts.iter().any(|p| p.content_type == "reasoning");
+                if has_reasoning {
+                    // Mark the last non-reasoning part with ephemeral cache control
+                    if let Some(part) = parts
+                        .iter_mut()
+                        .rev()
+                        .find(|p| p.content_type != "reasoning")
+                    {
+                        part.cache_control = Some(CacheControl::ephemeral());
                     }
                 }
             }
@@ -417,7 +437,7 @@ fn normalize_tool_call_id(id: &str, allow_underscore: bool) -> String {
     if allow_underscore {
         id.chars()
             .map(|c| {
-                if c.is_alphanumeric() || c == '_' || c == '-' {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
                     c
                 } else {
                     '_'
@@ -426,13 +446,13 @@ fn normalize_tool_call_id(id: &str, allow_underscore: bool) -> String {
             .collect()
     } else {
         id.chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect()
     }
 }
 
 fn normalize_tool_call_id_mistral(id: &str) -> String {
-    let alphanumeric: String = id.chars().filter(|c| c.is_alphanumeric()).collect();
+    let alphanumeric: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     let first_9: String = alphanumeric.chars().take(9).collect();
     format!("{:0<9}", first_9)
 }
@@ -753,6 +773,44 @@ pub fn apply_caching_per_part(messages: &mut [Message], provider_type: &Provider
             }
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ensure_noop_tool (LiteLLM proxy compatibility)
+// ---------------------------------------------------------------------------
+
+/// When message history contains tool_use/tool_result blocks but the current
+/// request has no tools, some proxies (notably LiteLLM) reject the request.
+/// This function checks for that condition and injects a `_noop` placeholder
+/// tool, matching opencode's behavior.
+pub fn ensure_noop_tool_if_needed(
+    tools: &mut Option<Vec<crate::ToolDefinition>>,
+    messages: &[Message],
+) {
+    let has_tools = tools.as_ref().map_or(false, |t| !t.is_empty());
+    if has_tools {
+        return;
+    }
+
+    let has_tool_content = messages.iter().any(|msg| match &msg.content {
+        Content::Parts(parts) => parts
+            .iter()
+            .any(|p| p.tool_use.is_some() || p.tool_result.is_some()),
+        _ => false,
+    });
+
+    if has_tool_content {
+        let noop = crate::ToolDefinition {
+            name: "_noop".to_string(),
+            description: Some("Placeholder tool for proxy compatibility".to_string()),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+        };
+        *tools = Some(vec![noop]);
     }
 }
 
@@ -1998,5 +2056,19 @@ mod tests {
         let result = provider_options_map(&model, opts);
         // amazon -> bedrock via SLUG_OVERRIDES
         assert!(result.contains_key("bedrock"));
+    }
+
+    #[test]
+    fn test_normalize_tool_call_id_claude_ascii_only() {
+        let normalized = normalize_tool_call_id("call:中文/id-1", true);
+        assert_eq!(normalized, "call____id-1");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_id_mistral_is_nine_ascii_alnum() {
+        let normalized = normalize_tool_call_id_mistral("call-中文-ABC_123456789xyz");
+        assert_eq!(normalized, "callABC12");
+        assert_eq!(normalized.len(), 9);
+        assert!(normalized.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 }

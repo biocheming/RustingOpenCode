@@ -30,8 +30,8 @@ pub use dialogs::{
     HelpDialog, McpDialog, McpItem, Model, ModelSelectDialog, PromptStashDialog, Provider,
     ProviderDialog, ProviderStatus, SessionDeleteState, SessionExportDialog, SessionItem,
     SessionListDialog, SessionRenameDialog, SkillListDialog, StashItem, StatusDialog, StatusLine,
-    SubagentDialog, SubagentInfo, SubagentMessage, Tag, TagDialog, ThemeListDialog, ThemeOption,
-    TimelineDialog, TimelineEntry,
+    SubagentDialog, SubagentInfo, SubagentMessage, SubmitResult, Tag, TagDialog, ThemeListDialog,
+    ThemeOption, TimelineDialog, TimelineEntry,
 };
 pub use diff::{DiffLine, DiffLineType, DiffMode, DiffView};
 pub use home::HomeView;

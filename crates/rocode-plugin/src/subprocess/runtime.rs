@@ -65,7 +65,9 @@ pub fn detect_runtime() -> Option<JsRuntime> {
         };
         if let Some(rt) = runtime {
             if rt == JsRuntime::Node && !node_supports_strip_types() {
-                tracing::warn!("ROCODE_PLUGIN_RUNTIME=node but node <22.6 lacks TS support; ignoring");
+                tracing::warn!(
+                    "ROCODE_PLUGIN_RUNTIME=node but node <22.6 lacks TS support; ignoring"
+                );
             } else if which::which(rt.command()).is_ok() {
                 return Some(rt);
             }

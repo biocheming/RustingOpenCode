@@ -12,6 +12,22 @@ pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
 }
 
+fn rewrite_invalid_arguments(tool_id: &str, err: ToolError) -> ToolError {
+    match err {
+        ToolError::InvalidArguments(msg) => {
+            if msg.contains("Please rewrite the input so it satisfies the expected schema.") {
+                ToolError::InvalidArguments(msg)
+            } else {
+                ToolError::InvalidArguments(format!(
+                    "The {} tool was called with invalid arguments: {}.\nPlease rewrite the input so it satisfies the expected schema.",
+                    tool_id, msg
+                ))
+            }
+        }
+        other => other,
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
@@ -102,6 +118,51 @@ impl ToolRegistry {
         };
 
         let mut args = args;
+
+        // Normalize: if args is a JSON string that contains a valid object,
+        // parse it into an actual object. This happens when the stream assembler
+        // fails to parse tool call arguments during streaming and wraps the raw
+        // text as Value::String.
+        if let Some(s) = args.as_str() {
+            if let Ok(parsed @ serde_json::Value::Object(_)) = serde_json::from_str(s) {
+                args = parsed;
+            } else {
+                // Some models (e.g. Qwen via LiteLLM) may send arguments in
+                // non-JSON formats like "key=value" or "key: value". Try to
+                // construct a JSON object from simple key=value pairs.
+                let mut obj = serde_json::Map::new();
+                for line in s.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some((key, value)) = line.split_once('=') {
+                        let key = key.trim().to_string();
+                        let value = value.trim();
+                        // Try to parse value as JSON, otherwise treat as string
+                        let json_value = serde_json::from_str(value)
+                            .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+                        obj.insert(key, json_value);
+                    }
+                }
+                if !obj.is_empty() {
+                    tracing::info!(
+                        tool = %tool_id,
+                        "normalized non-JSON tool arguments from key=value format"
+                    );
+                    args = serde_json::Value::Object(obj);
+                }
+            }
+        }
+
+        // If args is still an empty object, log a warning for diagnostics.
+        if args.is_object() && args.as_object().map_or(false, |o| o.is_empty()) {
+            tracing::warn!(
+                tool = %tool_id,
+                "tool called with empty arguments object"
+            );
+        }
+
         // Plugin hook: tool.execute.before
         let mut before_hook_ctx = HookContext::new(HookEvent::ToolExecuteBefore)
             .with_session(&ctx.session_id)
@@ -117,8 +178,29 @@ impl ToolRegistry {
             }
         }
 
-        tool.validate(&args)?;
+        tool.validate(&args)
+            .map_err(|e| rewrite_invalid_arguments(tool_id, e))?;
         let mut result = tool.execute(args.clone(), ctx.clone()).await;
+        if let Err(e) = &result {
+            // Log the exact args when a tool fails, to diagnose argument parsing issues.
+            tracing::error!(
+                tool = %tool_id,
+                error = %e,
+                args_type = %match &args {
+                    serde_json::Value::Object(o) => format!("object(keys={})", o.keys().cloned().collect::<Vec<_>>().join(",")),
+                    serde_json::Value::String(s) => format!("string(len={},preview={})", s.len(), &s[..s.len().min(200)]),
+                    serde_json::Value::Null => "null".to_string(),
+                    serde_json::Value::Array(_) => "array".to_string(),
+                    serde_json::Value::Bool(_) => "bool".to_string(),
+                    serde_json::Value::Number(_) => "number".to_string(),
+                },
+                args_json = %serde_json::to_string(&args).unwrap_or_else(|_| "??".to_string()),
+                "tool execution failed"
+            );
+        }
+        if let Err(e) = result {
+            result = Err(rewrite_invalid_arguments(tool_id, e));
+        }
 
         // Plugin hook: tool.execute.after
         let mut hook_ctx = HookContext::new(HookEvent::ToolExecuteAfter)

@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -116,7 +118,7 @@ impl HookContext {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum HookError {
     #[error("Hook execution failed: {0}")]
     ExecutionError(String),
@@ -166,14 +168,40 @@ impl Hook {
     }
 }
 
+/// Events that produce deterministic output for the same input and can be cached.
+const CACHEABLE_EVENTS: &[HookEvent] = &[HookEvent::ConfigLoaded, HookEvent::ShellEnv];
+
+/// Events that are pure notifications — callers don't need the result.
+const FIRE_AND_FORGET_EVENTS: &[HookEvent] = &[
+    HookEvent::SessionCompacting,
+    HookEvent::Error,
+    HookEvent::FileChange,
+    HookEvent::SessionEnd,
+];
+
+/// Compute a hash of the hook context data for cache keying.
+fn context_data_hash(data: &HashMap<String, serde_json::Value>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Sort keys for deterministic hashing.
+    let mut keys: Vec<&String> = data.keys().collect();
+    keys.sort();
+    for key in keys {
+        key.hash(&mut hasher);
+        data[key].to_string().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub struct PluginSystem {
     hooks: RwLock<HashMap<HookEvent, Vec<Arc<Hook>>>>,
+    cache: RwLock<HashMap<(HookEvent, u64), Vec<HookResult>>>,
 }
 
 impl PluginSystem {
     pub fn new() -> Self {
         Self {
             hooks: RwLock::new(HashMap::new()),
+            cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -184,21 +212,77 @@ impl PluginSystem {
         entry.sort_by(|a, b| b.priority.cmp(&a.priority));
     }
 
+    /// Execute all hooks for an event in parallel using `join_all`.
     pub async fn trigger(&self, context: HookContext) -> Vec<HookResult> {
         let hooks = self.hooks.read().await;
-        let mut results = Vec::new();
 
-        if let Some(hook_list) = hooks.get(&context.event) {
-            for hook in hook_list {
-                if !hook.enabled {
-                    continue;
-                }
-                let result = (hook.handler)(context.clone()).await;
-                results.push(result);
+        let hook_list = match hooks.get(&context.event) {
+            Some(list) => list.clone(),
+            None => return vec![],
+        };
+
+        let enabled: Vec<_> = hook_list.iter().filter(|h| h.enabled).cloned().collect();
+        if enabled.is_empty() {
+            return vec![];
+        }
+
+        // Check cache for deterministic events.
+        if CACHEABLE_EVENTS.contains(&context.event) {
+            let data_hash = context_data_hash(&context.data);
+            let cache = self.cache.read().await;
+            if let Some(cached) = cache.get(&(context.event.clone(), data_hash)) {
+                return cached.clone();
             }
         }
 
+        // Execute all enabled hooks in parallel.
+        let futures: Vec<_> = enabled
+            .iter()
+            .map(|h| (h.handler)(context.clone()))
+            .collect();
+        // Drop the read lock before awaiting.
+        drop(hooks);
+
+        let results: Vec<HookResult> = join_all(futures).await;
+
+        // Cache results for deterministic events.
+        if CACHEABLE_EVENTS.contains(&context.event) {
+            let data_hash = context_data_hash(&context.data);
+            let mut cache = self.cache.write().await;
+            cache.insert((context.event.clone(), data_hash), results.clone());
+        }
+
         results
+    }
+
+    /// Fire-and-forget: spawn hooks without waiting for results.
+    /// Suitable for notification-only events like `Error`, `FileChange`, etc.
+    pub async fn trigger_fire_and_forget(&self, context: HookContext) {
+        let hooks = self.hooks.read().await;
+
+        let hook_list = match hooks.get(&context.event) {
+            Some(list) => list.clone(),
+            None => return,
+        };
+        drop(hooks);
+
+        for hook in hook_list {
+            if !hook.enabled {
+                continue;
+            }
+            let ctx = context.clone();
+            tokio::spawn(async move {
+                if let Err(e) = (hook.handler)(ctx).await {
+                    tracing::warn!("Fire-and-forget hook '{}' error: {}", hook.name, e);
+                }
+            });
+        }
+    }
+
+    /// Invalidate cached results for a specific event.
+    pub async fn invalidate_cache(&self, event: &HookEvent) {
+        let mut cache = self.cache.write().await;
+        cache.retain(|(e, _), _| e != event);
     }
 
     pub async fn remove(&self, event: &HookEvent, name: &str) -> bool {
@@ -300,9 +384,14 @@ pub fn global() -> Arc<PluginSystem> {
 }
 
 /// Convenience: trigger a hook event on the global plugin system.
+/// Uses fire-and-forget for notification-only events, parallel execution otherwise.
 /// Errors from individual hooks are logged but do not propagate.
 pub async fn trigger(context: HookContext) {
     let system = global();
+    if FIRE_AND_FORGET_EVENTS.contains(&context.event) {
+        system.trigger_fire_and_forget(context).await;
+        return;
+    }
     let results = system.trigger(context).await;
     for result in results {
         if let Err(e) = result {

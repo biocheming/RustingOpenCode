@@ -94,10 +94,8 @@ impl Tool for LsTool {
         args: serde_json::Value,
         ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let input: LsInput = serde_json::from_value(args).unwrap_or(LsInput {
-            path: None,
-            ignore: None,
-        });
+        let input: LsInput = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(format!("ls: {}", e)))?;
 
         let requested_path = input.path.unwrap_or_else(|| ".".to_string());
         let mut base_dir = if Path::new(&requested_path).is_absolute() {

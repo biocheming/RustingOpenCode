@@ -5,10 +5,12 @@ use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvalidParams {
+    #[serde(alias = "tool_name")]
     #[serde(alias = "toolName")]
-    pub tool_name: String,
+    pub tool: String,
+    #[serde(alias = "error_message")]
     #[serde(alias = "errorMessage")]
-    pub error_message: String,
+    pub error: String,
     #[serde(alias = "receivedArgs")]
     pub received_args: Option<serde_json::Value>,
 }
@@ -22,27 +24,23 @@ impl Tool for InvalidTool {
     }
 
     fn description(&self) -> &str {
-        "Handle invalid tool calls. This tool is used when an invalid or unknown tool is requested."
+        "Do not use"
     }
 
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "toolName": {
+                "tool": {
                     "type": "string",
-                    "description": "The name of the invalid tool that was requested"
+                    "description": "The invalid or unknown tool name"
                 },
-                "errorMessage": {
+                "error": {
                     "type": "string",
                     "description": "Description of why the tool call is invalid"
                 },
-                "receivedArgs": {
-                    "type": "object",
-                    "description": "The arguments that were passed to the invalid tool"
-                }
             },
-            "required": ["toolName", "errorMessage"]
+            "required": ["tool", "error"]
         })
     }
 
@@ -55,23 +53,60 @@ impl Tool for InvalidTool {
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid parameters: {}", e)))?;
 
         let output = format!(
-            "⚠️ Invalid Tool Call\n\nTool: {}\nError: {}\n\nPlease check the available tools and try again with a valid tool name.",
-            params.tool_name,
-            params.error_message
+            "The arguments provided to the tool are invalid: {}",
+            params.error
         );
 
         let mut metadata = Metadata::new();
-        metadata.insert("tool_name".to_string(), serde_json::json!(params.tool_name));
-        metadata.insert(
-            "error_message".to_string(),
-            serde_json::json!(params.error_message),
-        );
+        metadata.insert("tool_name".to_string(), serde_json::json!(params.tool));
+        metadata.insert("error_message".to_string(), serde_json::json!(params.error));
 
         Ok(ToolResult {
             output,
-            title: format!("Invalid Tool: {}", params.tool_name),
+            title: "Invalid Tool".to_string(),
             metadata,
             truncated: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_tool_accepts_ts_shape() {
+        let tool = InvalidTool;
+        let ctx = ToolContext::new("s".to_string(), "m".to_string(), ".".to_string());
+        let out = tool
+            .execute(
+                serde_json::json!({
+                    "tool": "read_html",
+                    "error": "unknown tool"
+                }),
+                ctx,
+            )
+            .await
+            .expect("invalid tool should accept ts shape");
+        assert_eq!(out.title, "Invalid Tool");
+        assert!(out.output.contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_accepts_legacy_shape() {
+        let tool = InvalidTool;
+        let ctx = ToolContext::new("s".to_string(), "m".to_string(), ".".to_string());
+        let out = tool
+            .execute(
+                serde_json::json!({
+                    "toolName": "read_html",
+                    "errorMessage": "unknown tool"
+                }),
+                ctx,
+            )
+            .await
+            .expect("invalid tool should accept legacy shape");
+        assert_eq!(out.title, "Invalid Tool");
+        assert!(out.output.contains("unknown tool"));
     }
 }

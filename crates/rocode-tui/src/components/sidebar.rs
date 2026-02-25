@@ -15,6 +15,7 @@ use crate::context::{
     AppContext, LspConnectionStatus, McpConnectionStatus, MessageRole, TodoStatus,
 };
 use crate::theme::Theme;
+use rocode_core::process_registry::ProcessKind;
 
 pub struct Sidebar {
     context: Arc<AppContext>,
@@ -36,6 +37,12 @@ pub struct SidebarState {
     sidebar_area: Option<Rect>,
     sections_area: Option<Rect>,
     toggle_hits: Vec<SidebarToggleHit>,
+    /// Index of the currently selected process in the process list.
+    pub process_selected: usize,
+    /// Whether the process panel has keyboard focus.
+    pub process_focus: bool,
+    /// Maps rendered line index → process list index (for click selection).
+    process_line_hits: Vec<(usize, usize)>,
 }
 
 impl SidebarState {
@@ -79,6 +86,18 @@ impl SidebarState {
 
         let relative_row = usize::from(row.saturating_sub(area.y));
         let line_index = self.scroll_offset.saturating_add(relative_row);
+
+        // Check if the click is on a process item
+        if let Some((_line_idx, proc_idx)) = self
+            .process_line_hits
+            .iter()
+            .find(|(li, _)| *li == line_index)
+        {
+            self.process_selected = *proc_idx;
+            self.process_focus = true;
+            return true;
+        }
+
         let Some(section_key) = self
             .toggle_hits
             .iter()
@@ -137,6 +156,24 @@ impl SidebarState {
         let max_scroll = self.max_scroll();
         if self.scroll_offset > max_scroll {
             self.scroll_offset = max_scroll;
+        }
+    }
+
+    pub fn process_select_up(&mut self) {
+        self.process_selected = self.process_selected.saturating_sub(1);
+    }
+
+    pub fn process_select_down(&mut self, count: usize) {
+        if count > 0 {
+            self.process_selected = (self.process_selected + 1).min(count - 1);
+        }
+    }
+
+    pub fn clamp_process_selected(&mut self, count: usize) {
+        if count == 0 {
+            self.process_selected = 0;
+        } else if self.process_selected >= count {
+            self.process_selected = count - 1;
         }
     }
 }
@@ -477,9 +514,53 @@ impl Sidebar {
             }
         }
 
+        // Processes section
+        let proc_list = self.context.processes.read().clone();
+        state.clamp_process_selected(proc_list.len());
+        if !proc_list.is_empty() {
+            let mut proc_lines: Vec<Line<'static>> = Vec::new();
+            for (idx, proc) in proc_list.iter().enumerate() {
+                let selected = state.process_focus && idx == state.process_selected;
+                let prefix = if selected { "▸ " } else { "  " };
+                let kind_color = match proc.kind {
+                    ProcessKind::Plugin => theme.info,
+                    ProcessKind::Bash => theme.success,
+                    ProcessKind::Agent => theme.warning,
+                };
+                let name_width = area.width.saturating_sub(18) as usize;
+                let stats = format!("{:4.1}% {:>3}MB", proc.cpu_percent, proc.memory_kb / 1024);
+                let fg = if selected { theme.text } else { theme.text_muted };
+                let row_bg = if selected {
+                    Some(theme.background_element)
+                } else {
+                    None
+                };
+                let mk_style = |base: Style| -> Style {
+                    if let Some(bg) = row_bg { base.bg(bg) } else { base }
+                };
+                proc_lines.push(Line::from(vec![
+                    Span::styled(prefix, mk_style(Style::default().fg(if selected { theme.primary } else { theme.text_muted }))),
+                    Span::styled("● ", mk_style(Style::default().fg(kind_color))),
+                    Span::styled(
+                        truncate_text(&proc.name, name_width),
+                        mk_style(Style::default().fg(fg)),
+                    ),
+                    Span::styled(format!(" {}", stats), mk_style(Style::default().fg(theme.text_muted))),
+                ]));
+            }
+            sections.push(SidebarSection {
+                key: "processes",
+                title: "Processes",
+                lines: proc_lines,
+                summary: Some(format!("{} running", proc_list.len())),
+                collapsible: proc_list.len() > 2,
+            });
+        }
+
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut line_index = 0usize;
         let mut toggle_hits: Vec<SidebarToggleHit> = Vec::new();
+        let mut process_line_hits: Vec<(usize, usize)> = Vec::new();
         for section in sections {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
@@ -512,7 +593,11 @@ impl Sidebar {
             line_index += 1;
 
             if !collapsed {
-                for row in section.lines {
+                let is_processes = section.key == "processes";
+                for (row_idx, row) in section.lines.into_iter().enumerate() {
+                    if is_processes {
+                        process_line_hits.push((line_index, row_idx));
+                    }
                     lines.push(row);
                     line_index += 1;
                 }
@@ -542,12 +627,14 @@ impl Sidebar {
         };
 
         state.set_sections_layout(sections_text_area, lines.len(), toggle_hits);
+        state.process_line_hits = process_line_hits;
 
         let mut paragraph = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::NONE))
             .scroll((state.scroll_offset.min(usize::from(u16::MAX)) as u16, 0));
         if !floating {
-            paragraph = paragraph.style(Style::default().bg(theme.background_panel));
+            paragraph = paragraph
+                .block(Block::default().borders(Borders::NONE))
+                .style(Style::default().bg(theme.background_panel));
         }
         frame.render_widget(paragraph, sections_text_area);
 
