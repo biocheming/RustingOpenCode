@@ -16,8 +16,8 @@ use rocode_provider::{
 };
 
 use crate::compaction::{
-    CompactionConfig, CompactionEngine, MessageForPrune, ModelLimits, PruneToolPart, TokenUsage,
-    ToolPartStatus,
+    run_compaction, CompactionConfig, CompactionEngine, CompactionResult, MessageForPrune,
+    ModelLimits, PruneToolPart, TokenUsage, ToolPartStatus,
 };
 use crate::message_v2::{
     AssistantTime, AssistantTokens, CacheTokens, CompactionPart as V2CompactionPart, MessageInfo,
@@ -107,6 +107,16 @@ struct PendingSubtask {
     description: String,
 }
 
+#[derive(Debug, Clone)]
+struct StreamToolState {
+    name: String,
+    raw_input: String,
+    input: serde_json::Value,
+    status: crate::ToolCallStatus,
+    resolved_by_provider: bool,
+    state: crate::ToolState,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct PersistedSubsession {
     agent: String,
@@ -142,6 +152,17 @@ pub struct SessionPrompt {
 }
 
 impl SessionPrompt {
+    fn has_tool_result_after(session: &Session, message_index: usize, tool_call_id: &str) -> bool {
+        session.messages.iter().skip(message_index + 1).any(|msg| {
+            msg.parts.iter().any(|part| {
+                matches!(
+                    &part.part_type,
+                    PartType::ToolResult { tool_call_id: id, .. } if id == tool_call_id
+                )
+            })
+        })
+    }
+
     pub fn new(session_state: Arc<RwLock<SessionStateManager>>) -> Self {
         Self {
             state: Arc::new(Mutex::new(HashMap::new())),
@@ -1009,17 +1030,55 @@ impl SessionPrompt {
                     "Context overflow detected, triggering compaction for session {}",
                     session_id
                 );
-                if let Some(summary) = Self::trigger_compaction(session, &filtered_messages) {
-                    tracing::info!("Compaction complete, summary: {}", summary);
 
-                    // Notify plugins that compaction occurred (mirrors TS Plugin.trigger).
-                    let _ = rocode_plugin::trigger_collect(
-                        HookContext::new(HookEvent::SessionCompacting)
-                            .with_session(&session_id)
-                            .with_data("auto", serde_json::json!(true))
-                            .with_data("completed", serde_json::json!(true)),
-                    )
-                    .await;
+                // Use LLM-driven compaction via CompactionEngine::process().
+                // Build provider messages from the filtered session messages.
+                let parent_id = filtered_messages
+                    .last()
+                    .map(|m| m.id.clone())
+                    .unwrap_or_default();
+                let compaction_messages =
+                    Self::build_chat_messages(&filtered_messages, None).unwrap_or_default();
+                let model_ref = V2ModelRef {
+                    provider_id: provider_id.clone(),
+                    model_id: model_id.clone(),
+                };
+
+                match run_compaction::<crate::compaction::NoopSessionOps>(
+                    &session_id,
+                    &parent_id,
+                    compaction_messages,
+                    model_ref,
+                    provider.clone(),
+                    CancellationToken::new(),
+                    true, // auto-triggered
+                    None,
+                    None, // no SessionOps — we persist via Session directly below
+                )
+                .await
+                {
+                    Ok(CompactionResult::Continue) => {
+                        tracing::info!(
+                            "LLM compaction complete for session {}, continuing",
+                            session_id
+                        );
+                    }
+                    Ok(CompactionResult::Stop) => {
+                        tracing::info!("LLM compaction returned stop for session {}", session_id);
+                        break;
+                    }
+                    Err(e) => {
+                        // Fallback to simple text truncation if LLM compaction fails.
+                        tracing::warn!(
+                            "LLM compaction failed for session {}: {}, falling back to simple compaction",
+                            session_id,
+                            e
+                        );
+                        if let Some(summary) = Self::trigger_compaction(session, &filtered_messages)
+                        {
+                            tracing::info!("Fallback compaction complete: {}", summary);
+                        }
+                    }
                 }
             }
 
@@ -1102,11 +1161,20 @@ impl SessionPrompt {
             Self::emit_session_update(update_hook.as_ref(), session);
 
             // Consume stream events to build the assistant message incrementally.
-            // tool_calls keyed by id: (name, input_json_fragments)
-            let mut tool_calls: HashMap<String, (String, String)> = HashMap::new();
+            let tool_registry = Arc::new(rocode_tool::create_default_registry().await);
+            let mut tool_calls: HashMap<String, StreamToolState> = HashMap::new();
+            let mut stream_tool_results: Vec<(
+                String,
+                String,
+                bool,
+                Option<String>,
+                Option<HashMap<String, serde_json::Value>>,
+                Option<Vec<serde_json::Value>>,
+            )> = Vec::new();
             let mut finish_reason: Option<String> = None;
             let mut prompt_tokens: u64 = 0;
             let mut completion_tokens: u64 = 0;
+            let mut executed_local_tools_this_step = false;
             let mut last_emit = Instant::now() - Duration::from_millis(50);
 
             while let Some(event_result) = stream.next().await {
@@ -1142,50 +1210,341 @@ impl SessionPrompt {
                         );
                     }
                     Ok(StreamEvent::ReasoningEnd { .. }) => {}
-                    Ok(StreamEvent::ToolCallStart { id, name }) => match tool_calls.entry(id) {
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert((name, String::new()));
+                    Ok(StreamEvent::ToolCallStart { id, name }) => {
+                        tracing::info!(
+                            tool_call_id = %id,
+                            tool_name = %name,
+                            "[DIAG] ToolCallStart received"
+                        );
+                        if name.trim().is_empty() {
+                            tracing::warn!(tool_call_id = %id, "ignoring ToolCallStart with empty tool name");
+                            continue;
                         }
-                        std::collections::hash_map::Entry::Occupied(mut entry) => {
-                            if entry.get().0.is_empty() {
-                                entry.get_mut().0 = name;
+                        let entry =
+                            tool_calls
+                                .entry(id.clone())
+                                .or_insert_with(|| StreamToolState {
+                                    name: String::new(),
+                                    raw_input: String::new(),
+                                    input: serde_json::json!({}),
+                                    status: crate::ToolCallStatus::Pending,
+                                    resolved_by_provider: false,
+                                    state: crate::ToolState::Pending {
+                                        input: serde_json::json!({}),
+                                        raw: String::new(),
+                                    },
+                                });
+                        if entry.name.is_empty() {
+                            entry.name = name.clone();
+                        }
+                        entry.status = crate::ToolCallStatus::Pending;
+                        entry.state = crate::ToolState::Pending {
+                            input: entry.input.clone(),
+                            raw: entry.raw_input.clone(),
+                        };
+
+                        if let Some(assistant) = session.messages.get_mut(assistant_index) {
+                            Self::upsert_tool_call_part(
+                                assistant,
+                                &id,
+                                Some(&name),
+                                Some(entry.input.clone()),
+                                Some(entry.raw_input.clone()),
+                                Some(crate::ToolCallStatus::Pending),
+                                Some(entry.state.clone()),
+                            );
+                        }
+                    }
+                    Ok(StreamEvent::ToolCallDelta { id, input }) => {
+                        tracing::info!(
+                            tool_call_id = %id,
+                            delta_len = input.len(),
+                            delta_preview = %input.chars().take(200).collect::<String>(),
+                            "[DIAG] ToolCallDelta received"
+                        );
+                        let entry =
+                            tool_calls
+                                .entry(id.clone())
+                                .or_insert_with(|| StreamToolState {
+                                    name: String::new(),
+                                    raw_input: String::new(),
+                                    input: serde_json::json!({}),
+                                    status: crate::ToolCallStatus::Pending,
+                                    resolved_by_provider: false,
+                                    state: crate::ToolState::Pending {
+                                        input: serde_json::json!({}),
+                                        raw: String::new(),
+                                    },
+                                });
+                        entry.raw_input.push_str(&input);
+                        if rocode_provider::is_parsable_json(&entry.raw_input) {
+                            if let Ok(parsed) = serde_json::from_str(&entry.raw_input) {
+                                entry.input = parsed;
                             }
                         }
-                    },
-                    Ok(StreamEvent::ToolCallDelta { id, input }) => {
-                        let entry = tool_calls
-                            .entry(id)
-                            .or_insert_with(|| (String::new(), String::new()));
-                        entry.1.push_str(&input);
+                        entry.state = crate::ToolState::Pending {
+                            input: entry.input.clone(),
+                            raw: entry.raw_input.clone(),
+                        };
+                        if let Some(assistant) = session.messages.get_mut(assistant_index) {
+                            Self::upsert_tool_call_part(
+                                assistant,
+                                &id,
+                                None,
+                                Some(entry.input.clone()),
+                                Some(entry.raw_input.clone()),
+                                Some(crate::ToolCallStatus::Pending),
+                                Some(entry.state.clone()),
+                            );
+                        }
                     }
                     Ok(StreamEvent::ToolCallEnd { id, name, input }) => {
-                        let args_str = serde_json::to_string(&input).unwrap_or_default();
-                        tool_calls.insert(id, (name, args_str));
-                    }
-                    Ok(StreamEvent::ToolInputStart { id, tool_name }) => {
-                        match tool_calls.entry(id) {
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert((tool_name, String::new()));
-                            }
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                if entry.get().0.is_empty() {
-                                    entry.get_mut().0 = tool_name;
+                        if name.trim().is_empty() {
+                            tracing::warn!(tool_call_id = %id, "ignoring ToolCallEnd with empty tool name");
+                            continue;
+                        }
+                        let raw_input = serde_json::to_string(&input).unwrap_or_default();
+                        tracing::info!(
+                            tool_call_id = %id,
+                            tool_name = %name,
+                            input_type = %if input.is_object() { "object" } else if input.is_string() { "string" } else { "other" },
+                            raw_input_len = raw_input.len(),
+                            raw_input_preview = %raw_input.chars().take(200).collect::<String>(),
+                            "[DIAG] ToolCallEnd received"
+                        );
+                        let entry =
+                            tool_calls
+                                .entry(id.clone())
+                                .or_insert_with(|| StreamToolState {
+                                    name: String::new(),
+                                    raw_input: String::new(),
+                                    input: serde_json::json!({}),
+                                    status: crate::ToolCallStatus::Pending,
+                                    resolved_by_provider: false,
+                                    state: crate::ToolState::Pending {
+                                        input: serde_json::json!({}),
+                                        raw: String::new(),
+                                    },
+                                });
+                        entry.name = name.clone();
+                        entry.raw_input = raw_input.clone();
+                        entry.input = input.clone();
+                        entry.status = crate::ToolCallStatus::Running;
+                        entry.state = crate::ToolState::Running {
+                            input: entry.input.clone(),
+                            title: None,
+                            metadata: None,
+                            time: crate::RunningTime {
+                                start: chrono::Utc::now().timestamp_millis(),
+                            },
+                        };
+
+                        if let Some(assistant) = session.messages.get_mut(assistant_index) {
+                            Self::upsert_tool_call_part(
+                                assistant,
+                                &id,
+                                Some(&name),
+                                Some(input),
+                                Some(raw_input),
+                                Some(crate::ToolCallStatus::Running),
+                                Some(entry.state.clone()),
+                            );
+                        }
+                        let tool_context = rocode_tool::ToolContext::new(
+                            session_id.clone(),
+                            session.messages[assistant_index].id.clone(),
+                            session.directory.clone(),
+                        )
+                        .with_agent(String::new())
+                        .with_abort(token.clone());
+                        match Self::execute_tool_calls_with_hook(
+                            session,
+                            tool_registry.clone(),
+                            tool_context,
+                            provider.clone(),
+                            &provider_id,
+                            &model_id,
+                            update_hook.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(executed) => {
+                                if executed > 0 {
+                                    executed_local_tools_this_step = true;
                                 }
                             }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Immediate tool execution error for session {}: {}",
+                                    session_id,
+                                    e
+                                );
+                            }
+                        }
+                        session.touch();
+                        Self::maybe_emit_session_update(
+                            update_hook.as_ref(),
+                            session,
+                            &mut last_emit,
+                            true,
+                        );
+                    }
+                    Ok(StreamEvent::ToolInputStart { id, tool_name }) => {
+                        if tool_name.trim().is_empty() {
+                            tracing::warn!(tool_call_id = %id, "ignoring ToolInputStart with empty tool name");
+                            continue;
+                        }
+                        let entry =
+                            tool_calls
+                                .entry(id.clone())
+                                .or_insert_with(|| StreamToolState {
+                                    name: String::new(),
+                                    raw_input: String::new(),
+                                    input: serde_json::json!({}),
+                                    status: crate::ToolCallStatus::Pending,
+                                    resolved_by_provider: false,
+                                    state: crate::ToolState::Pending {
+                                        input: serde_json::json!({}),
+                                        raw: String::new(),
+                                    },
+                                });
+                        if entry.name.is_empty() {
+                            entry.name = tool_name.clone();
+                        }
+                        entry.status = crate::ToolCallStatus::Pending;
+                        entry.state = crate::ToolState::Pending {
+                            input: entry.input.clone(),
+                            raw: entry.raw_input.clone(),
+                        };
+                        if let Some(assistant) = session.messages.get_mut(assistant_index) {
+                            Self::upsert_tool_call_part(
+                                assistant,
+                                &id,
+                                Some(&tool_name),
+                                Some(entry.input.clone()),
+                                Some(entry.raw_input.clone()),
+                                Some(crate::ToolCallStatus::Pending),
+                                Some(entry.state.clone()),
+                            );
                         }
                     }
                     Ok(StreamEvent::ToolInputDelta { id, delta }) => {
-                        let entry = tool_calls
-                            .entry(id)
-                            .or_insert_with(|| (String::new(), String::new()));
-                        entry.1.push_str(&delta);
+                        let entry =
+                            tool_calls
+                                .entry(id.clone())
+                                .or_insert_with(|| StreamToolState {
+                                    name: String::new(),
+                                    raw_input: String::new(),
+                                    input: serde_json::json!({}),
+                                    status: crate::ToolCallStatus::Pending,
+                                    resolved_by_provider: false,
+                                    state: crate::ToolState::Pending {
+                                        input: serde_json::json!({}),
+                                        raw: String::new(),
+                                    },
+                                });
+                        entry.raw_input.push_str(&delta);
+                        // Update the PartType's raw field so the accumulated input
+                        // is available for execution even if ToolInputEnd never fires.
+                        entry.state = crate::ToolState::Pending {
+                            input: entry.input.clone(),
+                            raw: entry.raw_input.clone(),
+                        };
+                        if let Some(assistant) = session.messages.get_mut(assistant_index) {
+                            Self::upsert_tool_call_part(
+                                assistant,
+                                &id,
+                                None,
+                                None,
+                                Some(entry.raw_input.clone()),
+                                None,
+                                Some(entry.state.clone()),
+                            );
+                        }
                     }
-                    Ok(StreamEvent::ToolInputEnd { .. }) => {}
+                    Ok(StreamEvent::ToolInputEnd { id }) => {
+                        if let Some(entry) = tool_calls.get_mut(&id) {
+                            if entry.name.trim().is_empty() {
+                                tracing::warn!(tool_call_id = %id, "ignoring ToolInputEnd for pending tool call with empty tool name");
+                                continue;
+                            }
+                            if !entry.raw_input.is_empty() {
+                                entry.input = serde_json::from_str(&entry.raw_input)
+                                    .unwrap_or_else(|_| {
+                                        serde_json::Value::String(entry.raw_input.clone())
+                                    });
+                            }
+                            entry.status = crate::ToolCallStatus::Running;
+                            entry.state = crate::ToolState::Running {
+                                input: entry.input.clone(),
+                                title: None,
+                                metadata: None,
+                                time: crate::RunningTime {
+                                    start: chrono::Utc::now().timestamp_millis(),
+                                },
+                            };
+                            if let Some(assistant) = session.messages.get_mut(assistant_index) {
+                                Self::upsert_tool_call_part(
+                                    assistant,
+                                    &id,
+                                    Some(&entry.name),
+                                    Some(entry.input.clone()),
+                                    Some(entry.raw_input.clone()),
+                                    Some(crate::ToolCallStatus::Running),
+                                    Some(entry.state.clone()),
+                                );
+                            }
+                            let tool_context = rocode_tool::ToolContext::new(
+                                session_id.clone(),
+                                session.messages[assistant_index].id.clone(),
+                                session.directory.clone(),
+                            )
+                            .with_agent(String::new())
+                            .with_abort(token.clone());
+                            match Self::execute_tool_calls_with_hook(
+                                session,
+                                tool_registry.clone(),
+                                tool_context,
+                                provider.clone(),
+                                &provider_id,
+                                &model_id,
+                                update_hook.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(executed) => {
+                                    if executed > 0 {
+                                        executed_local_tools_this_step = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Immediate tool execution error for session {}: {}",
+                                        session_id,
+                                        e
+                                    );
+                                }
+                            }
+                            session.touch();
+                            Self::maybe_emit_session_update(
+                                update_hook.as_ref(),
+                                session,
+                                &mut last_emit,
+                                true,
+                            );
+                        }
+                    }
                     Ok(StreamEvent::FinishStep {
                         finish_reason: fr,
                         usage,
                         ..
                     }) => {
+                        tracing::info!(
+                            finish_reason = %fr.as_deref().unwrap_or("None"),
+                            tool_calls_count = tool_calls.len(),
+                            tool_calls_keys = %tool_calls.keys().cloned().collect::<Vec<_>>().join(","),
+                            "[DIAG] FinishStep received"
+                        );
                         finish_reason = fr;
                         prompt_tokens = usage.prompt_tokens;
                         completion_tokens = usage.completion_tokens;
@@ -1203,9 +1562,114 @@ impl SessionPrompt {
                         tracing::error!("Stream error for session {}: {}", session_id, msg);
                         return Err(anyhow::anyhow!("Provider error: {}", msg));
                     }
-                    // ToolResult/ToolError come from Responses API; legacy stream
-                    // doesn't produce them — tool execution is handled below.
-                    Ok(StreamEvent::ToolResult { .. } | StreamEvent::ToolError { .. }) => {}
+                    Ok(StreamEvent::ToolResult {
+                        tool_call_id,
+                        input,
+                        output,
+                        ..
+                    }) => {
+                        if Self::has_tool_result_after(session, assistant_index, &tool_call_id) {
+                            continue;
+                        }
+                        if let Some(entry) = tool_calls.get_mut(&tool_call_id) {
+                            if let Some(next_input) = input.clone() {
+                                entry.input = next_input;
+                            }
+                            entry.status = crate::ToolCallStatus::Completed;
+                            entry.resolved_by_provider = true;
+                            let start = match &entry.state {
+                                crate::ToolState::Running { time, .. } => time.start,
+                                _ => chrono::Utc::now().timestamp_millis(),
+                            };
+                            entry.state = crate::ToolState::Completed {
+                                input: entry.input.clone(),
+                                output: output.output.clone(),
+                                title: output.title.clone(),
+                                metadata: output.metadata.clone(),
+                                time: crate::CompletedTime {
+                                    start,
+                                    end: chrono::Utc::now().timestamp_millis(),
+                                    compacted: None,
+                                },
+                                attachments: None,
+                            };
+                            if let Some(assistant) = session.messages.get_mut(assistant_index) {
+                                Self::upsert_tool_call_part(
+                                    assistant,
+                                    &tool_call_id,
+                                    Some(&entry.name),
+                                    Some(entry.input.clone()),
+                                    Some(entry.raw_input.clone()),
+                                    Some(crate::ToolCallStatus::Completed),
+                                    Some(entry.state.clone()),
+                                );
+                            }
+                        }
+                        stream_tool_results.push((
+                            tool_call_id,
+                            output.output,
+                            false,
+                            Some(output.title),
+                            Some(output.metadata),
+                            output.attachments,
+                        ));
+                    }
+                    Ok(StreamEvent::ToolError {
+                        tool_call_id,
+                        input,
+                        error,
+                        kind,
+                        ..
+                    }) => {
+                        if Self::has_tool_result_after(session, assistant_index, &tool_call_id) {
+                            continue;
+                        }
+                        if let Some(entry) = tool_calls.get_mut(&tool_call_id) {
+                            if let Some(next_input) = input.clone() {
+                                entry.input = next_input;
+                            }
+                            entry.status = crate::ToolCallStatus::Error;
+                            entry.resolved_by_provider = true;
+                            let start = match &entry.state {
+                                crate::ToolState::Running { time, .. } => time.start,
+                                _ => chrono::Utc::now().timestamp_millis(),
+                            };
+                            entry.state = crate::ToolState::Error {
+                                input: entry.input.clone(),
+                                error: error.clone(),
+                                metadata: None,
+                                time: crate::ErrorTime {
+                                    start,
+                                    end: chrono::Utc::now().timestamp_millis(),
+                                },
+                            };
+                            if let Some(assistant) = session.messages.get_mut(assistant_index) {
+                                Self::upsert_tool_call_part(
+                                    assistant,
+                                    &tool_call_id,
+                                    Some(&entry.name),
+                                    Some(entry.input.clone()),
+                                    Some(entry.raw_input.clone()),
+                                    Some(crate::ToolCallStatus::Error),
+                                    Some(entry.state.clone()),
+                                );
+                            }
+                        }
+                        let metadata = kind.map(|k| {
+                            HashMap::from([(
+                                "kind".to_string(),
+                                serde_json::to_value(k).unwrap_or(serde_json::Value::Null),
+                            )])
+                        });
+                        stream_tool_results.push((
+                            tool_call_id,
+                            error,
+                            true,
+                            Some("Tool Error".to_string()),
+                            metadata,
+                            None,
+                        ));
+                    }
                     Ok(StreamEvent::StartStep) => {}
                     Err(e) => {
                         tracing::error!("Stream error for session {}: {}", session_id, e);
@@ -1214,28 +1678,8 @@ impl SessionPrompt {
                 }
             }
 
-            // Finalize the placeholder assistant message with tool calls and usage.
+            // Finalize the placeholder assistant message with usage metadata.
             if let Some(assistant_msg) = session.messages.get_mut(assistant_index) {
-                for (tc_id, (tc_name, tc_args)) in &tool_calls {
-                    // Skip ghost entries created by Ollama-style models that
-                    // stream tool_calls chunks with empty or missing names.
-                    if tc_name.is_empty() {
-                        tracing::warn!(tool_call_id = %tc_id, "skipping tool call with empty name");
-                        continue;
-                    }
-                    let input: serde_json::Value =
-                        serde_json::from_str(tc_args).unwrap_or(serde_json::json!({}));
-                    assistant_msg.parts.push(crate::MessagePart {
-                        id: rocode_core::id::create(rocode_core::id::Prefix::Part, true, None),
-                        part_type: PartType::ToolCall {
-                            id: tc_id.clone(),
-                            name: tc_name.clone(),
-                            input,
-                        },
-                        created_at: chrono::Utc::now(),
-                        message_id: None,
-                    });
-                }
                 if let Some(reason) = finish_reason.clone() {
                     assistant_msg
                         .metadata
@@ -1259,32 +1703,114 @@ impl SessionPrompt {
                 });
             }
 
+            if !stream_tool_results.is_empty() {
+                let mut tool_msg = SessionMessage::tool(session_id.clone());
+                for (tool_call_id, content, is_error, title, metadata, attachments) in
+                    stream_tool_results
+                {
+                    Self::push_tool_result_part(
+                        &mut tool_msg,
+                        tool_call_id,
+                        content,
+                        is_error,
+                        title,
+                        metadata,
+                        attachments,
+                    );
+                }
+                session.messages.push(tool_msg);
+            }
+
+            // Promote any tool calls still in Pending state to Running.
+            // Some providers (e.g. LiteLLM, non-streaming) never emit ToolCallEnd,
+            // so tool calls remain Pending after the stream ends. Without this
+            // promotion, `tool_call_input_for_execution` returns None and the
+            // tool never executes.
+            if let Some(assistant_msg) = session.messages.get_mut(assistant_index) {
+                for part in &mut assistant_msg.parts {
+                    if let PartType::ToolCall {
+                        id,
+                        name,
+                        input,
+                        raw,
+                        status,
+                        state,
+                    } = &mut part.part_type
+                    {
+                        if matches!(status, crate::ToolCallStatus::Pending)
+                            && !name.trim().is_empty()
+                        {
+                            // Use accumulated raw input from the stream's tool_calls
+                            // HashMap, which may have data from ToolInputDelta events
+                            // that wasn't written to the PartType.
+                            if let Some(entry) = tool_calls.get(id.as_str()) {
+                                tracing::info!(
+                                    tool_call_id = %id,
+                                    tool_name = %name,
+                                    entry_raw_input_len = entry.raw_input.len(),
+                                    entry_raw_input_preview = %entry.raw_input.chars().take(200).collect::<String>(),
+                                    entry_input_type = %if entry.input.is_object() { "object" } else if entry.input.is_string() { "string" } else { "other" },
+                                    "[DIAG] Pending→Running promotion: found entry in tool_calls HashMap"
+                                );
+                                if !entry.raw_input.is_empty() {
+                                    *raw = Some(entry.raw_input.clone());
+                                    // Also try to parse the raw input into a proper object
+                                    if let Ok(parsed) =
+                                        serde_json::from_str::<serde_json::Value>(&entry.raw_input)
+                                    {
+                                        *input = parsed;
+                                    }
+                                }
+                                if !entry.input.is_null() && entry.input != serde_json::json!({}) {
+                                    *input = entry.input.clone();
+                                }
+                            } else {
+                                tracing::info!(
+                                    tool_call_id = %id,
+                                    tool_name = %name,
+                                    hashmap_keys = %tool_calls.keys().cloned().collect::<Vec<_>>().join(","),
+                                    "[DIAG] Pending→Running promotion: entry NOT found in tool_calls HashMap"
+                                );
+                            }
+                            *status = crate::ToolCallStatus::Running;
+                            *state = Some(crate::ToolState::Running {
+                                input: input.clone(),
+                                title: None,
+                                metadata: None,
+                                time: crate::RunningTime {
+                                    start: chrono::Utc::now().timestamp_millis(),
+                                },
+                            });
+                            tracing::info!(
+                                tool_call_id = %id,
+                                tool_name = %name,
+                                input_keys = %if input.is_object() {
+                                    input.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default()
+                                } else {
+                                    format!("non-object: {}", input.to_string().chars().take(100).collect::<String>())
+                                },
+                                raw_preview = %raw.as_deref().unwrap_or("None").chars().take(200).collect::<String>(),
+                                "[DIAG] promoted Pending tool call to Running after stream ended"
+                            );
+                        }
+                    }
+                }
+            }
+
             let mut has_tool_calls = session
                 .messages
                 .get(assistant_index)
-                .map(|message| {
-                    message
-                        .parts
-                        .iter()
-                        .any(|p| matches!(p.part_type, PartType::ToolCall { .. }))
-                })
+                .map(Self::has_unresolved_tool_calls)
                 .unwrap_or(false);
+
+            tracing::info!(
+                has_tool_calls = has_tool_calls,
+                finish_reason = %finish_reason.as_deref().unwrap_or("None"),
+                "[DIAG] post-stream: before chat.message plugin hook"
+            );
 
             session.touch();
             Self::emit_session_update(update_hook.as_ref(), session);
-
-            if !post_first_step_ran {
-                Self::ensure_title(session, provider.clone(), &model_id).await;
-                let _ = Self::summarize_session(
-                    session,
-                    &session_id,
-                    &provider_id,
-                    &model_id,
-                    provider.as_ref(),
-                )
-                .await;
-                post_first_step_ran = true;
-            }
 
             // Plugin hook: chat.message — notify plugins of new assistant message
             if let Some(assistant_message) = session.messages.get(assistant_index).cloned() {
@@ -1299,44 +1825,42 @@ impl SessionPrompt {
                         .with_data("parts", serde_json::json!(&assistant_message.parts)),
                 )
                 .await;
+                tracing::info!("[DIAG] post-stream: chat.message plugin hook completed");
                 if let Some(current_message) = session.messages.get_mut(assistant_index) {
                     apply_chat_message_hook_outputs(current_message, hook_outputs);
                 }
                 has_tool_calls = session
                     .messages
                     .get(assistant_index)
-                    .map(|message| {
-                        message
-                            .parts
-                            .iter()
-                            .any(|p| matches!(p.part_type, PartType::ToolCall { .. }))
-                    })
+                    .map(Self::has_unresolved_tool_calls)
                     .unwrap_or(false);
             }
+
+            tracing::info!(
+                has_tool_calls = has_tool_calls,
+                finish_reason = %finish_reason.as_deref().unwrap_or("None"),
+                "[DIAG] post-stream: after chat.message hook, before tool execution check"
+            );
 
             if has_tool_calls {
                 tracing::info!("Processing tool calls for session {}", session_id);
 
                 let tool_context = rocode_tool::ToolContext::new(
                     session_id.clone(),
-                    session
-                        .messages
-                        .last()
-                        .map(|m| m.id.clone())
-                        .unwrap_or_default(),
+                    session.messages[assistant_index].id.clone(),
                     session.directory.clone(),
                 )
                 .with_agent(String::new())
                 .with_abort(token.clone());
 
-                let registry = Arc::new(rocode_tool::create_default_registry().await);
-                if let Err(e) = Self::execute_tool_calls(
+                if let Err(e) = Self::execute_tool_calls_with_hook(
                     session,
-                    registry,
+                    tool_registry.clone(),
                     tool_context,
                     provider.clone(),
                     &provider_id,
                     &model_id,
+                    update_hook.as_ref(),
                 )
                 .await
                 {
@@ -1347,7 +1871,30 @@ impl SessionPrompt {
                 continue;
             }
 
-            if finish_reason.as_deref() != Some("tool-calls") {
+            if executed_local_tools_this_step {
+                tracing::info!(
+                    "[DIAG] local tool execution completed in-stream, continuing prompt loop"
+                );
+                continue;
+            }
+
+            if !post_first_step_ran {
+                Self::ensure_title(session, provider.clone(), &model_id).await;
+                let _ = Self::summarize_session(
+                    session,
+                    &session_id,
+                    &provider_id,
+                    &model_id,
+                    provider.as_ref(),
+                )
+                .await;
+                post_first_step_ran = true;
+            }
+
+            if !matches!(
+                finish_reason.as_deref(),
+                Some("tool-calls") | Some("tool_calls")
+            ) {
                 tracing::info!(
                     "Prompt loop complete for session {} with finish: {:?}",
                     session_id,
@@ -1355,6 +1902,7 @@ impl SessionPrompt {
                 );
                 break;
             }
+            tracing::info!("[DIAG] finish_reason=tool-calls, continuing prompt loop");
         }
 
         // Abort handling: mark any pending tool calls as error when cancelled.
@@ -1387,6 +1935,271 @@ impl SessionPrompt {
         if force || elapsed >= Duration::from_millis(50) {
             Self::emit_session_update(update_hook, session);
             *last_emit = Instant::now();
+        }
+    }
+
+    fn upsert_tool_call_part(
+        message: &mut SessionMessage,
+        tool_call_id: &str,
+        tool_name: Option<&str>,
+        input: Option<serde_json::Value>,
+        raw_input: Option<String>,
+        status: Option<crate::ToolCallStatus>,
+        tool_state: Option<crate::ToolState>,
+    ) {
+        let mut input = input;
+        let mut raw_input = raw_input;
+        let mut status = status;
+        if let Some(state) = tool_state.as_ref() {
+            let (state_input, state_raw, state_status) = Self::state_projection(state);
+            input = Some(state_input);
+            // Only override raw_input if state_projection returns Some.
+            // Running/Completed/Error states return None for raw, but the
+            // caller may have explicitly provided a raw value that should
+            // be preserved.
+            if state_raw.is_some() {
+                raw_input = state_raw;
+            }
+            status = Some(state_status);
+        }
+
+        let mut found = false;
+        for part in &mut message.parts {
+            if let PartType::ToolCall {
+                id,
+                name,
+                input: part_input,
+                status: part_status,
+                raw,
+                state,
+            } = &mut part.part_type
+            {
+                if id == tool_call_id {
+                    if let Some(next_name) = tool_name {
+                        if !next_name.is_empty() {
+                            *name = next_name.to_string();
+                        }
+                    }
+                    if let Some(next_input) = input.as_ref() {
+                        *part_input = next_input.clone();
+                    }
+                    if let Some(next_raw) = raw_input.as_ref() {
+                        *raw = Some(next_raw.clone());
+                    }
+                    if let Some(next_status) = status.as_ref() {
+                        *part_status = next_status.clone();
+                    }
+                    if let Some(next_state) = tool_state.as_ref() {
+                        *state = Some(next_state.clone());
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if found {
+            return;
+        }
+
+        message.parts.push(crate::MessagePart {
+            id: rocode_core::id::create(rocode_core::id::Prefix::Part, true, None),
+            part_type: PartType::ToolCall {
+                id: tool_call_id.to_string(),
+                name: tool_name.unwrap_or_default().to_string(),
+                input: input.unwrap_or_else(|| serde_json::json!({})),
+                status: status.unwrap_or(crate::ToolCallStatus::Pending),
+                raw: raw_input,
+                state: tool_state,
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+    }
+
+    fn state_projection(
+        state: &crate::ToolState,
+    ) -> (serde_json::Value, Option<String>, crate::ToolCallStatus) {
+        match state {
+            crate::ToolState::Pending { input, raw } => (
+                input.clone(),
+                Some(raw.clone()),
+                crate::ToolCallStatus::Pending,
+            ),
+            crate::ToolState::Running { input, .. } => {
+                (input.clone(), None, crate::ToolCallStatus::Running)
+            }
+            crate::ToolState::Completed { input, .. } => {
+                (input.clone(), None, crate::ToolCallStatus::Completed)
+            }
+            crate::ToolState::Error { input, .. } => {
+                (input.clone(), None, crate::ToolCallStatus::Error)
+            }
+        }
+    }
+
+    fn push_tool_result_part(
+        message: &mut SessionMessage,
+        tool_call_id: String,
+        content: String,
+        is_error: bool,
+        title: Option<String>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+        attachments: Option<Vec<serde_json::Value>>,
+    ) {
+        message.parts.push(crate::MessagePart {
+            id: rocode_core::id::create(rocode_core::id::Prefix::Part, true, None),
+            part_type: PartType::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                title,
+                metadata,
+                attachments,
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+    }
+
+    fn has_unresolved_tool_calls(message: &SessionMessage) -> bool {
+        message.parts.iter().any(|part| {
+            let PartType::ToolCall {
+                name,
+                input,
+                status,
+                raw,
+                state,
+                ..
+            } = &part.part_type
+            else {
+                return false;
+            };
+
+            if name.trim().is_empty() {
+                return false;
+            }
+
+            Self::tool_call_input_for_execution(status, input, raw.as_deref(), state.as_ref())
+                .is_some()
+        })
+    }
+
+    fn parse_json_or_string(raw: &str) -> serde_json::Value {
+        // First try standard JSON parse.
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
+            return val;
+        }
+        // Some providers emit arguments with trailing commas, BOM, or other
+        // minor deviations. Try stripping common noise before giving up.
+        let cleaned = raw
+            .trim()
+            .trim_start_matches('\u{feff}') // BOM
+            .trim();
+        if cleaned != raw {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(cleaned) {
+                return val;
+            }
+        }
+        // If the raw string looks like it could be a JSON object with issues,
+        // wrap it so tools can still access it via the registry normalizer.
+        tracing::warn!(
+            raw_len = raw.len(),
+            raw_preview = %if raw.len() > 200 { &raw[..200] } else { raw },
+            "tool call arguments failed JSON parse, wrapping as string"
+        );
+        serde_json::Value::String(raw.to_string())
+    }
+
+    fn invalid_tool_payload(tool_name: &str, error: &str) -> serde_json::Value {
+        serde_json::json!({
+            "tool": tool_name,
+            "error": error,
+        })
+    }
+
+    fn tool_call_input_for_execution(
+        status: &crate::ToolCallStatus,
+        input: &serde_json::Value,
+        raw: Option<&str>,
+        state: Option<&crate::ToolState>,
+    ) -> Option<serde_json::Value> {
+        tracing::info!(
+            status = %format!("{:?}", status),
+            input_type = %if input.is_object() { format!("object(keys={})", input.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default()) } else if input.is_string() { format!("string(len={})", input.as_str().map(|s| s.len()).unwrap_or(0)) } else { format!("{:?}", input) },
+            raw_len = %raw.map(|r| r.len()).unwrap_or(0),
+            raw_preview = %raw.unwrap_or("None").chars().take(200).collect::<String>(),
+            state_variant = %match state {
+                Some(crate::ToolState::Pending { .. }) => "Pending",
+                Some(crate::ToolState::Running { .. }) => "Running",
+                Some(crate::ToolState::Completed { .. }) => "Completed",
+                Some(crate::ToolState::Error { .. }) => "Error",
+                None => "None",
+            },
+            "[DIAG] tool_call_input_for_execution entry"
+        );
+        let (state_input, state_raw) = match state {
+            Some(crate::ToolState::Pending { input, raw }) => {
+                (Some(input.clone()), Some(raw.as_str()))
+            }
+            Some(crate::ToolState::Running { input, .. })
+            | Some(crate::ToolState::Completed { input, .. })
+            | Some(crate::ToolState::Error { input, .. }) => (Some(input.clone()), None),
+            None => (None, None),
+        };
+
+        let raw_input = state_raw.or(raw).map(str::trim).filter(|s| !s.is_empty());
+
+        match status {
+            // TS parity: tool execution begins on "tool-call" (running state),
+            // not on partial/pending input fragments.
+            crate::ToolCallStatus::Pending => None,
+            crate::ToolCallStatus::Running => {
+                // Try raw input first (most authoritative source).
+                if let Some(raw) = raw_input {
+                    let parsed = Self::parse_json_or_string(raw);
+                    // If parse_json_or_string returned a non-empty object, use it.
+                    if parsed.is_object() && parsed.as_object().map_or(false, |o| !o.is_empty()) {
+                        return Some(parsed);
+                    }
+                    // If it returned a Value::String, the registry normalizer
+                    // will try to parse it again. Still usable.
+                    if parsed.is_string() {
+                        return Some(parsed);
+                    }
+                }
+
+                // Fall back to state_input or PartType input.
+                let fallback = state_input.unwrap_or_else(|| input.clone());
+
+                // If the fallback is an empty object but the PartType input is
+                // a string (e.g. Value::String wrapping JSON), try to parse it.
+                if fallback.is_object() && fallback.as_object().map_or(false, |o| o.is_empty()) {
+                    // Try the PartType's input directly — it might be a
+                    // Value::String containing valid JSON.
+                    if let Some(s) = input.as_str() {
+                        if let Ok(parsed @ serde_json::Value::Object(_)) = serde_json::from_str(s) {
+                            tracing::debug!(
+                                "tool_call_input_for_execution: recovered args from input string"
+                            );
+                            return Some(parsed);
+                        }
+                    }
+                    // Also try raw from PartType even if state_raw was empty.
+                    if let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) {
+                        if let Ok(parsed @ serde_json::Value::Object(_)) = serde_json::from_str(raw)
+                        {
+                            tracing::debug!(
+                                "tool_call_input_for_execution: recovered args from raw field"
+                            );
+                            return Some(parsed);
+                        }
+                    }
+                }
+
+                Some(fallback)
+            }
+            crate::ToolCallStatus::Completed | crate::ToolCallStatus::Error => None,
         }
     }
 
@@ -1483,29 +2296,100 @@ impl SessionPrompt {
         provider_id: &str,
         model_id: &str,
     ) -> anyhow::Result<()> {
-        let last_assistant = session
+        Self::execute_tool_calls_with_hook(
+            session,
+            tool_registry,
+            ctx,
+            provider,
+            provider_id,
+            model_id,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn execute_tool_calls_with_hook(
+        session: &mut Session,
+        tool_registry: Arc<rocode_tool::ToolRegistry>,
+        ctx: rocode_tool::ToolContext,
+        provider: Arc<dyn Provider>,
+        provider_id: &str,
+        model_id: &str,
+        update_hook: Option<&SessionUpdateHook>,
+    ) -> anyhow::Result<usize> {
+        let Some(last_assistant_index) = session
             .messages
             .iter()
-            .rev()
-            .find(|m| matches!(m.role, MessageRole::Assistant));
-
-        let tool_calls: Vec<(String, String, serde_json::Value)> = match last_assistant {
-            Some(msg) => msg
-                .parts
-                .iter()
-                .filter_map(|p| match &p.part_type {
-                    PartType::ToolCall { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
-                    _ => None,
-                })
-                .collect(),
-            None => return Ok(()),
+            .rposition(|m| matches!(m.role, MessageRole::Assistant))
+        else {
+            return Ok(0);
         };
 
+        let resolved_call_ids: HashSet<String> = session
+            .messages
+            .iter()
+            .skip(last_assistant_index + 1)
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match &p.part_type {
+                PartType::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let tool_calls: Vec<(String, String, serde_json::Value)> = session.messages
+            [last_assistant_index]
+            .parts
+            .iter()
+            .filter_map(|p| match &p.part_type {
+                PartType::ToolCall {
+                    id,
+                    name,
+                    input,
+                    status,
+                    raw,
+                    state,
+                    ..
+                } if !resolved_call_ids.contains(id) && !name.trim().is_empty() => {
+                    Self::tool_call_input_for_execution(
+                        status,
+                        input,
+                        raw.as_deref(),
+                        state.as_ref(),
+                    )
+                    .map(|args| (id.clone(), name.clone(), args))
+                }
+                _ => None,
+            })
+            .collect();
+
         if tool_calls.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+
+        if let Some(assistant_msg) = session.messages.get_mut(last_assistant_index) {
+            for (call_id, tool_name, input) in &tool_calls {
+                Self::upsert_tool_call_part(
+                    assistant_msg,
+                    call_id,
+                    Some(tool_name),
+                    Some(input.clone()),
+                    None,
+                    Some(crate::ToolCallStatus::Running),
+                    Some(crate::ToolState::Running {
+                        input: input.clone(),
+                        title: None,
+                        metadata: None,
+                        time: crate::RunningTime {
+                            start: chrono::Utc::now().timestamp_millis(),
+                        },
+                    }),
+                );
+            }
+        }
+
+        // Emit update so TUI shows tools in "Running" state immediately.
+        Self::emit_session_update(update_hook, session);
 
         let subsessions = Arc::new(Mutex::new(Self::load_persisted_subsessions(session)));
         let default_model = format!("{}:{}", provider_id, model_id);
@@ -1516,35 +2400,179 @@ impl SessionPrompt {
             tool_registry.clone(),
             default_model,
         );
+        let available_tool_ids: HashSet<String> =
+            tool_registry.list_ids().await.into_iter().collect();
 
+        let mut executed_calls = 0usize;
         let tool_results_msg = {
             let mut msg = SessionMessage::tool(ctx.session_id.clone());
             for (call_id, tool_name, input) in tool_calls {
+                tracing::info!(
+                    tool_call_id = %call_id,
+                    tool_name = %tool_name,
+                    input_type = %if input.is_object() { "object" } else if input.is_string() { "string" } else { "other" },
+                    input_keys = %if input.is_object() {
+                        input.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default()
+                    } else {
+                        input.to_string().chars().take(120).collect::<String>()
+                    },
+                    "[DIAG] executing tool call"
+                );
                 let mut tool_ctx = ctx.clone();
                 tool_ctx.call_id = Some(call_id.clone());
-                let result = match tool_registry.execute(&tool_name, input, tool_ctx).await {
-                    Ok(result) => (result.output, false),
-                    Err(e) => (format!("Error: {}", e), true),
+                let repaired_tool_name =
+                    Self::repair_tool_call_name(&tool_name, &available_tool_ids);
+                let mut effective_tool_name = repaired_tool_name.clone();
+                let mut effective_input =
+                    if repaired_tool_name == "invalid" && tool_name != "invalid" {
+                        Self::invalid_tool_payload(
+                            &tool_name,
+                            &format!("Unknown tool requested by model: {}", tool_name),
+                        )
+                    } else {
+                        input
+                    };
+
+                let mut execution = tool_registry
+                    .execute(
+                        &effective_tool_name,
+                        effective_input.clone(),
+                        tool_ctx.clone(),
+                    )
+                    .await;
+
+                if effective_tool_name != "invalid"
+                    && available_tool_ids.contains("invalid")
+                    && matches!(&execution, Err(rocode_tool::ToolError::InvalidArguments(_)))
+                {
+                    let validation_error = execution
+                        .as_ref()
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "Invalid arguments".to_string());
+                    tracing::info!(
+                        tool_name = %tool_name,
+                        error = %validation_error,
+                        "tool call validation failed, routing to invalid tool"
+                    );
+                    effective_tool_name = "invalid".to_string();
+                    effective_input = Self::invalid_tool_payload(&tool_name, &validation_error);
+                    execution = tool_registry
+                        .execute(
+                            &effective_tool_name,
+                            effective_input.clone(),
+                            tool_ctx.clone(),
+                        )
+                        .await;
+                }
+
+                let (content, is_error, title, metadata, attachments) = match execution {
+                    Ok(result) => (
+                        result.output,
+                        false,
+                        Some(result.title),
+                        Some(result.metadata),
+                        None,
+                    ),
+                    Err(e) => (
+                        format!("Error: {}", e),
+                        true,
+                        Some("Tool Error".to_string()),
+                        None,
+                        None,
+                    ),
                 };
 
-                msg.parts.push(crate::MessagePart {
-                    id: format!("prt_{}", uuid::Uuid::new_v4()),
-                    part_type: PartType::ToolResult {
-                        tool_call_id: call_id,
-                        content: result.0,
-                        is_error: result.1,
-                    },
-                    created_at: chrono::Utc::now(),
-                    message_id: None,
-                });
+                Self::push_tool_result_part(
+                    &mut msg,
+                    call_id.clone(),
+                    content.clone(),
+                    is_error,
+                    title.clone(),
+                    metadata.clone(),
+                    attachments.clone(),
+                );
+                executed_calls += 1;
+
+                if let Some(assistant_msg) = session.messages.get_mut(last_assistant_index) {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let next_state = if is_error {
+                        crate::ToolState::Error {
+                            input: effective_input.clone(),
+                            error: content.clone(),
+                            metadata: None,
+                            time: crate::ErrorTime {
+                                start: now,
+                                end: now,
+                            },
+                        }
+                    } else {
+                        crate::ToolState::Completed {
+                            input: effective_input.clone(),
+                            output: content.clone(),
+                            title: title.clone().unwrap_or_else(|| "Tool Result".to_string()),
+                            metadata: metadata.clone().unwrap_or_default(),
+                            time: crate::CompletedTime {
+                                start: now,
+                                end: now,
+                                compacted: None,
+                            },
+                            attachments: None,
+                        }
+                    };
+                    Self::upsert_tool_call_part(
+                        assistant_msg,
+                        &call_id,
+                        Some(&effective_tool_name),
+                        Some(effective_input),
+                        None,
+                        Some(if is_error {
+                            crate::ToolCallStatus::Error
+                        } else {
+                            crate::ToolCallStatus::Completed
+                        }),
+                        Some(next_state),
+                    );
+                }
+
+                // Emit update after each tool completes so TUI renders results incrementally.
+                Self::emit_session_update(update_hook, session);
             }
             msg
         };
 
-        session.messages.push(tool_results_msg);
+        if !tool_results_msg.parts.is_empty() {
+            session.messages.push(tool_results_msg);
+        }
         let persisted = subsessions.lock().await.clone();
         Self::save_persisted_subsessions(session, &persisted);
-        Ok(())
+        Ok(executed_calls)
+    }
+
+    fn repair_tool_call_name(tool_name: &str, available_tool_ids: &HashSet<String>) -> String {
+        if available_tool_ids.contains(tool_name) {
+            return tool_name.to_string();
+        }
+
+        let lower = tool_name.to_ascii_lowercase();
+        if lower != tool_name && available_tool_ids.contains(&lower) {
+            tracing::info!(
+                original = tool_name,
+                repaired = %lower,
+                "repairing tool call name via lowercase match"
+            );
+            return lower;
+        }
+
+        if available_tool_ids.contains("invalid") {
+            tracing::warn!(
+                tool_name = tool_name,
+                "unknown tool call, routing to invalid tool"
+            );
+            return "invalid".to_string();
+        }
+
+        tool_name.to_string()
     }
 
     fn mcp_tools_from_session(session: &Session) -> Vec<ToolDefinition> {
@@ -1751,6 +2779,12 @@ impl SessionPrompt {
         }
 
         for msg in session_messages {
+            // Skip messages with no parts — empty Tool/Assistant messages
+            // confuse providers (especially Anthropic which rejects empty content).
+            if msg.parts.is_empty() {
+                continue;
+            }
+
             if matches!(msg.role, MessageRole::Assistant)
                 && msg
                     .parts
@@ -1839,7 +2873,9 @@ impl SessionPrompt {
                     media_type: None,
                     provider_options: None,
                 }),
-                PartType::ToolCall { id, name, input } => Some(ContentPart {
+                PartType::ToolCall {
+                    id, name, input, ..
+                } => Some(ContentPart {
                     content_type: "tool_use".to_string(),
                     text: None,
                     image_url: None,
@@ -1858,6 +2894,7 @@ impl SessionPrompt {
                     tool_call_id,
                     content,
                     is_error,
+                    ..
                 } => Some(ContentPart {
                     content_type: "tool_result".to_string(),
                     text: None,
@@ -1925,6 +2962,9 @@ impl SessionPrompt {
                             id: tu.id,
                             name: tu.name,
                             input: tu.input,
+                            status: crate::ToolCallStatus::Running,
+                            raw: None,
+                            state: None,
                         },
                         created_at: now,
                         message_id: None,
@@ -2257,6 +3297,33 @@ impl SessionPrompt {
         provider_id: &str,
         model_id: &str,
     ) -> Vec<MessageWithParts> {
+        let legacy_tool_results: HashMap<
+            String,
+            (
+                String,
+                bool,
+                Option<String>,
+                Option<HashMap<String, serde_json::Value>>,
+            ),
+        > = messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|part| match &part.part_type {
+                PartType::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                    title,
+                    metadata,
+                    ..
+                } => Some((
+                    tool_call_id.clone(),
+                    (content.clone(), *is_error, title.clone(), metadata.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+
         let mut out = Vec::with_capacity(messages.len());
         let mut last_user_id = String::new();
 
@@ -2295,6 +3362,34 @@ impl SessionPrompt {
                         message_id: msg.id.clone(),
                         auto: true,
                     })),
+                    PartType::ToolCall {
+                        id,
+                        name,
+                        input,
+                        status,
+                        raw,
+                        state,
+                    } => {
+                        let state = state.clone().unwrap_or_else(|| {
+                            Self::legacy_tool_state_to_v2(
+                                id,
+                                name,
+                                input,
+                                status,
+                                raw.as_deref().unwrap_or_default(),
+                                legacy_tool_results.get(id),
+                            )
+                        });
+                        Some(V2Part::Tool(crate::message_v2::ToolPart {
+                            id: part.id.clone(),
+                            session_id: msg.session_id.clone(),
+                            message_id: msg.id.clone(),
+                            call_id: id.clone(),
+                            tool: name.clone(),
+                            state,
+                            metadata: None,
+                        }))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -2481,6 +3576,71 @@ impl SessionPrompt {
         out
     }
 
+    fn legacy_tool_state_to_v2(
+        tool_call_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+        status: &crate::ToolCallStatus,
+        raw: &str,
+        tool_result: Option<&(
+            String,
+            bool,
+            Option<String>,
+            Option<HashMap<String, serde_json::Value>>,
+        )>,
+    ) -> crate::ToolState {
+        let now = chrono::Utc::now().timestamp_millis();
+        match status {
+            crate::ToolCallStatus::Pending => crate::ToolState::Pending {
+                input: input.clone(),
+                raw: raw.to_string(),
+            },
+            crate::ToolCallStatus::Running => crate::ToolState::Running {
+                input: input.clone(),
+                title: None,
+                metadata: None,
+                time: crate::RunningTime { start: now },
+            },
+            crate::ToolCallStatus::Completed => {
+                let (output, title, metadata) = tool_result
+                    .map(|(content, _, title, metadata)| {
+                        (
+                            content.clone(),
+                            title.clone().unwrap_or_else(|| tool_name.to_string()),
+                            metadata.clone().unwrap_or_default(),
+                        )
+                    })
+                    .unwrap_or_else(|| (String::new(), tool_name.to_string(), HashMap::new()));
+                crate::ToolState::Completed {
+                    input: input.clone(),
+                    output,
+                    title,
+                    metadata,
+                    time: crate::CompletedTime {
+                        start: now,
+                        end: now,
+                        compacted: None,
+                    },
+                    attachments: None,
+                }
+            }
+            crate::ToolCallStatus::Error => {
+                let error = tool_result
+                    .map(|(content, _, _, _)| content.clone())
+                    .unwrap_or_else(|| format!("Tool execution failed: {}", tool_call_id));
+                crate::ToolState::Error {
+                    input: input.clone(),
+                    error,
+                    metadata: None,
+                    time: crate::ErrorTime {
+                        start: now,
+                        end: now,
+                    },
+                }
+            }
+        }
+    }
+
     async fn summarize_session(
         session: &mut Session,
         session_id: &str,
@@ -2537,6 +3697,7 @@ impl SessionPrompt {
                             tool_call_id,
                             content,
                             is_error,
+                            ..
                         } => Some(PruneToolPart {
                             id: p.id.clone(),
                             tool: tool_name_by_call
@@ -3503,6 +4664,7 @@ mod tests {
     use rocode_provider::{
         ChatRequest, ChatResponse, ModelInfo, ProviderError, StreamEvent, StreamResult, StreamUsage,
     };
+    use rocode_tool::{Tool, ToolContext, ToolError, ToolResult};
     use std::sync::Mutex as StdMutex;
 
     struct StaticModelProvider {
@@ -3596,6 +4758,145 @@ mod tests {
                     .into_iter()
                     .map(Result::<StreamEvent, ProviderError>::Ok),
             )))
+        }
+    }
+
+    struct MultiTurnScriptedProvider {
+        model: ModelInfo,
+        turns: Arc<StdMutex<std::collections::VecDeque<Vec<StreamEvent>>>>,
+        request_count: Arc<StdMutex<usize>>,
+    }
+
+    impl MultiTurnScriptedProvider {
+        fn new(model: ModelInfo, turns: Vec<Vec<StreamEvent>>) -> Self {
+            Self {
+                model,
+                turns: Arc::new(StdMutex::new(turns.into())),
+                request_count: Arc::new(StdMutex::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MultiTurnScriptedProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+
+        fn name(&self) -> &str {
+            "Mock"
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![self.model.clone()]
+        }
+
+        fn get_model(&self, id: &str) -> Option<&ModelInfo> {
+            if self.model.id == id {
+                Some(&self.model)
+            } else {
+                None
+            }
+        }
+
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+            Err(ProviderError::InvalidRequest(
+                "chat() not used in this test".to_string(),
+            ))
+        }
+
+        async fn chat_stream(&self, _request: ChatRequest) -> Result<StreamResult, ProviderError> {
+            {
+                let mut count = self
+                    .request_count
+                    .lock()
+                    .expect("request_count lock should not poison");
+                *count += 1;
+            }
+
+            let events = self
+                .turns
+                .lock()
+                .expect("turns lock should not poison")
+                .pop_front()
+                .ok_or_else(|| {
+                    ProviderError::InvalidRequest(
+                        "no scripted response left for chat_stream".to_string(),
+                    )
+                })?;
+
+            Ok(Box::pin(stream::iter(
+                events
+                    .into_iter()
+                    .map(Result::<StreamEvent, ProviderError>::Ok),
+            )))
+        }
+    }
+
+    struct NoArgEchoTool;
+
+    #[async_trait]
+    impl Tool for NoArgEchoTool {
+        fn id(&self) -> &str {
+            "noarg_echo"
+        }
+
+        fn description(&self) -> &str {
+            "Echoes input for tests"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::simple("NoArg Echo", args.to_string()))
+        }
+    }
+
+    struct AlwaysInvalidArgsTool;
+
+    #[async_trait]
+    impl Tool for AlwaysInvalidArgsTool {
+        fn id(&self) -> &str {
+            "needs_path"
+        }
+
+        fn description(&self) -> &str {
+            "Fails validation for tests"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filePath": { "type": "string" }
+                },
+                "required": ["filePath"]
+            })
+        }
+
+        fn validate(&self, _args: &serde_json::Value) -> Result<(), ToolError> {
+            Err(ToolError::InvalidArguments(
+                "filePath is required".to_string(),
+            ))
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Err(ToolError::ExecutionError(
+                "validate should prevent execute".to_string(),
+            ))
         }
     }
 
@@ -3754,6 +5055,103 @@ mod tests {
             .map(SessionMessage::get_text)
             .unwrap_or_default();
         assert_eq!(final_text, "Hello");
+    }
+
+    #[tokio::test]
+    async fn prompt_continues_after_tool_calls_without_finish_step_reason() {
+        let prompt = SessionPrompt::default();
+        let mut session = Session::new("proj", ".");
+        let temp_dir = tempfile::tempdir().expect("tempdir should create");
+        let file_path = temp_dir.path().join("sample.txt");
+        tokio::fs::write(&file_path, "alpha\nbeta")
+            .await
+            .expect("file should write");
+        let file_path = file_path.to_string_lossy().to_string();
+
+        let scripted = MultiTurnScriptedProvider::new(
+            ModelInfo {
+                id: "test-model".to_string(),
+                name: "Test Model".to_string(),
+                provider: "mock".to_string(),
+                context_window: 8192,
+                max_output_tokens: 1024,
+                supports_vision: false,
+                supports_tools: true,
+                cost_per_million_input: 0.0,
+                cost_per_million_output: 0.0,
+            },
+            vec![
+                vec![
+                    StreamEvent::Start,
+                    StreamEvent::ToolCallStart {
+                        id: "tool-call-0".to_string(),
+                        name: "read".to_string(),
+                    },
+                    StreamEvent::ToolCallEnd {
+                        id: "tool-call-0".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({ "file_path": file_path }),
+                    },
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::Start,
+                    StreamEvent::TextDelta("Read complete".to_string()),
+                    StreamEvent::FinishStep {
+                        finish_reason: Some("stop".to_string()),
+                        usage: StreamUsage::default(),
+                        provider_metadata: None,
+                    },
+                    StreamEvent::Done,
+                ],
+            ],
+        );
+        let request_count = scripted.request_count.clone();
+        let provider: Arc<dyn Provider> = Arc::new(scripted);
+
+        let input = PromptInput {
+            session_id: session.id.clone(),
+            message_id: None,
+            model: Some(ModelRef {
+                provider_id: "mock".to_string(),
+                model_id: "test-model".to_string(),
+            }),
+            agent: None,
+            no_reply: false,
+            system: None,
+            variant: None,
+            parts: vec![PartInput::Text {
+                text: "Read the file and summarize".to_string(),
+            }],
+            tools: None,
+        };
+
+        prompt
+            .prompt_with_update_hook(
+                input,
+                &mut session,
+                provider,
+                None,
+                Vec::new(),
+                AgentParams::default(),
+                None,
+            )
+            .await
+            .expect("prompt_with_update_hook should succeed");
+
+        let request_count = *request_count
+            .lock()
+            .expect("request_count lock should not poison");
+        assert_eq!(request_count, 2, "expected a second model round");
+
+        let final_text = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::Assistant))
+            .map(SessionMessage::get_text)
+            .unwrap_or_default();
+        assert_eq!(final_text, "Read complete");
     }
 
     #[tokio::test]
@@ -4170,6 +5568,329 @@ mod tests {
         assert!(tools.iter().any(|t| t.name == "github_search"));
     }
 
+    #[tokio::test]
+    async fn execute_tool_calls_ignores_empty_tool_name() {
+        let tool_registry = Arc::new(rocode_tool::ToolRegistry::new());
+        tool_registry.register(NoArgEchoTool).await;
+
+        let mut session = Session::new("proj", ".");
+        let sid = session.id.clone();
+        session
+            .messages
+            .push(SessionMessage::user(sid.clone(), "run tools"));
+
+        let mut assistant = SessionMessage::assistant(sid);
+        assistant.parts.push(crate::MessagePart {
+            id: format!("prt_{}", uuid::Uuid::new_v4()),
+            part_type: PartType::ToolCall {
+                id: "call_empty".to_string(),
+                name: " ".to_string(),
+                input: serde_json::json!({}),
+                status: crate::ToolCallStatus::Running,
+                raw: None,
+                state: None,
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+        assistant.add_tool_call("call_ok", "noarg_echo", serde_json::json!({}));
+        session.messages.push(assistant);
+
+        let provider: Arc<dyn Provider> =
+            Arc::new(StaticModelProvider::with_model("test-model", 8192, 1024));
+        let ctx = ToolContext::new(session.id.clone(), "msg_test".to_string(), ".".to_string());
+
+        SessionPrompt::execute_tool_calls(
+            &mut session,
+            tool_registry,
+            ctx,
+            provider,
+            "mock",
+            "test-model",
+        )
+        .await
+        .expect("execute_tool_calls should succeed");
+
+        let tool_msg = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .expect("tool message should exist");
+        let result_ids: Vec<&str> = tool_msg
+            .parts
+            .iter()
+            .filter_map(|part| match &part.part_type {
+                PartType::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_ids, vec!["call_ok"]);
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_runs_no_arg_tool() {
+        let tool_registry = Arc::new(rocode_tool::ToolRegistry::new());
+        tool_registry.register(NoArgEchoTool).await;
+
+        let mut session = Session::new("proj", ".");
+        let sid = session.id.clone();
+        session
+            .messages
+            .push(SessionMessage::user(sid.clone(), "run noarg"));
+        let mut assistant = SessionMessage::assistant(sid);
+        assistant.add_tool_call("call_noarg", "noarg_echo", serde_json::json!({}));
+        session.messages.push(assistant);
+
+        let provider: Arc<dyn Provider> =
+            Arc::new(StaticModelProvider::with_model("test-model", 8192, 1024));
+        let ctx = ToolContext::new(session.id.clone(), "msg_test".to_string(), ".".to_string());
+
+        SessionPrompt::execute_tool_calls(
+            &mut session,
+            tool_registry,
+            ctx,
+            provider,
+            "mock",
+            "test-model",
+        )
+        .await
+        .expect("execute_tool_calls should succeed");
+
+        let tool_msg = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .expect("tool message should exist");
+
+        let (content, is_error) = tool_msg
+            .parts
+            .iter()
+            .find_map(|part| match &part.part_type {
+                PartType::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                    ..
+                } if tool_call_id == "call_noarg" => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("noarg result should exist");
+
+        assert!(!is_error);
+        assert_eq!(content, "{}");
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_routes_invalid_arguments_to_invalid_tool() {
+        let tool_registry = Arc::new(rocode_tool::ToolRegistry::new());
+        tool_registry.register(AlwaysInvalidArgsTool).await;
+        tool_registry
+            .register(rocode_tool::invalid::InvalidTool)
+            .await;
+
+        let mut session = Session::new("proj", ".");
+        let sid = session.id.clone();
+        session
+            .messages
+            .push(SessionMessage::user(sid.clone(), "run invalid"));
+        let mut assistant = SessionMessage::assistant(sid);
+        assistant.add_tool_call("call_invalid", "needs_path", serde_json::json!({}));
+        session.messages.push(assistant);
+
+        let provider: Arc<dyn Provider> =
+            Arc::new(StaticModelProvider::with_model("test-model", 8192, 1024));
+        let ctx = ToolContext::new(session.id.clone(), "msg_test".to_string(), ".".to_string());
+
+        SessionPrompt::execute_tool_calls(
+            &mut session,
+            tool_registry,
+            ctx,
+            provider,
+            "mock",
+            "test-model",
+        )
+        .await
+        .expect("execute_tool_calls should succeed");
+
+        let assistant_msg = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::Assistant))
+            .expect("assistant message should exist");
+        let tool_call = assistant_msg
+            .parts
+            .iter()
+            .find_map(|part| match &part.part_type {
+                PartType::ToolCall {
+                    id,
+                    name,
+                    input,
+                    status,
+                    ..
+                } if id == "call_invalid" => Some((name, input, status)),
+                _ => None,
+            })
+            .expect("tool call should exist");
+        assert_eq!(tool_call.0, "invalid");
+        assert_eq!(
+            tool_call.1.get("tool").and_then(|v| v.as_str()),
+            Some("needs_path")
+        );
+        assert!(tool_call.1.get("receivedArgs").is_none());
+        assert!(matches!(tool_call.2, crate::ToolCallStatus::Completed));
+
+        let tool_msg = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .expect("tool message should exist");
+        let (content, is_error) = tool_msg
+            .parts
+            .iter()
+            .find_map(|part| match &part.part_type {
+                PartType::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                    ..
+                } if tool_call_id == "call_invalid" => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("invalid fallback result should exist");
+        assert!(!is_error);
+        assert!(content.contains("The arguments provided to the tool are invalid:"));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_only_runs_running_tool_calls() {
+        let tool_registry = Arc::new(rocode_tool::ToolRegistry::new());
+        tool_registry.register(NoArgEchoTool).await;
+
+        let mut session = Session::new("proj", ".");
+        let sid = session.id.clone();
+        session
+            .messages
+            .push(SessionMessage::user(sid.clone(), "run running only"));
+        let mut assistant = SessionMessage::assistant(sid);
+        assistant.parts.push(crate::MessagePart {
+            id: format!("prt_{}", uuid::Uuid::new_v4()),
+            part_type: PartType::ToolCall {
+                id: "call_pending".to_string(),
+                name: "noarg_echo".to_string(),
+                input: serde_json::json!({}),
+                status: crate::ToolCallStatus::Pending,
+                raw: Some("{".to_string()),
+                state: Some(crate::ToolState::Pending {
+                    input: serde_json::json!({}),
+                    raw: "{".to_string(),
+                }),
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+        assistant.add_tool_call("call_running", "noarg_echo", serde_json::json!({}));
+        session.messages.push(assistant);
+
+        let provider: Arc<dyn Provider> =
+            Arc::new(StaticModelProvider::with_model("test-model", 8192, 1024));
+        let ctx = ToolContext::new(session.id.clone(), "msg_test".to_string(), ".".to_string());
+
+        SessionPrompt::execute_tool_calls(
+            &mut session,
+            tool_registry,
+            ctx,
+            provider,
+            "mock",
+            "test-model",
+        )
+        .await
+        .expect("execute_tool_calls should succeed");
+
+        let tool_msg = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .expect("tool message should exist");
+        let result_ids: Vec<&str> = tool_msg
+            .parts
+            .iter()
+            .filter_map(|part| match &part.part_type {
+                PartType::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_ids, vec!["call_running"]);
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_reused_call_id_in_new_turn_still_executes() {
+        let tool_registry = Arc::new(rocode_tool::ToolRegistry::new());
+        tool_registry.register(NoArgEchoTool).await;
+
+        let mut session = Session::new("proj", ".");
+        let sid = session.id.clone();
+
+        session
+            .messages
+            .push(SessionMessage::user(sid.clone(), "turn one"));
+        let mut assistant_1 = SessionMessage::assistant(sid.clone());
+        assistant_1.add_tool_call("tool-call-0", "noarg_echo", serde_json::json!({}));
+        session.messages.push(assistant_1);
+        let mut tool_msg_1 = SessionMessage::tool(sid.clone());
+        tool_msg_1.add_tool_result("tool-call-0", "{}", false);
+        session.messages.push(tool_msg_1);
+
+        session
+            .messages
+            .push(SessionMessage::user(sid.clone(), "turn two"));
+        let mut assistant_2 = SessionMessage::assistant(sid);
+        assistant_2.add_tool_call("tool-call-0", "noarg_echo", serde_json::json!({}));
+        session.messages.push(assistant_2);
+
+        let provider: Arc<dyn Provider> =
+            Arc::new(StaticModelProvider::with_model("test-model", 8192, 1024));
+        let ctx = ToolContext::new(session.id.clone(), "msg_test".to_string(), ".".to_string());
+
+        SessionPrompt::execute_tool_calls(
+            &mut session,
+            tool_registry,
+            ctx,
+            provider,
+            "mock",
+            "test-model",
+        )
+        .await
+        .expect("execute_tool_calls should succeed");
+
+        let tool_msgs: Vec<&SessionMessage> = session
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .collect();
+        assert!(
+            tool_msgs.len() >= 2,
+            "expected a second tool message for the new turn"
+        );
+
+        let last_tool_msg = tool_msgs.last().expect("latest tool message should exist");
+        let second_turn_result_count = last_tool_msg
+            .parts
+            .iter()
+            .filter(|part| {
+                matches!(
+                    &part.part_type,
+                    PartType::ToolResult { tool_call_id, .. } if tool_call_id == "tool-call-0"
+                )
+            })
+            .count();
+        assert_eq!(second_turn_result_count, 1);
+    }
+
     #[test]
     fn mcp_tools_from_session_reads_runtime_metadata() {
         let mut session = Session::new("proj", ".");
@@ -4538,5 +6259,85 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(matches!(messages[0].role, Role::Assistant));
         assert!(matches!(messages[1].role, Role::Tool));
+    }
+
+    #[test]
+    fn repair_tool_call_name_keeps_exact_match() {
+        let tools = HashSet::from([
+            "read".to_string(),
+            "glob".to_string(),
+            "invalid".to_string(),
+        ]);
+        assert_eq!(SessionPrompt::repair_tool_call_name("read", &tools), "read");
+    }
+
+    #[test]
+    fn tool_call_input_for_execution_skips_empty_pending() {
+        let input = serde_json::json!({});
+        let resolved = SessionPrompt::tool_call_input_for_execution(
+            &crate::ToolCallStatus::Pending,
+            &input,
+            None,
+            None,
+        );
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn tool_call_input_for_execution_pending_ignores_raw_input() {
+        let input = serde_json::json!({});
+        let resolved = SessionPrompt::tool_call_input_for_execution(
+            &crate::ToolCallStatus::Pending,
+            &input,
+            Some("[filePath=/tmp/a.html]"),
+            None,
+        );
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn tool_call_input_for_execution_running_keeps_object_input() {
+        let input = serde_json::json!({});
+        let resolved = SessionPrompt::tool_call_input_for_execution(
+            &crate::ToolCallStatus::Running,
+            &input,
+            None,
+            None,
+        );
+        assert_eq!(resolved, Some(serde_json::json!({})));
+    }
+
+    #[test]
+    fn invalid_tool_payload_is_ts_shape() {
+        let payload = SessionPrompt::invalid_tool_payload("read", "missing filePath");
+        assert_eq!(payload.get("tool").and_then(|v| v.as_str()), Some("read"));
+        assert_eq!(
+            payload.get("error").and_then(|v| v.as_str()),
+            Some("missing filePath")
+        );
+        assert!(payload.get("receivedArgs").is_none());
+    }
+
+    #[test]
+    fn repair_tool_call_name_repairs_case_mismatch() {
+        let tools = HashSet::from([
+            "read".to_string(),
+            "glob".to_string(),
+            "invalid".to_string(),
+        ]);
+        assert_eq!(SessionPrompt::repair_tool_call_name("Read", &tools), "read");
+    }
+
+    #[test]
+    fn repair_tool_call_name_routes_unknown_to_invalid() {
+        let tools = HashSet::from([
+            "read".to_string(),
+            "glob".to_string(),
+            "invalid".to_string(),
+        ]);
+        assert_eq!(
+            SessionPrompt::repair_tool_call_name("read_html_file", &tools),
+            "invalid"
+        );
     }
 }

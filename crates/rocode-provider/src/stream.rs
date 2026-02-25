@@ -232,7 +232,8 @@ impl ToolCallAssembler {
             return None;
         }
 
-        let input = serde_json::from_str(&self.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        let input = serde_json::from_str(&self.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(self.arguments.clone()));
         Some(StreamEvent::ToolCallEnd {
             id: self.id,
             name: self.name,
@@ -332,6 +333,11 @@ pub fn parse_openai_sse(data: &str) -> Vec<StreamEvent> {
     };
 
     let mut events = Vec::new();
+    let usage = event.usage.as_ref().map(|u| StreamUsage {
+        prompt_tokens: u.prompt_tokens,
+        completion_tokens: u.completion_tokens,
+        ..Default::default()
+    });
 
     for choice in event.choices {
         if let Some(delta) = &choice.delta {
@@ -368,7 +374,22 @@ pub fn parse_openai_sse(data: &str) -> Vec<StreamEvent> {
 
         if let Some(reason) = &choice.finish_reason {
             match reason.as_str() {
-                "stop" | "tool_calls" => events.push(StreamEvent::Done),
+                "stop" => {
+                    events.push(StreamEvent::FinishStep {
+                        finish_reason: Some("stop".to_string()),
+                        usage: usage.clone().unwrap_or_default(),
+                        provider_metadata: None,
+                    });
+                    events.push(StreamEvent::Done);
+                }
+                "tool_calls" => {
+                    events.push(StreamEvent::FinishStep {
+                        finish_reason: Some("tool-calls".to_string()),
+                        usage: usage.clone().unwrap_or_default(),
+                        provider_metadata: None,
+                    });
+                    events.push(StreamEvent::Done);
+                }
                 _ => {}
             }
         }
@@ -577,7 +598,9 @@ mod tests {
                 id,
                 name,
                 input
-            } if id == "tool-call-0" && name == "read" && input == &serde_json::json!({})
+            } if id == "tool-call-0"
+                && name == "read"
+                && input == &serde_json::Value::String(r#"{"path":"incomplete""#.to_string())
         )));
     }
 
@@ -636,9 +659,16 @@ mod tests {
     fn parse_openai_sse_ends_on_tool_calls_finish_reason() {
         let data = r#"{"choices":[{"finish_reason":"tool_calls"}]}"#;
         let events = parse_openai_sse(data);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            StreamEvent::FinishStep {
+                finish_reason: Some(ref reason),
+                ..
+            } if reason == "tool-calls"
+        ));
         assert!(
-            matches!(events[0], StreamEvent::Done),
+            matches!(events[1], StreamEvent::Done),
             "tool_calls finish_reason should emit Done"
         );
     }
