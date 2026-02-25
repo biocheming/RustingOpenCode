@@ -1,12 +1,27 @@
+use std::collections::HashMap;
+
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
 use crate::theme::Theme;
+
+/// Popular providers shown first (matches TS opencode ordering).
+const POPULAR_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "github-copilot",
+    "openai",
+    "google",
+    "openrouter",
+    "vercel",
+    "deepseek",
+];
+
+const RECENT_LIMIT: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -16,102 +31,69 @@ pub struct Model {
     pub context_window: u64,
 }
 
+/// A display row in the model list — either a group header or a selectable model.
+#[derive(Clone)]
+enum Row {
+    Header(String),
+    Model { index: usize },
+}
+
 pub struct ModelSelectDialog {
     models: Vec<Model>,
-    filtered: Vec<usize>,
+    /// (provider_id, model_id) pairs, most recent first.
+    recent: Vec<(String, String)>,
+    /// Currently active model key: "provider/model_id".
+    current_model: Option<String>,
+    /// Flat display rows (headers + models) after filtering/grouping.
+    rows: Vec<Row>,
+    /// Indices into `rows` that are selectable (Model rows only).
+    selectable: Vec<usize>,
+    cursor: usize,
+    scroll_offset: usize,
     query: String,
-    state: ListState,
     open: bool,
 }
 
 impl ModelSelectDialog {
     pub fn new() -> Self {
-        let models = vec![
-            Model {
-                id: "claude-sonnet-4".into(),
-                name: "Claude Sonnet 4".into(),
-                provider: "anthropic".into(),
-                context_window: 200000,
-            },
-            Model {
-                id: "claude-3-5-sonnet".into(),
-                name: "Claude 3.5 Sonnet".into(),
-                provider: "anthropic".into(),
-                context_window: 200000,
-            },
-            Model {
-                id: "claude-3-opus".into(),
-                name: "Claude 3 Opus".into(),
-                provider: "anthropic".into(),
-                context_window: 200000,
-            },
-            Model {
-                id: "gpt-4o".into(),
-                name: "GPT-4o".into(),
-                provider: "openai".into(),
-                context_window: 128000,
-            },
-            Model {
-                id: "gpt-4-turbo".into(),
-                name: "GPT-4 Turbo".into(),
-                provider: "openai".into(),
-                context_window: 128000,
-            },
-            Model {
-                id: "o1".into(),
-                name: "o1".into(),
-                provider: "openai".into(),
-                context_window: 200000,
-            },
-            Model {
-                id: "gemini-2.0-flash".into(),
-                name: "Gemini 2.0 Flash".into(),
-                provider: "google".into(),
-                context_window: 1000000,
-            },
-            Model {
-                id: "gemini-1.5-pro".into(),
-                name: "Gemini 1.5 Pro".into(),
-                provider: "google".into(),
-                context_window: 1000000,
-            },
-            Model {
-                id: "deepseek-v3".into(),
-                name: "DeepSeek V3".into(),
-                provider: "deepseek".into(),
-                context_window: 64000,
-            },
-            Model {
-                id: "llama-3.1-70b".into(),
-                name: "Llama 3.1 70B".into(),
-                provider: "openrouter".into(),
-                context_window: 128000,
-            },
-        ];
-
-        let filtered = (0..models.len()).collect();
-        let mut state = ListState::default();
-        state.select(Some(0));
-
         Self {
-            models,
-            filtered,
+            models: Vec::new(),
+            recent: Vec::new(),
+            current_model: None,
+            rows: Vec::new(),
+            selectable: Vec::new(),
+            cursor: 0,
+            scroll_offset: 0,
             query: String::new(),
-            state,
             open: false,
         }
     }
 
     pub fn set_models(&mut self, models: Vec<Model>) {
         self.models = models;
-        self.filtered = (0..self.models.len()).collect();
+        self.rebuild();
+    }
+
+    pub fn set_current_model(&mut self, key: Option<String>) {
+        self.current_model = key;
+    }
+
+    /// Record a model as recently used (pushed to front, capped at RECENT_LIMIT).
+    pub fn push_recent(&mut self, provider: &str, model_id: &str) {
+        let entry = (provider.to_string(), model_id.to_string());
+        self.recent.retain(|r| r != &entry);
+        self.recent.insert(0, entry);
+        if self.recent.len() > RECENT_LIMIT {
+            self.recent.truncate(RECENT_LIMIT);
+        }
     }
 
     pub fn open(&mut self) {
         self.open = true;
         self.query.clear();
-        self.filtered = (0..self.models.len()).collect();
-        self.state.select(Some(0));
+        self.rebuild();
+        self.cursor = 0;
+        self.scroll_offset = 0;
     }
 
     pub fn close(&mut self) {
@@ -124,65 +106,133 @@ impl ModelSelectDialog {
 
     pub fn handle_input(&mut self, c: char) {
         self.query.push(c);
-        self.filter();
+        self.rebuild();
     }
 
     pub fn handle_backspace(&mut self) {
         self.query.pop();
-        self.filter();
+        self.rebuild();
     }
 
     pub fn move_up(&mut self) {
-        if let Some(selected) = self.state.selected() {
-            if selected > 0 {
-                self.state.select(Some(selected - 1));
-            }
+        if self.cursor > 0 {
+            self.cursor -= 1;
         }
     }
 
     pub fn move_down(&mut self) {
-        if let Some(selected) = self.state.selected() {
-            if selected < self.filtered.len().saturating_sub(1) {
-                self.state.select(Some(selected + 1));
-            }
+        if self.cursor < self.selectable.len().saturating_sub(1) {
+            self.cursor += 1;
         }
     }
 
     pub fn selected_model(&self) -> Option<&Model> {
-        self.state
-            .selected()
-            .and_then(|i| self.filtered.get(i))
-            .and_then(|&idx| self.models.get(idx))
+        self.selectable
+            .get(self.cursor)
+            .and_then(|&row_idx| match &self.rows[row_idx] {
+                Row::Model { index } => self.models.get(*index),
+                _ => None,
+            })
     }
 
-    fn filter(&mut self) {
+
+    /// Rebuild the flat row list from models, applying search filter and grouping.
+    fn rebuild(&mut self) {
         let query_lower = self.query.to_lowercase();
-        self.filtered = self
+        let filtered: Vec<usize> = self
             .models
             .iter()
             .enumerate()
             .filter(|(_, m)| {
-                m.name.to_lowercase().contains(&query_lower)
+                query_lower.is_empty()
+                    || m.name.to_lowercase().contains(&query_lower)
                     || m.provider.to_lowercase().contains(&query_lower)
                     || m.id.to_lowercase().contains(&query_lower)
             })
             .map(|(i, _)| i)
             .collect();
 
-        if self.filtered.is_empty() {
-            self.state.select(None);
-        } else {
-            self.state.select(Some(0));
+        let mut rows = Vec::new();
+        let mut used = vec![false; self.models.len()];
+
+        // --- Recent section ---
+        let recent_indices: Vec<usize> = self
+            .recent
+            .iter()
+            .filter_map(|(prov, mid)| {
+                filtered.iter().copied().find(|&i| {
+                    let m = &self.models[i];
+                    m.provider == *prov && m.id == *mid
+                })
+            })
+            .collect();
+
+        if !recent_indices.is_empty() {
+            rows.push(Row::Header("Recent".into()));
+            for &idx in &recent_indices {
+                rows.push(Row::Model { index: idx });
+                used[idx] = true;
+            }
         }
+
+        // --- Group remaining by provider (popular first) ---
+        let remaining: Vec<usize> = filtered.iter().copied().filter(|&i| !used[i]).collect();
+        let mut by_provider: HashMap<&str, Vec<usize>> = HashMap::new();
+        for &idx in &remaining {
+            by_provider
+                .entry(self.models[idx].provider.as_str())
+                .or_default()
+                .push(idx);
+        }
+
+        // Sort provider keys: popular first, then alphabetical
+        let mut provider_keys: Vec<&str> = by_provider.keys().copied().collect();
+        provider_keys.sort_by(|a, b| {
+            let a_pop = POPULAR_PROVIDERS.iter().position(|&p| p == *a);
+            let b_pop = POPULAR_PROVIDERS.iter().position(|&p| p == *b);
+            match (a_pop, b_pop) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.to_lowercase().cmp(&b.to_lowercase()),
+            }
+        });
+
+        for provider in provider_keys {
+            let mut indices = by_provider.remove(provider).unwrap_or_default();
+            indices.sort_by(|&a, &b| {
+                self.models[a]
+                    .name
+                    .to_lowercase()
+                    .cmp(&self.models[b].name.to_lowercase())
+            });
+            rows.push(Row::Header(provider.to_string()));
+            for idx in indices {
+                rows.push(Row::Model { index: idx });
+            }
+        }
+
+        // Build selectable index
+        let selectable: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| matches!(r, Row::Model { .. }).then_some(i))
+            .collect();
+
+        self.rows = rows;
+        self.selectable = selectable;
+        self.cursor = 0;
+        self.scroll_offset = 0;
     }
+
 
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open {
             return;
         }
 
-        let dialog_width = 50;
-        let dialog_height = (self.filtered.len() + 4).min(15) as u16;
+        let dialog_width = 54u16;
+        let dialog_height = (self.rows.len() + 4).min(20).max(6) as u16;
         let dialog_area = centered_rect(dialog_width, dialog_height, area);
 
         frame.render_widget(Clear, dialog_area);
@@ -201,12 +251,12 @@ impl ModelSelectDialog {
         let inner_area = super::dialog_inner(block.inner(dialog_area));
         frame.render_widget(block, dialog_area);
 
+        // Search bar
         let search_line = Line::from(vec![
             Span::styled("> ", Style::default().fg(theme.primary)),
             Span::styled(&self.query, Style::default().fg(theme.text)),
             Span::styled("▏", Style::default().fg(theme.primary)),
         ]);
-
         frame.render_widget(
             Paragraph::new(search_line),
             Rect {
@@ -217,42 +267,101 @@ impl ModelSelectDialog {
             },
         );
 
-        let items: Vec<ListItem> = self
-            .filtered
-            .iter()
-            .filter_map(|&idx| {
-                self.models.get(idx).map(|m| {
-                    let is_selected = self
-                        .state
-                        .selected()
-                        .and_then(|s| self.filtered.get(s))
-                        .map(|&i| i == idx)
-                        .unwrap_or(false);
-
-                    let style = if is_selected {
-                        Style::default().fg(theme.text).bg(theme.background_element)
-                    } else {
-                        Style::default().fg(theme.text)
-                    };
-
-                    ListItem::new(Line::from(vec![
-                        Span::styled(&m.name, style),
-                        Span::styled("  ", style),
-                        Span::styled(&m.provider, Style::default().fg(theme.text_muted)),
-                    ]))
-                })
-            })
-            .collect();
-
-        let list = List::new(items);
+        // List area
         let list_area = Rect {
             x: inner_area.x,
             y: inner_area.y + 2,
-            width: inner_area.width,
+            width: inner_area.width.saturating_sub(1), // reserve 1 for scrollbar
             height: inner_area.height.saturating_sub(2),
         };
+        if list_area.height == 0 {
+            return;
+        }
 
-        frame.render_stateful_widget(list, list_area, &mut self.state.clone());
+        // Determine which row the cursor points to
+        let selected_row = self.selectable.get(self.cursor).copied();
+
+        // Auto-scroll so the selected row is visible
+        let scroll = {
+            let vis_height = list_area.height as usize;
+            let mut s = self.scroll_offset;
+            if let Some(sel) = selected_row {
+                if sel < s {
+                    s = sel;
+                } else if sel >= s + vis_height {
+                    s = sel.saturating_sub(vis_height.saturating_sub(1));
+                }
+            }
+            s
+        };
+
+        let visible_rows = self.rows.iter().enumerate().skip(scroll).take(list_area.height as usize);
+        let content_width = list_area.width as usize;
+
+        for (row_idx, (abs_idx, row)) in visible_rows.enumerate() {
+            let y = list_area.y + row_idx as u16;
+            let row_area = Rect { x: list_area.x, y, width: list_area.width, height: 1 };
+
+            match row {
+                Row::Header(label) => {
+                    let line = Line::from(Span::styled(
+                        format!(" {}", label),
+                        Style::default().fg(theme.text_muted).add_modifier(Modifier::BOLD),
+                    ));
+                    frame.render_widget(Paragraph::new(line), row_area);
+                }
+                Row::Model { index } => {
+                    let m = &self.models[*index];
+                    let is_selected = selected_row == Some(abs_idx);
+                    let model_key = format!("{}/{}", m.provider, m.id);
+                    let is_current = self.current_model.as_deref() == Some(model_key.as_str());
+
+                    let bg = if is_selected {
+                        theme.background_element
+                    } else {
+                        theme.background_panel
+                    };
+                    let base = Style::default().bg(bg);
+
+                    let check = if is_current { "✓ " } else { "  " };
+                    let ctx_str = format_context_window(m.context_window);
+
+                    // Build: "  ✓ ModelName          128K"
+                    let name_width = m.name.len() + check.len();
+                    let ctx_width = ctx_str.len();
+                    let padding = content_width.saturating_sub(name_width + ctx_width + 1);
+
+                    let line = Line::from(vec![
+                        Span::styled(check, base.fg(theme.success)),
+                        Span::styled(&m.name, base.fg(if is_current { theme.primary } else { theme.text })),
+                        Span::styled(" ".repeat(padding), base),
+                        Span::styled(ctx_str, base.fg(theme.text_muted)),
+                    ]);
+                    frame.render_widget(Paragraph::new(line), row_area);
+                }
+            }
+        }
+
+        // Scrollbar
+        if self.rows.len() > list_area.height as usize {
+            let scroll_area = Rect {
+                x: list_area.x + list_area.width,
+                y: list_area.y,
+                width: 1,
+                height: list_area.height,
+            };
+            let mut sb_state = ScrollbarState::new(self.rows.len())
+                .position(scroll)
+                .viewport_content_length(list_area.height as usize);
+            let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .track_style(Style::default().fg(theme.border_subtle))
+                .thumb_symbol("█")
+                .thumb_style(Style::default().fg(theme.primary));
+            frame.render_stateful_widget(sb, scroll_area, &mut sb_state);
+        }
     }
 }
 
@@ -264,4 +373,16 @@ impl Default for ModelSelectDialog {
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     super::centered_rect(width, height, area)
+}
+
+fn format_context_window(ctx: u64) -> String {
+    if ctx >= 1_000_000 {
+        format!("{}M", ctx / 1_000_000)
+    } else if ctx >= 1_000 {
+        format!("{}K", ctx / 1_000)
+    } else if ctx > 0 {
+        format!("{}", ctx)
+    } else {
+        String::new()
+    }
 }

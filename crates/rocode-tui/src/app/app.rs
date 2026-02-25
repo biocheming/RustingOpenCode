@@ -1359,8 +1359,12 @@ impl App {
                 KeyCode::Backspace => self.model_select.handle_backspace(),
                 KeyCode::Enter => {
                     if let Some(model) = self.model_select.selected_model() {
-                        let model_ref = format!("{}/{}", model.provider, model.id);
-                        self.set_active_model_selection(model_ref, Some(model.provider.clone()));
+                        let provider = model.provider.clone();
+                        let id = model.id.clone();
+                        let model_ref = format!("{}/{}", provider, id);
+                        self.model_select.push_recent(&provider, &id);
+                        self.model_select.set_current_model(Some(model_ref.clone()));
+                        self.set_active_model_selection(model_ref, Some(provider));
                     }
                     self.model_select.close();
                 }
@@ -2606,6 +2610,16 @@ impl App {
             variants.sort();
         }
         self.model_select.set_models(models);
+        // Sync current model indicator
+        let current_key = self.context.current_model.read().as_ref().map(|m| {
+            let provider = self.context.current_provider.read();
+            if let Some(ref p) = *provider {
+                format!("{}/{}", p, m)
+            } else {
+                m.clone()
+            }
+        });
+        self.model_select.set_current_model(current_key);
         self.available_models = available_models;
         self.model_variants = variant_map;
         self.model_variant_selection.retain(|model_key, variant| {
