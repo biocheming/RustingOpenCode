@@ -7,7 +7,7 @@ RustingOpenCode（简称 ROCode）是 OpenCode 的 Rust 实现与演进版本，
 ## 当前状态
 
 - 品牌名：`RustingOpenCode` / `ROCode`
-- 版本标识：`2026.02.24`
+- 版本标识：`v2026.2.25`
 - 可执行命令：`rocode`
 
 ## 功能概览
