@@ -8,9 +8,10 @@ use crate::theme::Theme;
 
 /// Render a text part using markdown rendering
 pub fn render_text_part(text: &str, theme: &Theme, marker_color: Color) -> Vec<Line<'static>> {
+    let cleaned = strip_think_tags(text);
     let renderer = MarkdownRenderer::new(theme.clone());
     let mut with_marker = Vec::new();
-    for (idx, line) in renderer.to_lines(text).into_iter().enumerate() {
+    for (idx, line) in renderer.to_lines(&cleaned).into_iter().enumerate() {
         let marker = if idx == 0 { "▸ " } else { "  " };
         let mut spans = vec![Span::styled(marker, Style::default().fg(marker_color))];
         spans.extend(line.spans);
@@ -31,7 +32,7 @@ pub fn render_reasoning_part(
     collapsed: bool,
     preview_lines: usize,
 ) -> ReasoningRender {
-    let cleaned = text.replace("[REDACTED]", "").trim().to_string();
+    let cleaned = strip_think_tags(&text.replace("[REDACTED]", "")).trim().to_string();
     if cleaned.is_empty() {
         return ReasoningRender {
             lines: Vec::new(),
@@ -45,25 +46,21 @@ pub fn render_reasoning_part(
     let total_content_lines = content_lines.len();
     let collapsible = total_content_lines > preview_lines;
 
+    let header_style = Style::default()
+        .fg(theme.info)
+        .add_modifier(Modifier::BOLD);
+
     if collapsible && collapsed {
         lines.push(Line::from(Span::styled(
             format!("▶ Thinking ({} lines)", total_content_lines),
-            Style::default()
-                .fg(theme.text_muted)
-                .add_modifier(Modifier::ITALIC),
+            header_style,
         )));
         return ReasoningRender { lines, collapsible };
     }
 
     lines.push(Line::from(Span::styled(
-        if collapsible {
-            "▼ Thinking"
-        } else {
-            "Thinking"
-        },
-        Style::default()
-            .fg(theme.text_muted)
-            .add_modifier(Modifier::ITALIC),
+        "▼ Thinking",
+        header_style,
     )));
 
     let visible_count = if collapsible && collapsed {
@@ -91,4 +88,11 @@ pub fn render_reasoning_part(
     }
 
     ReasoningRender { lines, collapsible }
+}
+
+/// Strip `<think>` / `</think>` tags that some models leak into content.
+fn strip_think_tags(text: &str) -> String {
+    text.replace("<think>", "")
+        .replace("</think>", "")
+        .replace("<think/>", "")
 }
