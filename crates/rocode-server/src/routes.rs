@@ -1916,6 +1916,7 @@ async fn session_prompt(
     let (provider, provider_id, model_id) =
         resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)
             .await?;
+    let agent_registry = AgentRegistry::from_config(&config);
     drop(config);
 
     let task_state = state.clone();
@@ -2005,6 +2006,21 @@ async fn session_prompt(
             tools: None,
         };
 
+        let agent_lookup: Option<
+            Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>,
+        > = {
+            Some(Arc::new(move |name: &str| {
+                agent_registry.get(name).map(|info| rocode_tool::TaskAgentInfo {
+                    name: info.name.clone(),
+                    model: info.model.as_ref().map(|m| rocode_tool::TaskAgentModel {
+                        provider_id: m.provider_id.clone(),
+                        model_id: m.model_id.clone(),
+                    }),
+                    can_use_task: info.is_tool_allowed("task"),
+                })
+            }))
+        };
+
         if let Err(error) = prompt_runner
             .prompt_with_update_hook(
                 input,
@@ -2014,6 +2030,7 @@ async fn session_prompt(
                 tool_defs,
                 rocode_session::AgentParams::default(),
                 Some(update_hook),
+                agent_lookup,
             )
             .await
         {

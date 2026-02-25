@@ -802,6 +802,7 @@ impl SessionPrompt {
             tools,
             agent_params,
             None,
+            None,
         )
         .await
     }
@@ -815,6 +816,7 @@ impl SessionPrompt {
         tools: Vec<ToolDefinition>,
         agent_params: AgentParams,
         update_hook: Option<SessionUpdateHook>,
+        agent_lookup: Option<Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>>,
     ) -> anyhow::Result<()> {
         self.assert_not_busy(&input.session_id).await?;
 
@@ -862,6 +864,7 @@ impl SessionPrompt {
             tools,
             &agent_params,
             update_hook,
+            agent_lookup,
         )
         .await;
 
@@ -942,6 +945,7 @@ impl SessionPrompt {
             tools,
             &agent_params,
             None,
+            None,
         )
         .await;
 
@@ -967,6 +971,7 @@ impl SessionPrompt {
         tools: Vec<ToolDefinition>,
         agent_params: &AgentParams,
         update_hook: Option<SessionUpdateHook>,
+        agent_lookup: Option<Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>>,
     ) -> anyhow::Result<()> {
         let mut step = 0u32;
         let provider_type = ProviderType::from_provider_id(&provider_id);
@@ -1371,6 +1376,7 @@ impl SessionPrompt {
                             &provider_id,
                             &model_id,
                             update_hook.as_ref(),
+                            agent_lookup.clone(),
                         )
                         .await
                         {
@@ -1515,6 +1521,7 @@ impl SessionPrompt {
                                 &provider_id,
                                 &model_id,
                                 update_hook.as_ref(),
+                                agent_lookup.clone(),
                             )
                             .await
                             {
@@ -1867,6 +1874,7 @@ impl SessionPrompt {
                     &provider_id,
                     &model_id,
                     update_hook.as_ref(),
+                    agent_lookup.clone(),
                 )
                 .await
                 {
@@ -2310,6 +2318,7 @@ impl SessionPrompt {
             provider_id,
             model_id,
             None,
+            None,
         )
         .await?;
         Ok(())
@@ -2323,6 +2332,7 @@ impl SessionPrompt {
         provider_id: &str,
         model_id: &str,
         update_hook: Option<&SessionUpdateHook>,
+        agent_lookup: Option<Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>>,
     ) -> anyhow::Result<usize> {
         let Some(last_assistant_index) = session
             .messages
@@ -2405,7 +2415,9 @@ impl SessionPrompt {
             provider,
             tool_registry.clone(),
             default_model,
-        );
+            agent_lookup,
+        )
+        .with_registry(tool_registry.clone());
         let available_tool_ids: HashSet<String> =
             tool_registry.list_ids().await.into_iter().collect();
 
@@ -2638,7 +2650,17 @@ impl SessionPrompt {
         provider: Arc<dyn Provider>,
         tool_registry: Arc<rocode_tool::ToolRegistry>,
         default_model: String,
+        agent_lookup: Option<Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>>,
     ) -> rocode_tool::ToolContext {
+        let ctx = if let Some(lookup) = agent_lookup {
+            ctx.with_get_agent_info(move |name| {
+                let lookup = lookup.clone();
+                async move { Ok(lookup(&name)) }
+            })
+        } else {
+            ctx
+        };
+
         let ctx = ctx.with_get_last_model({
             let default_model = default_model.clone();
             move |_session_id| {
@@ -5061,6 +5083,7 @@ mod tests {
                 Vec::new(),
                 AgentParams::default(),
                 Some(hook),
+                None,
             )
             .await
             .expect("prompt_with_update_hook should succeed");
@@ -5168,6 +5191,7 @@ mod tests {
                 None,
                 Vec::new(),
                 AgentParams::default(),
+                None,
                 None,
             )
             .await

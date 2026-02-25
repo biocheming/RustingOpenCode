@@ -199,6 +199,29 @@ pub type GetLastModelCallback = Arc<
         + Sync,
 >;
 
+/// Agent info returned by the get_agent callback, used by the task tool.
+#[derive(Debug, Clone)]
+pub struct TaskAgentInfo {
+    pub name: String,
+    pub model: Option<TaskAgentModel>,
+    pub can_use_task: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskAgentModel {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+pub type GetAgentInfoCallback = Arc<
+    dyn (Fn(
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<TaskAgentInfo>, ToolError>> + Send>,
+        >) + Send
+        + Sync,
+>;
+
 pub type CreateSyntheticMessageCallback = Arc<
     dyn (Fn(
             String,
@@ -302,6 +325,7 @@ pub struct ToolContext {
     pub todo_update: Option<TodoUpdateCallback>,
     pub todo_get: Option<TodoGetCallback>,
     pub get_last_model: Option<GetLastModelCallback>,
+    pub get_agent_info: Option<GetAgentInfoCallback>,
     pub create_synthetic_message: Option<CreateSyntheticMessageCallback>,
     pub project_root: String,
     pub registry: Option<Arc<ToolRegistry>>,
@@ -334,6 +358,7 @@ impl ToolContext {
             todo_update: None,
             todo_get: None,
             get_last_model: None,
+            get_agent_info: None,
             create_synthetic_message: None,
             project_root: directory,
             registry: None,
@@ -636,6 +661,23 @@ impl ToolContext {
         }
     }
 
+    pub fn with_get_agent_info<F, Fut>(mut self, callback: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Option<TaskAgentInfo>, ToolError>> + Send + 'static,
+    {
+        self.get_agent_info = Some(Arc::new(move |name| Box::pin(callback(name))));
+        self
+    }
+
+    pub async fn do_get_agent_info(&self, name: &str) -> Option<TaskAgentInfo> {
+        if let Some(ref callback) = self.get_agent_info {
+            callback(name.to_string()).await.ok().flatten()
+        } else {
+            None
+        }
+    }
+
     pub fn with_create_synthetic_message<F, Fut>(mut self, callback: F) -> Self
     where
         F: Fn(String, Option<String>, String) -> Fut + Send + Sync + 'static,
@@ -681,6 +723,7 @@ impl std::fmt::Debug for ToolContext {
             .field("agent", &self.agent)
             .field("directory", &self.directory)
             .field("worktree", &self.worktree)
+            .field("get_agent_info", &self.get_agent_info.is_some())
             .finish()
     }
 }

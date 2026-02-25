@@ -596,6 +596,19 @@ impl AgentExecutor {
         let providers = self.providers.clone();
         let tools = self.tools.clone();
 
+        let ctx = ctx.with_get_agent_info(|name| async move {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let registry = crate::AgentRegistry::from_project_dir(&cwd);
+            Ok(registry.get(&name).map(|info| rocode_tool::TaskAgentInfo {
+                name: info.name.clone(),
+                model: info.model.as_ref().map(|m| rocode_tool::TaskAgentModel {
+                    provider_id: m.provider_id.clone(),
+                    model_id: m.model_id.clone(),
+                }),
+                can_use_task: info.is_tool_allowed("task"),
+            }))
+        });
+
         ctx.with_create_subsession({
             let subsessions = subsessions.clone();
             move |agent_name, _title, model, disabled_tools| {

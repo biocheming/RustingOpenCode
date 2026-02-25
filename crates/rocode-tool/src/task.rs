@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{Metadata, PermissionRequest, Tool, ToolContext, ToolError, ToolResult};
+use crate::{Metadata, PermissionRequest, TaskAgentInfo, TaskAgentModel, Tool, ToolContext, ToolError, ToolResult};
 
 pub struct TaskTool;
 
@@ -105,7 +105,7 @@ impl Tool for TaskTool {
             .await?;
         }
 
-        let agent = get_agent(&input.subagent_type);
+        let agent = ctx.do_get_agent_info(&input.subagent_type).await;
         let disabled_tools = get_disabled_tools(agent.as_ref(), input.load_skills.as_ref());
         let preferred_model = if let Some(model) = agent.as_ref().and_then(|a| {
             a.model
@@ -160,64 +160,8 @@ impl Tool for TaskTool {
     }
 }
 
-struct AgentInfo {
-    name: String,
-    model: Option<AgentModel>,
-    can_use_task: bool,
-}
-
-struct AgentModel {
-    model_id: String,
-    provider_id: String,
-}
-
-fn get_agent(name: &str) -> Option<AgentInfo> {
-    let agents = get_available_agents();
-    agents.into_iter().find(|a| a.name == name)
-}
-
-fn get_available_agents() -> Vec<AgentInfo> {
-    vec![
-        AgentInfo {
-            name: "general".to_string(),
-            model: None,
-            can_use_task: false,
-        },
-        AgentInfo {
-            name: "explore".to_string(),
-            model: None,
-            can_use_task: false,
-        },
-        AgentInfo {
-            name: "plan".to_string(),
-            model: None,
-            can_use_task: false,
-        },
-        AgentInfo {
-            name: "title".to_string(),
-            model: None,
-            can_use_task: false,
-        },
-        AgentInfo {
-            name: "summary".to_string(),
-            model: None,
-            can_use_task: false,
-        },
-        AgentInfo {
-            name: "compaction".to_string(),
-            model: None,
-            can_use_task: false,
-        },
-        AgentInfo {
-            name: "build".to_string(),
-            model: None,
-            can_use_task: true,
-        },
-    ]
-}
-
 fn get_disabled_tools(
-    agent: Option<&AgentInfo>,
+    agent: Option<&TaskAgentInfo>,
     _load_skills: Option<&Vec<String>>,
 ) -> Vec<String> {
     let mut disabled = vec!["todowrite".to_string(), "todoread".to_string()];
@@ -230,9 +174,9 @@ fn get_disabled_tools(
     disabled
 }
 
-fn parse_model_ref(raw: Option<&str>) -> AgentModel {
+fn parse_model_ref(raw: Option<&str>) -> TaskAgentModel {
     let Some(raw) = raw else {
-        return AgentModel {
+        return TaskAgentModel {
             model_id: "default".to_string(),
             provider_id: "default".to_string(),
         };
@@ -240,13 +184,13 @@ fn parse_model_ref(raw: Option<&str>) -> AgentModel {
 
     let pair = raw.split_once(':').or_else(|| raw.split_once('/'));
     if let Some((provider, model)) = pair {
-        return AgentModel {
+        return TaskAgentModel {
             model_id: model.to_string(),
             provider_id: provider.to_string(),
         };
     }
 
-    AgentModel {
+    TaskAgentModel {
         model_id: raw.to_string(),
         provider_id: "default".to_string(),
     }
@@ -269,6 +213,17 @@ mod tests {
         let prompt_calls = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
 
         let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_get_agent_info(|name| async move {
+                if name == "build" {
+                    Ok(Some(TaskAgentInfo {
+                        name: "build".to_string(),
+                        model: None,
+                        can_use_task: true,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })
             .with_get_last_model(|_session_id| async move { Ok(Some("provider-x:model-y".into())) })
             .with_create_subsession({
                 let create_calls = create_calls.clone();
@@ -343,6 +298,17 @@ mod tests {
         let prompted = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
 
         let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_get_agent_info(|name| async move {
+                if name == "build" {
+                    Ok(Some(TaskAgentInfo {
+                        name: "build".to_string(),
+                        model: None,
+                        can_use_task: true,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })
             .with_get_last_model(|_session_id| async move { Ok(Some("provider-x:model-y".into())) })
             .with_create_subsession({
                 let created = created.clone();
@@ -382,5 +348,170 @@ mod tests {
         assert!(result
             .output
             .contains("task_id: task_existing_42 (for resuming to continue this task if needed)"));
+    }
+
+    #[tokio::test]
+    async fn task_recognizes_dynamic_agent_with_model_and_can_use_task() {
+        let create_calls = Arc::new(Mutex::new(Vec::<(
+            String,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+        )>::new()));
+
+        let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_get_agent_info(|name| async move {
+                if name == "librarian" {
+                    Ok(Some(TaskAgentInfo {
+                        name: "librarian".to_string(),
+                        model: Some(TaskAgentModel {
+                            provider_id: "openai".to_string(),
+                            model_id: "gpt-4o".to_string(),
+                        }),
+                        can_use_task: true,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })
+            .with_get_last_model(|_session_id| async move { Ok(Some("anthropic:claude".into())) })
+            .with_create_subsession({
+                let create_calls = create_calls.clone();
+                move |agent, title, model, disabled_tools| {
+                    let create_calls = create_calls.clone();
+                    async move {
+                        create_calls
+                            .lock()
+                            .await
+                            .push((agent, title, model, disabled_tools));
+                        Ok("task_librarian_abc".to_string())
+                    }
+                }
+            })
+            .with_prompt_subsession(|_session_id, _prompt| async move {
+                Ok("librarian result".to_string())
+            });
+
+        let args = serde_json::json!({
+            "description": "Search docs",
+            "prompt": "Find relevant documentation",
+            "subagent_type": "librarian"
+        });
+
+        let result = TaskTool::new().execute(args, ctx).await.unwrap();
+
+        // Agent's own model should be preferred over get_last_model fallback
+        assert_eq!(
+            result.metadata.get("model"),
+            Some(&serde_json::json!({
+                "modelID": "gpt-4o",
+                "providerID": "openai"
+            }))
+        );
+
+        let create_calls = create_calls.lock().await.clone();
+        assert_eq!(create_calls.len(), 1);
+        // Model passed to create_subsession should be the agent's model
+        assert_eq!(create_calls[0].2, Some("openai:gpt-4o".to_string()));
+        // can_use_task=true means "task" should NOT be in disabled_tools
+        assert_eq!(
+            create_calls[0].3,
+            vec!["todowrite".to_string(), "todoread".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_unknown_agent_falls_back_to_last_model_and_disables_task() {
+        let create_calls = Arc::new(Mutex::new(Vec::<(
+            String,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+        )>::new()));
+
+        let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_get_agent_info(|_name| async move { Ok(None) })
+            .with_get_last_model(|_session_id| async move { Ok(Some("anthropic:claude".into())) })
+            .with_create_subsession({
+                let create_calls = create_calls.clone();
+                move |agent, title, model, disabled_tools| {
+                    let create_calls = create_calls.clone();
+                    async move {
+                        create_calls
+                            .lock()
+                            .await
+                            .push((agent, title, model, disabled_tools));
+                        Ok("task_unknown_xyz".to_string())
+                    }
+                }
+            })
+            .with_prompt_subsession(|_session_id, _prompt| async move {
+                Ok("fallback result".to_string())
+            });
+
+        let args = serde_json::json!({
+            "description": "Do something",
+            "prompt": "Handle this",
+            "subagent_type": "nonexistent_agent"
+        });
+
+        let result = TaskTool::new().execute(args, ctx).await.unwrap();
+
+        // Should fall back to get_last_model
+        assert_eq!(
+            result.metadata.get("model"),
+            Some(&serde_json::json!({
+                "modelID": "claude",
+                "providerID": "anthropic"
+            }))
+        );
+
+        let create_calls = create_calls.lock().await.clone();
+        assert_eq!(create_calls.len(), 1);
+        assert_eq!(create_calls[0].2, Some("anthropic:claude".to_string()));
+        // Unknown agent → can_use_task defaults to false → "task" should be disabled
+        assert!(create_calls[0].3.contains(&"task".to_string()));
+    }
+
+    #[tokio::test]
+    async fn task_no_callback_disables_task_tool() {
+        let create_calls = Arc::new(Mutex::new(Vec::<(
+            String,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+        )>::new()));
+
+        // No with_get_agent_info — simulates paths where callback isn't injected
+        let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_get_last_model(|_session_id| async move { Ok(Some("anthropic:claude".into())) })
+            .with_create_subsession({
+                let create_calls = create_calls.clone();
+                move |agent, title, model, disabled_tools| {
+                    let create_calls = create_calls.clone();
+                    async move {
+                        create_calls
+                            .lock()
+                            .await
+                            .push((agent, title, model, disabled_tools));
+                        Ok("task_nocb_xyz".to_string())
+                    }
+                }
+            })
+            .with_prompt_subsession(|_session_id, _prompt| async move {
+                Ok("no callback result".to_string())
+            });
+
+        let args = serde_json::json!({
+            "description": "Do something",
+            "prompt": "Handle this",
+            "subagent_type": "build"
+        });
+
+        let _result = TaskTool::new().execute(args, ctx).await.unwrap();
+
+        let create_calls = create_calls.lock().await.clone();
+        // Without callback, agent=None → task disabled (backward compat)
+        assert!(create_calls[0].3.contains(&"task".to_string()));
     }
 }
