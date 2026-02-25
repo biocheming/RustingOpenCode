@@ -1085,11 +1085,17 @@ impl SessionPrompt {
             tracing::info!("Prompt loop step {} for session {}", step, session_id);
 
             // Plugin hook: chat.messages.transform — let plugins modify messages before sending
+            let hook_messages = serde_json::Value::Array(
+                filtered_messages
+                    .iter()
+                    .map(session_message_hook_payload)
+                    .collect(),
+            );
             let message_hook_outputs = rocode_plugin::trigger_collect(
                 HookContext::new(HookEvent::ChatMessagesTransform)
                     .with_session(&session_id)
                     .with_data("message_count", serde_json::json!(filtered_messages.len()))
-                    .with_data("messages", serde_json::json!(&filtered_messages)),
+                    .with_data("messages", hook_messages),
             )
             .await;
             apply_chat_messages_hook_outputs(&mut filtered_messages, message_hook_outputs);
@@ -1821,7 +1827,7 @@ impl SessionPrompt {
                         .with_data("provider_id", serde_json::json!(&provider_id))
                         .with_data("message_id", serde_json::json!(&assistant_message.id))
                         .with_data("has_tool_calls", serde_json::json!(has_tool_calls))
-                        .with_data("message", serde_json::json!(&assistant_message))
+                        .with_data("message", session_message_hook_payload(&assistant_message))
                         .with_data("parts", serde_json::json!(&assistant_message.parts)),
                 )
                 .await;
@@ -4050,6 +4056,34 @@ fn hook_payload_object(
         .and_then(|value| value.as_object())
         .or_else(|| payload.as_object())
         .or_else(|| payload.get("data").and_then(|value| value.as_object()))
+}
+
+fn session_message_hook_payload(message: &SessionMessage) -> serde_json::Value {
+    let mut payload = serde_json::to_value(message).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+
+    object.insert(
+        "info".to_string(),
+        serde_json::json!({
+            "id": message.id,
+            "sessionID": message.session_id,
+            "role": hook_message_role(&message.role),
+            "time": { "created": message.created_at.timestamp_millis() },
+        }),
+    );
+
+    payload
+}
+
+fn hook_message_role(role: &crate::MessageRole) -> &'static str {
+    match role {
+        crate::MessageRole::User => "user",
+        crate::MessageRole::Assistant => "assistant",
+        crate::MessageRole::System => "system",
+        crate::MessageRole::Tool => "tool",
+    }
 }
 
 fn apply_chat_messages_hook_outputs(
