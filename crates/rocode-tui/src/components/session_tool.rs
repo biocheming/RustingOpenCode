@@ -248,8 +248,8 @@ pub fn render_tool_call(
 
                 if let Some(root) = list_root {
                     lines.push(block_content_line(
-                        format!("Directory {}", root),
-                        Style::default().fg(theme.info),
+                        format!("[Directory]: {}", root),
+                        Style::default().fg(theme.info).add_modifier(ratatui::style::Modifier::BOLD),
                         theme,
                         bg,
                     ));
