@@ -38,6 +38,7 @@ impl AnthropicProvider {
                 name: "Claude Sonnet 4".to_string(),
                 provider: "anthropic".to_string(),
                 context_window: 200000,
+                max_input_tokens: None,
                 max_output_tokens: 16000,
                 supports_vision: true,
                 supports_tools: true,
@@ -49,6 +50,7 @@ impl AnthropicProvider {
                 name: "Claude 3.5 Sonnet".to_string(),
                 provider: "anthropic".to_string(),
                 context_window: 200000,
+                max_input_tokens: None,
                 max_output_tokens: 8192,
                 supports_vision: true,
                 supports_tools: true,
@@ -60,6 +62,7 @@ impl AnthropicProvider {
                 name: "Claude 3.5 Haiku".to_string(),
                 provider: "anthropic".to_string(),
                 context_window: 200000,
+                max_input_tokens: None,
                 max_output_tokens: 8192,
                 supports_vision: true,
                 supports_tools: true,
@@ -71,6 +74,7 @@ impl AnthropicProvider {
                 name: "Claude 3 Opus".to_string(),
                 provider: "anthropic".to_string(),
                 context_window: 200000,
+                max_input_tokens: None,
                 max_output_tokens: 4096,
                 supports_vision: true,
                 supports_tools: true,
@@ -93,9 +97,7 @@ impl AnthropicProvider {
             .find(|m| m.id == request.model)
             .map(|m| m.max_output_tokens)
             .unwrap_or(16000);
-        let max_tokens = request
-            .max_tokens
-            .unwrap_or_else(|| model_max.min(32_000));
+        let max_tokens = request.max_tokens.unwrap_or_else(|| model_max.min(32_000));
         let mut messages = Vec::new();
         let mut system = request.system;
 

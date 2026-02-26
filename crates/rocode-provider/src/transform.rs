@@ -193,14 +193,16 @@ fn merge_deep_into(
     for (k, v) in source {
         if let Some(existing) = target.get_mut(k) {
             if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), v.as_object()) {
-                let mut sub_target: HashMap<String, serde_json::Value> =
-                    existing_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                let sub_source: HashMap<String, serde_json::Value> =
-                    new_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let mut sub_target: HashMap<String, serde_json::Value> = existing_obj
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let sub_source: HashMap<String, serde_json::Value> = new_obj
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 merge_deep_into(&mut sub_target, &sub_source);
-                *existing = serde_json::Value::Object(
-                    sub_target.into_iter().collect(),
-                );
+                *existing = serde_json::Value::Object(sub_target.into_iter().collect());
                 continue;
             }
         }

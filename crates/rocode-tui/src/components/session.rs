@@ -561,7 +561,13 @@ impl SessionView {
             );
             append_non_message_lines(&mut lines, &mut line_to_message, painted);
             if !messages.is_empty() {
-                push_spacing_lines(&mut lines, &mut line_to_message, message_gap_lines, theme.background, content_width);
+                push_spacing_lines(
+                    &mut lines,
+                    &mut line_to_message,
+                    message_gap_lines,
+                    theme.background,
+                    content_width,
+                );
             }
         }
 
@@ -573,7 +579,13 @@ impl SessionView {
             // cozy mode adds an extra blank line for breathing room
             if let Some(prev_role) = &last_visible_role {
                 if *prev_role != msg.role || matches!(msg.role, MessageRole::User) {
-                    push_spacing_lines(&mut lines, &mut line_to_message, message_gap_lines, theme.background, content_width);
+                    push_spacing_lines(
+                        &mut lines,
+                        &mut line_to_message,
+                        message_gap_lines,
+                        theme.background,
+                        content_width,
+                    );
                 }
             }
             message_first_lines
@@ -656,7 +668,12 @@ impl SessionView {
                                             &mut lines,
                                             &mut line_to_message,
                                             &msg.id,
-                                            vec![paint_block_line(Line::from(""), message_bg, message_border, content_width)],
+                                            vec![paint_block_line(
+                                                Line::from(""),
+                                                message_bg,
+                                                message_border,
+                                                content_width,
+                                            )],
                                         );
                                     }
                                     let mut text_lines = super::session_text::render_text_part(
@@ -690,7 +707,12 @@ impl SessionView {
                                                 &mut lines,
                                                 &mut line_to_message,
                                                 &msg.id,
-                                                vec![paint_block_line(Line::from(""), message_bg, message_border, content_width)],
+                                                vec![paint_block_line(
+                                                    Line::from(""),
+                                                    message_bg,
+                                                    message_border,
+                                                    content_width,
+                                                )],
                                             );
                                         }
                                         let reasoning_id = format!("{}:{part_idx}", msg.id);
@@ -748,11 +770,16 @@ impl SessionView {
                                             &mut lines,
                                             &mut line_to_message,
                                             &msg.id,
-                                            vec![paint_block_line(Line::from(""), message_bg, message_border, content_width)],
+                                            vec![paint_block_line(
+                                                Line::from(""),
+                                                message_bg,
+                                                message_border,
+                                                content_width,
+                                            )],
                                         );
                                     }
-                                    let state = if let Some((_, is_error)) = tool_results.get(id) {
-                                        if *is_error {
+                                    let state = if let Some(info) = tool_results.get(id) {
+                                        if info.is_error {
                                             super::session_tool::ToolState::Failed
                                         } else {
                                             super::session_tool::ToolState::Completed
@@ -773,7 +800,14 @@ impl SessionView {
                                     );
                                     let painted_tool: Vec<Line<'static>> = tool_lines
                                         .into_iter()
-                                        .map(|l| paint_block_line(l, message_bg, message_border, content_width))
+                                        .map(|l| {
+                                            paint_block_line(
+                                                l,
+                                                message_bg,
+                                                message_border,
+                                                content_width,
+                                            )
+                                        })
                                         .collect();
                                     append_message_lines(
                                         &mut lines,
@@ -910,8 +944,7 @@ impl SessionView {
         // No outer Block border — each message line's paint_block_line already
         // includes its own gutter character and fills the full content_width,
         // so the colored background spans the entire area width.
-        let paragraph = Paragraph::new(lines)
-            .scroll((self.scroll_offset as u16, 0));
+        let paragraph = Paragraph::new(lines).scroll((self.scroll_offset as u16, 0));
 
         frame.render_widget(paragraph, messages_area);
         if let Some(scroll_area) = scrollbar_area {
@@ -1068,10 +1101,7 @@ fn push_spacing_lines(
     bg: Color,
     width: usize,
 ) {
-    let spacing = Line::from(Span::styled(
-        " ".repeat(width),
-        Style::default().bg(bg),
-    ));
+    let spacing = Line::from(Span::styled(" ".repeat(width), Style::default().bg(bg)));
     for _ in 0..count {
         lines.push(spacing.clone());
         line_to_message.push(None);
@@ -1315,7 +1345,7 @@ fn is_tool_result_carrier(message: &Message) -> bool {
 fn collect_assistant_tool_results(
     messages: &[Message],
     assistant_idx: usize,
-) -> HashMap<String, (String, bool)> {
+) -> HashMap<String, super::session_tool::ToolResultInfo> {
     let mut tool_results = HashMap::new();
 
     for (idx, message) in messages.iter().enumerate().skip(assistant_idx) {
@@ -1328,9 +1358,19 @@ fn collect_assistant_tool_results(
                 id,
                 result,
                 is_error,
+                title,
+                metadata,
             } = part
             {
-                tool_results.insert(id.clone(), (result.clone(), *is_error));
+                tool_results.insert(
+                    id.clone(),
+                    super::session_tool::ToolResultInfo {
+                        output: result.clone(),
+                        is_error: *is_error,
+                        title: title.clone(),
+                        metadata: metadata.clone(),
+                    },
+                );
             }
         }
     }
@@ -1523,6 +1563,8 @@ mod tests {
                 id: "call-1".to_string(),
                 result: "ok".to_string(),
                 is_error: false,
+                title: None,
+                metadata: None,
             }],
         );
         assert!(is_tool_result_carrier(&msg));
@@ -1548,6 +1590,8 @@ mod tests {
                     id: "call-1".to_string(),
                     result: "file_a\nfile_b".to_string(),
                     is_error: false,
+                    title: None,
+                    metadata: None,
                 }],
             ),
             message(
@@ -1566,6 +1610,8 @@ mod tests {
                     id: "call-2".to_string(),
                     result: "readme".to_string(),
                     is_error: false,
+                    title: None,
+                    metadata: None,
                 }],
             ),
         ];

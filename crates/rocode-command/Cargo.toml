@@ -1,6 +1,6 @@
 [package]
 name = "rocode-command"
-version = "2026.2.25"
+version = "2026.2.26"
 edition = "2021"
 
 [dependencies]

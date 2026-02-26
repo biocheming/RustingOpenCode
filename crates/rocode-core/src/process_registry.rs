@@ -226,8 +226,12 @@ fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
             };
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                let Some(pid_str) = name.to_str() else { continue };
-                let Ok(pid) = pid_str.parse::<u32>() else { continue };
+                let Some(pid_str) = name.to_str() else {
+                    continue;
+                };
+                let Ok(pid) = pid_str.parse::<u32>() else {
+                    continue;
+                };
                 if pid == root_pid || result.contains(&pid) {
                     continue;
                 }

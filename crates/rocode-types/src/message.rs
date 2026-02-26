@@ -10,6 +10,11 @@ pub struct SessionMessage {
     pub parts: Vec<MessagePart>,
     pub created_at: DateTime<Utc>,
     pub metadata: HashMap<String, serde_json::Value>,
+    /// The finish reason from the LLM provider (e.g. "stop", "tool-calls").
+    /// Set during streaming when FinishStep is received, mirroring TS
+    /// `assistantMessage.finish` in processor.ts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -101,6 +106,7 @@ impl SessionMessage {
             }],
             created_at: Utc::now(),
             metadata: HashMap::new(),
+            finish: None,
         }
     }
 
@@ -112,6 +118,7 @@ impl SessionMessage {
             parts: Vec::new(),
             created_at: Utc::now(),
             metadata: HashMap::new(),
+            finish: None,
         }
     }
 

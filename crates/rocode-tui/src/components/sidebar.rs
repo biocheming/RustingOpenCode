@@ -529,23 +529,41 @@ impl Sidebar {
                 };
                 let name_width = area.width.saturating_sub(18) as usize;
                 let stats = format!("{:4.1}% {:>3}MB", proc.cpu_percent, proc.memory_kb / 1024);
-                let fg = if selected { theme.text } else { theme.text_muted };
+                let fg = if selected {
+                    theme.text
+                } else {
+                    theme.text_muted
+                };
                 let row_bg = if selected {
                     Some(theme.background_element)
                 } else {
                     None
                 };
                 let mk_style = |base: Style| -> Style {
-                    if let Some(bg) = row_bg { base.bg(bg) } else { base }
+                    if let Some(bg) = row_bg {
+                        base.bg(bg)
+                    } else {
+                        base
+                    }
                 };
                 proc_lines.push(Line::from(vec![
-                    Span::styled(prefix, mk_style(Style::default().fg(if selected { theme.primary } else { theme.text_muted }))),
+                    Span::styled(
+                        prefix,
+                        mk_style(Style::default().fg(if selected {
+                            theme.primary
+                        } else {
+                            theme.text_muted
+                        })),
+                    ),
                     Span::styled("● ", mk_style(Style::default().fg(kind_color))),
                     Span::styled(
                         truncate_text(&proc.name, name_width),
                         mk_style(Style::default().fg(fg)),
                     ),
-                    Span::styled(format!(" {}", stats), mk_style(Style::default().fg(theme.text_muted))),
+                    Span::styled(
+                        format!(" {}", stats),
+                        mk_style(Style::default().fg(theme.text_muted)),
+                    ),
                 ]));
             }
             sections.push(SidebarSection {

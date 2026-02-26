@@ -1,6 +1,6 @@
 # rocode-core
 
-文档基线：v2026.2.25（更新日期：2026-02-25）
+文档基线：v2026.2.26（更新日期：2026-02-26）
 
 `rocode-core` 是工作区最底层的通用基础库，提供全局事件总线、ID 生成与进程注册能力。
 
@@ -18,11 +18,12 @@
 - `process_registry.rs`：跨模块进程注册、资源采样与终止
 - `lib.rs`：统一导出
 
-## 当前分支变化（v2026.2.25）
+## 当前分支变化（v2026.2.26）
 
 - 新增 `process_registry` 导出，统一跟踪 Plugin/Bash/Agent 子进程。
 - 进程信息包含 `pid/name/kind/started_at/cpu_percent/memory_kb`，供 TUI 侧栏实时展示。
 - Linux 下通过 `/proc` 聚合父子进程 CPU/内存；支持带 SIGTERM->SIGKILL 的终止流程。
+- 本轮补充了 `/proc` 子进程枚举路径的健壮性分支处理，避免目录项解析异常影响进程树采集。
 
 ## 依赖关系
 

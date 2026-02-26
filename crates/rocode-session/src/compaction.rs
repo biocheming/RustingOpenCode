@@ -11,7 +11,9 @@ use crate::message_v2::{
     AssistantTime, AssistantTokens, CacheTokens, CompletedTime, MessageInfo, MessagePath,
     MessageWithParts, ModelRef, Part, TextTime, ToolState, UserTime,
 };
-use rocode_provider::{ChatRequest, Content, ContentPart, ImageUrl, Message, Provider, Role, StreamResult};
+use rocode_provider::{
+    ChatRequest, Content, ContentPart, ImageUrl, Message, Provider, Role, StreamResult,
+};
 
 const COMPACTION_BUFFER: u64 = 20_000;
 const PRUNE_MINIMUM: u64 = 20_000;
@@ -646,7 +648,7 @@ When constructing the summary, try to stick to this template:
                     error = %e,
                     "Compaction provider stream failed"
                 );
-                Ok(CompactionResult::Stop)
+                Err(e.into())
             }
         }
     }
@@ -995,7 +997,10 @@ async fn collect_compaction_text(
                 return Err(anyhow::anyhow!("Compaction stream error: {}", err));
             }
             Err(err) => {
-                return Err(anyhow::anyhow!("Compaction provider stream failed: {}", err));
+                return Err(anyhow::anyhow!(
+                    "Compaction provider stream failed: {}",
+                    err
+                ));
             }
             _ => {}
         }
@@ -1120,6 +1125,7 @@ mod tests {
                     name: "Mock Model".to_string(),
                     provider: "mock".to_string(),
                     context_window,
+                    max_input_tokens: None,
                     max_output_tokens,
                     supports_vision: false,
                     supports_tools: false,

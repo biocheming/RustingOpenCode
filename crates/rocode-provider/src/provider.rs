@@ -13,6 +13,10 @@ pub struct ModelInfo {
     pub name: String,
     pub provider: String,
     pub context_window: u64,
+    /// Maximum input tokens the model accepts. When `None`, the compaction
+    /// system falls back to `context_window - max_output_tokens`.
+    #[serde(default)]
+    pub max_input_tokens: Option<u64>,
     pub max_output_tokens: u64,
     pub supports_vision: bool,
     pub supports_tools: bool,

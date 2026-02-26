@@ -4,7 +4,7 @@ use sqlx::{Sqlite, Transaction};
 use std::future::Future;
 use std::path::PathBuf;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -45,6 +45,20 @@ impl Database {
             .connect(&db_url)
             .await
             .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?;
+
+        // WAL mode allows concurrent reads during writes; NORMAL sync reduces fsync overhead.
+        if let Err(e) = sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await
+        {
+            warn!("failed to set journal_mode=WAL: {}", e);
+        }
+        if let Err(e) = sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(&pool)
+            .await
+        {
+            warn!("failed to set synchronous=NORMAL: {}", e);
+        }
 
         let db = Self { pool };
         db.run_migrations().await?;
@@ -101,10 +115,18 @@ impl Database {
         info!("Running database migrations");
 
         for migration in crate::schema::ALL_MIGRATIONS {
-            sqlx::query(migration)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| DatabaseError::MigrationError(e.to_string()))?;
+            match sqlx::query(migration).execute(&self.pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    // ALTER TABLE ADD COLUMN fails with "duplicate column" on
+                    // databases that already have the column — safe to ignore.
+                    if msg.contains("duplicate column") {
+                        continue;
+                    }
+                    return Err(DatabaseError::MigrationError(msg));
+                }
+            }
         }
 
         Ok(())

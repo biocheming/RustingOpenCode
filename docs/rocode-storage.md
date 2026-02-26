@@ -1,8 +1,15 @@
 # rocode-storage
 
-文档基线：v2026.2.25（更新日期：2026-02-25）
+文档基线：v2026.2.26（更新日期：2026-02-26）
 
 `rocode-storage` 提供 SQLite 持久化能力，封装数据库初始化与仓储访问。
+
+## 当前分支变化（v2026.2.26）
+
+- 数据库初始化新增 `PRAGMA journal_mode=WAL` 与 `PRAGMA synchronous=NORMAL`（失败仅告警），提升并发读写吞吐。
+- `SessionRepository` 新增 `upsert()` 与事务化 `flush_with_messages()`：单事务完成 session upsert、message upsert、stale message 对账删除。
+- `sync_sessions_to_storage()` 路径已统一复用事务 flush 逻辑，避免“删全量再逐条重建”的高收尾开销。
+- `messages` 表新增 `finish` 列，并通过迁移脚本兼容旧库；MessageRepository 已完成读写全链路支持。
 
 ## 主要职责
 

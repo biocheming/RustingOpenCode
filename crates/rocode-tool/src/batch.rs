@@ -25,15 +25,9 @@ pub struct BatchResult {
     pub tool: String,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachment: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<serde_json::Value>,
 }
 
 pub struct BatchTool;
@@ -121,11 +115,8 @@ impl Tool for BatchTool {
                     BatchResult {
                         tool: tool_name,
                         success: false,
-                        output: None,
-                        title: None,
                         error: Some(err_msg),
-                        metadata: None,
-                        attachment: None,
+                        attachments: Vec::new(),
                     }
                 }) as BatchFuture);
                 continue;
@@ -185,7 +176,8 @@ impl Tool for BatchTool {
                                             "input": tool_params,
                                             "output": res.output,
                                             "title": res.title,
-                                            "metadata": res.metadata,
+                                            "metadata": strip_attachments_from_metadata(&res.metadata),
+                                            "attachments": collect_attachments_from_metadata(&res.metadata),
                                             "time": {
                                                 "start": call_start_time,
                                                 "end": call_end_time
@@ -194,21 +186,13 @@ impl Tool for BatchTool {
                                     }))
                                     .await;
 
-                                let attachment = res.metadata.get("attachment").cloned();
-                                let metadata_value = if !res.metadata.is_empty() {
-                                    Some(serde_json::to_value(&res.metadata).ok()).flatten()
-                                } else {
-                                    None
-                                };
+                                let attachments = collect_attachments_from_metadata(&res.metadata);
 
                                 BatchResult {
                                     tool: tool_name,
                                     success: true,
-                                    output: Some(res.output),
-                                    title: Some(res.title),
                                     error: None,
-                                    metadata: metadata_value,
-                                    attachment,
+                                    attachments,
                                 }
                             }
                             Err(e) => {
@@ -241,11 +225,8 @@ impl Tool for BatchTool {
                                 BatchResult {
                                     tool: tool_name,
                                     success: false,
-                                    output: None,
-                                    title: None,
                                     error: Some(e.to_string()),
-                                    metadata: None,
-                                    attachment: None,
+                                    attachments: Vec::new(),
                                 }
                             }
                         }
@@ -260,11 +241,8 @@ impl Tool for BatchTool {
                         BatchResult {
                             tool: tool_name.clone(),
                             success: false,
-                            output: None,
-                            title: None,
                             error: Some(err_msg),
-                            metadata: None,
-                            attachment: None,
+                            attachments: Vec::new(),
                         }
                     }
                 };
@@ -281,14 +259,11 @@ impl Tool for BatchTool {
             final_results.push(BatchResult {
                 tool: "batch".to_string(),
                 success: false,
-                output: None,
-                title: None,
                 error: Some(format!(
                     "{} additional calls discarded (max {} per batch)",
                     discarded_count, MAX_BATCH_SIZE
                 )),
-                metadata: None,
-                attachment: None,
+                attachments: Vec::new(),
             });
         }
 
@@ -297,21 +272,24 @@ impl Tool for BatchTool {
 
         let output = if failed > 0 {
             format!(
-                "Batch execution: {}/{} tools succeeded. {} failed.\n\nResults:\n{}",
+                "Executed {}/{} tools successfully. {} failed.",
                 successful,
                 final_results.len(),
-                failed,
-                serde_json::to_string_pretty(&final_results).unwrap_or_default()
+                failed
             )
         } else {
             format!(
-                "All {} tools executed successfully.\n\nKeep using the batch tool for optimal performance!\n\nResults:\n{}",
-                successful,
-                serde_json::to_string_pretty(&final_results).unwrap_or_default()
+                "All {} tools executed successfully.\n\nKeep using the batch tool for optimal performance in your next response!",
+                successful
             )
         };
 
         let tools_list: Vec<&str> = final_results.iter().map(|r| r.tool.as_str()).collect();
+        let aggregated_attachments: Vec<serde_json::Value> = final_results
+            .iter()
+            .filter(|r| r.success)
+            .flat_map(|r| r.attachments.clone())
+            .collect();
 
         let mut metadata = Metadata::new();
         metadata.insert("total".to_string(), serde_json::json!(final_results.len()));
@@ -328,6 +306,12 @@ impl Tool for BatchTool {
                 }))
                 .collect::<Vec<_>>()),
         );
+        if !aggregated_attachments.is_empty() {
+            metadata.insert(
+                "attachments".to_string(),
+                serde_json::Value::Array(aggregated_attachments),
+            );
+        }
 
         Ok(ToolResult {
             output,
@@ -338,9 +322,30 @@ impl Tool for BatchTool {
     }
 }
 
+fn collect_attachments_from_metadata(metadata: &Metadata) -> Vec<serde_json::Value> {
+    let mut attachments = Vec::new();
+    if let Some(value) = metadata.get("attachments") {
+        if let Some(array) = value.as_array() {
+            attachments.extend(array.iter().cloned());
+        }
+    }
+    if let Some(value) = metadata.get("attachment") {
+        attachments.push(value.clone());
+    }
+    attachments
+}
+
+fn strip_attachments_from_metadata(metadata: &Metadata) -> Metadata {
+    let mut sanitized = metadata.clone();
+    sanitized.remove("attachments");
+    sanitized.remove("attachment");
+    sanitized
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BatchParams;
+    use super::{collect_attachments_from_metadata, strip_attachments_from_metadata, BatchParams};
+    use crate::Metadata;
 
     #[test]
     fn batch_params_accepts_camel_case_tool_calls() {
@@ -359,5 +364,40 @@ mod tests {
         let parsed: BatchParams =
             serde_json::from_value(serde_json::json!({})).expect("should parse empty object");
         assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn collect_attachments_reads_both_plural_and_singular_keys() {
+        let mut metadata = Metadata::new();
+        metadata.insert(
+            "attachments".to_string(),
+            serde_json::json!([{ "mime": "application/pdf", "url": "data:application/pdf;base64,AA==" }]),
+        );
+        metadata.insert(
+            "attachment".to_string(),
+            serde_json::json!({ "mime": "image/png", "url": "data:image/png;base64,BB==" }),
+        );
+
+        let attachments = collect_attachments_from_metadata(&metadata);
+        assert_eq!(attachments.len(), 2);
+    }
+
+    #[test]
+    fn strip_attachments_removes_attachment_payload_keys() {
+        let mut metadata = Metadata::new();
+        metadata.insert("foo".to_string(), serde_json::json!("bar"));
+        metadata.insert(
+            "attachments".to_string(),
+            serde_json::json!([{ "mime": "application/pdf", "url": "data:application/pdf;base64,AA==" }]),
+        );
+        metadata.insert(
+            "attachment".to_string(),
+            serde_json::json!({ "mime": "image/png", "url": "data:image/png;base64,BB==" }),
+        );
+
+        let sanitized = strip_attachments_from_metadata(&metadata);
+        assert_eq!(sanitized.get("foo").and_then(|v| v.as_str()), Some("bar"));
+        assert!(!sanitized.contains_key("attachments"));
+        assert!(!sanitized.contains_key("attachment"));
     }
 }

@@ -778,6 +778,7 @@ mod tests {
                 name: "Mock".to_string(),
                 provider: "mock".to_string(),
                 context_window: 8192,
+                max_input_tokens: None,
                 max_output_tokens: 1024,
                 supports_vision: false,
                 supports_tools: false,

@@ -232,7 +232,9 @@ impl McpTransport for HttpTransport {
                     match JsonRpcMessage::from_str(data) {
                         Ok(message) => {
                             if self.response_tx.send(message).is_err() {
-                                tracing::warn!("HttpTransport: response channel closed, dropping SSE message");
+                                tracing::warn!(
+                                    "HttpTransport: response channel closed, dropping SSE message"
+                                );
                                 break;
                             }
                         }
@@ -252,9 +254,7 @@ impl McpTransport for HttpTransport {
                     McpClientError::ProtocolError(format!("Failed to parse response: {}", e))
                 })?;
                 self.response_tx.send(message).map_err(|_| {
-                    McpClientError::TransportError(
-                        "HttpTransport: response channel closed".into(),
-                    )
+                    McpClientError::TransportError("HttpTransport: response channel closed".into())
                 })?;
             }
         }

@@ -862,9 +862,7 @@ fn part_to_info(part: &rocode_session::MessagePart) -> PartInfo {
                     .to_string(),
                 ),
                 raw: raw.clone(),
-                state: state
-                    .as_ref()
-                    .and_then(|s| serde_json::to_value(s).ok()),
+                state: state.as_ref().and_then(|s| serde_json::to_value(s).ok()),
             })
         } else {
             None
@@ -943,10 +941,15 @@ fn message_to_info(session_id: &str, message: &rocode_session::SessionMessage) -
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         finish: message
-            .metadata
-            .get("finish_reason")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+            .finish
+            .clone()
+            .or_else(|| {
+                message
+                    .metadata
+                    .get("finish_reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            }),
         error: message
             .metadata
             .get("error")
@@ -998,23 +1001,21 @@ fn session_parts_to_provider_content(
             }),
             rocode_session::PartType::ToolCall {
                 id, name, input, ..
-            } => {
-                Some(rocode_provider::ContentPart {
-                    content_type: "tool_use".to_string(),
-                    text: None,
-                    image_url: None,
-                    tool_use: Some(rocode_provider::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    }),
-                    tool_result: None,
-                    cache_control: None,
-                    filename: None,
-                    media_type: None,
-                    provider_options: None,
-                })
-            }
+            } => Some(rocode_provider::ContentPart {
+                content_type: "tool_use".to_string(),
+                text: None,
+                image_url: None,
+                tool_use: Some(rocode_provider::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }),
+                tool_result: None,
+                cache_control: None,
+                filename: None,
+                media_type: None,
+                provider_options: None,
+            }),
             rocode_session::PartType::ToolResult {
                 tool_call_id,
                 content,
@@ -1423,11 +1424,7 @@ async fn stream_message(
                 assistant_msg
                     .metadata
                     .insert("model_id".to_string(), serde_json::json!(&stream_model_id));
-                (
-                    history,
-                    assistant_msg.id.clone(),
-                    session.directory.clone(),
-                )
+                (history, assistant_msg.id.clone(), session.directory.clone())
             };
 
             send_sse_event(
@@ -1664,7 +1661,8 @@ async fn stream_message(
             }
 
             let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
-            let mut pending: Vec<(String, PendingToolCall)> = pending_tool_calls.into_iter().collect();
+            let mut pending: Vec<(String, PendingToolCall)> =
+                pending_tool_calls.into_iter().collect();
             pending.sort_by(|a, b| a.0.cmp(&b.0));
             for (id, pending) in pending {
                 let name = pending.name.unwrap_or_default();
@@ -1870,7 +1868,9 @@ async fn stream_message(
             .await;
         }
 
-        persist_sessions_if_enabled(&stream_state).await;
+        if let Err(err) = stream_state.flush_session_to_storage(&stream_session_id).await {
+            tracing::error!(session_id = %stream_session_id, %err, "failed to flush session to storage after stream");
+        }
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)))
@@ -1966,12 +1966,59 @@ async fn session_prompt(
         let (update_tx, mut update_rx) =
             tokio::sync::mpsc::unbounded_channel::<rocode_session::Session>();
         let update_state = task_state.clone();
+        let update_session_repo = task_state.session_repo.clone();
+        let update_message_repo = task_state.message_repo.clone();
+
+        // Coalescing persistence worker — only persists the latest snapshot, not every tick.
+        let persist_latest: Arc<tokio::sync::Mutex<Option<rocode_session::Session>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let persist_notify = Arc::new(Notify::new());
+        let persist_worker = {
+            let latest = persist_latest.clone();
+            let notify = persist_notify.clone();
+            let s_repo = update_session_repo.clone();
+            let m_repo = update_message_repo.clone();
+            tokio::spawn(async move {
+                loop {
+                    notify.notified().await;
+                    // Drain: grab the latest snapshot, leaving None.
+                    let snapshot = latest.lock().await.take();
+                    let Some(snapshot) = snapshot else { continue };
+                    if let (Some(s_repo), Some(m_repo)) = (&s_repo, &m_repo) {
+                        match serde_json::to_value(&snapshot) {
+                            Ok(val) => match serde_json::from_value::<rocode_types::Session>(val) {
+                                Ok(mut stored) => {
+                                    let messages = std::mem::take(&mut stored.messages);
+                                    if let Err(e) = s_repo.upsert(&stored).await {
+                                        tracing::warn!(session_id = %stored.id, %e, "incremental session upsert failed");
+                                    }
+                                    for msg in messages {
+                                        if let Err(e) = m_repo.upsert(&msg).await {
+                                            tracing::warn!(message_id = %msg.id, %e, "incremental message upsert failed");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(session_id = %snapshot.id, %e, "incremental persist: failed to deserialize session snapshot");
+                                }
+                            },
+                            Err(e) => {
+                                tracing::warn!(session_id = %snapshot.id, %e, "incremental persist: failed to serialize session snapshot");
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
         let mut update_task = tokio::spawn(async move {
             while let Some(snapshot) = update_rx.recv().await {
                 let snapshot_id = snapshot.id.clone();
+
+                // 1. Update in-memory state + WebSocket broadcast FIRST (low latency).
                 {
                     let mut sessions = update_state.sessions.lock().await;
-                    sessions.update(snapshot);
+                    sessions.update(snapshot.clone());
                 }
                 update_state.broadcast(
                     &serde_json::json!({
@@ -1981,8 +2028,16 @@ async fn session_prompt(
                     })
                     .to_string(),
                 );
+
+                // 2. Queue latest snapshot for async persistence (coalesced).
+                *persist_latest.lock().await = Some(snapshot);
+                persist_notify.notify_one();
             }
+            // Channel closed — signal persist worker to flush final snapshot.
+            persist_notify.notify_one();
         });
+        // Keep persist_worker handle at this scope so the outer timeout path can abort it.
+        let persist_worker_handle = persist_worker;
         let update_hook: rocode_session::SessionUpdateHook = Arc::new(move |snapshot| {
             let _ = update_tx.send(snapshot.clone());
         });
@@ -2010,14 +2065,16 @@ async fn session_prompt(
             Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>,
         > = {
             Some(Arc::new(move |name: &str| {
-                agent_registry.get(name).map(|info| rocode_tool::TaskAgentInfo {
-                    name: info.name.clone(),
-                    model: info.model.as_ref().map(|m| rocode_tool::TaskAgentModel {
-                        provider_id: m.provider_id.clone(),
-                        model_id: m.model_id.clone(),
-                    }),
-                    can_use_task: info.is_tool_allowed("task"),
-                })
+                agent_registry
+                    .get(name)
+                    .map(|info| rocode_tool::TaskAgentInfo {
+                        name: info.name.clone(),
+                        model: info.model.as_ref().map(|m| rocode_tool::TaskAgentModel {
+                            provider_id: m.provider_id.clone(),
+                            model_id: m.model_id.clone(),
+                        }),
+                        can_use_task: info.is_tool_allowed("task"),
+                    })
             }))
         };
 
@@ -2042,6 +2099,7 @@ async fn session_prompt(
                 "session prompt failed"
             );
             let assistant = session.add_assistant_message();
+            assistant.finish = Some("error".to_string());
             assistant
                 .metadata
                 .insert("error".to_string(), serde_json::json!(error.to_string()));
@@ -2074,6 +2132,12 @@ async fn session_prompt(
                 );
             }
         }
+        // Always clean up the persist worker — it may still be alive if update_task was aborted.
+        // Give it a brief window to flush the last queued snapshot, then abort.
+        if !persist_worker_handle.is_finished() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        persist_worker_handle.abort();
 
         {
             let mut sessions = task_state.sessions.lock().await;
@@ -2090,7 +2154,10 @@ async fn session_prompt(
         // Normal path reached — defuse the guard so we handle cleanup explicitly.
         _idle_guard.defuse();
         set_session_run_status(&task_state, &session_id, SessionRunStatus::Idle).await;
-        persist_sessions_if_enabled(&task_state).await;
+        // Only flush the current session — full sync is deferred to shutdown/startup.
+        if let Err(err) = task_state.flush_session_to_storage(&session_id).await {
+            tracing::error!(session_id = %session_id, %err, "failed to flush session to storage");
+        }
     });
 
     Ok(Json(serde_json::json!({

@@ -18,8 +18,25 @@ pub enum CustomEvent {
     StreamChunk(String),
     StreamComplete,
     StreamError(String),
-    ToolCallStart { id: String, name: String },
-    ToolCallComplete { id: String, result: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallComplete {
+        id: String,
+        result: String,
+    },
+    PromptDispatchHomeFinished {
+        optimistic_session_id: String,
+        optimistic_message_id: String,
+        created_session: Option<crate::api::SessionInfo>,
+        error: Option<String>,
+    },
+    PromptDispatchSessionFinished {
+        session_id: String,
+        optimistic_message_id: String,
+        error: Option<String>,
+    },
     StateChanged(StateChange),
 }
 

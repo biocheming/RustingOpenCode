@@ -164,4 +164,3 @@ pub(crate) async fn handle_stats_command(
 
     Ok(())
 }
-

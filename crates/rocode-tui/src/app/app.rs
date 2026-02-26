@@ -44,6 +44,7 @@ pub struct App {
     context: Arc<AppContext>,
     state: AppState,
     terminal: terminal::Tui,
+    event_tx: Sender<Event>,
     event_rx: Receiver<Event>,
     prompt: Prompt,
     selection: Selection,
@@ -184,6 +185,7 @@ impl App {
             context,
             state: AppState::default(),
             terminal,
+            event_tx,
             event_rx,
             prompt,
             selection: Selection::new(),
@@ -474,9 +476,7 @@ impl App {
                                         .kill(proc.pid);
                                     *self.context.processes.write() =
                                         rocode_core::process_registry::global_registry().list();
-                                    ss.clamp_process_selected(
-                                        self.context.processes.read().len(),
-                                    );
+                                    ss.clamp_process_selected(self.context.processes.read().len());
                                 }
                                 return Ok(());
                             }
@@ -760,6 +760,71 @@ impl App {
                 }
             }
             Event::Custom(event) => match event {
+                CustomEvent::PromptDispatchHomeFinished {
+                    optimistic_session_id,
+                    optimistic_message_id,
+                    created_session,
+                    error,
+                } => {
+                    if let Some(session) = created_session {
+                        self.promote_optimistic_session(optimistic_session_id, session);
+
+                        if let Route::Session { session_id: active } = self.context.current_route()
+                        {
+                            if active == *optimistic_session_id {
+                                self.context.navigate(Route::Session {
+                                    session_id: session.id.clone(),
+                                });
+                            }
+                        }
+                        self.ensure_session_view(&session.id);
+
+                        if let Some(err) = error {
+                            self.remove_optimistic_message(&session.id, optimistic_message_id);
+                            self.set_session_status(&session.id, SessionStatus::Idle);
+                            self.sync_prompt_spinner_state();
+                            self.alert_dialog
+                                .set_message(&format!("Failed to send prompt:\n{}", err));
+                            self.alert_dialog.open();
+                        } else {
+                            self.set_session_status(&session.id, SessionStatus::Running);
+                            self.prompt.set_spinner_task_kind(TaskKind::LlmRequest);
+                            self.prompt.set_spinner_active(true);
+                        }
+                    } else {
+                        self.remove_optimistic_session(optimistic_session_id);
+                        if let Route::Session { session_id: active } = self.context.current_route()
+                        {
+                            if active == *optimistic_session_id {
+                                self.context.navigate(Route::Home);
+                                self.active_session_id = None;
+                                self.session_view = None;
+                            }
+                        }
+                        self.prompt.set_spinner_active(false);
+                        if let Some(err) = error {
+                            self.alert_dialog
+                                .set_message(&format!("Failed to create session:\n{}", err));
+                            self.alert_dialog.open();
+                        }
+                    }
+                    self.event_caused_change = true;
+                }
+                CustomEvent::PromptDispatchSessionFinished {
+                    session_id,
+                    optimistic_message_id,
+                    error,
+                } => {
+                    if let Some(err) = error {
+                        self.remove_optimistic_message(session_id, optimistic_message_id);
+                        self.set_session_status(session_id, SessionStatus::Idle);
+                        self.sync_prompt_spinner_state();
+                        self.alert_dialog
+                            .set_message(&format!("Failed to send prompt:\n{}", err));
+                        self.alert_dialog.open();
+                    }
+                    self.event_caused_change = true;
+                }
                 CustomEvent::StateChanged(StateChange::SessionUpdated(session_id)) => {
                     if let Route::Session { session_id: active } = self.context.current_route() {
                         if active == *session_id {
@@ -1364,6 +1429,7 @@ impl App {
                         let model_ref = format!("{}/{}", provider, id);
                         self.model_select.push_recent(&provider, &id);
                         self.model_select.set_current_model(Some(model_ref.clone()));
+                        self.context.save_recent_models(self.model_select.recent());
                         self.set_active_model_selection(model_ref, Some(provider));
                     }
                     self.model_select.close();
@@ -2381,44 +2447,25 @@ impl App {
                 self.prompt.set_spinner_active(true);
                 // Render immediately so the user sees their message before network I/O.
                 let _ = self.draw();
-
-                let session = match client.create_session(None) {
-                    Ok(session) => session,
-                    Err(err) => {
-                        self.remove_optimistic_session(&optimistic_session_id);
-                        self.context.navigate(Route::Home);
-                        self.active_session_id = None;
-                        self.session_view = None;
-                        self.prompt.set_spinner_active(false);
-                        self.alert_dialog
-                            .set_message(&format!("Failed to create session:\n{}", err));
-                        self.alert_dialog.open();
-                        return Ok(());
-                    }
-                };
-                self.promote_optimistic_session(&optimistic_session_id, &session);
-                self.context.navigate(Route::Session {
-                    session_id: session.id.clone(),
+                let event_tx = self.event_tx.clone();
+                thread::spawn(move || {
+                    let (created_session, error) = match client.create_session(None) {
+                        Ok(session) => {
+                            let error = client
+                                .send_prompt(&session.id, input, agent, model, variant)
+                                .err()
+                                .map(|e| e.to_string());
+                            (Some(session), error)
+                        }
+                        Err(err) => (None, Some(err.to_string())),
+                    };
+                    let _ = event_tx.send(Event::Custom(CustomEvent::PromptDispatchHomeFinished {
+                        optimistic_session_id,
+                        optimistic_message_id: opt_id,
+                        created_session,
+                        error,
+                    }));
                 });
-                self.ensure_session_view(&session.id);
-                if let Err(err) = client.send_prompt(
-                    &session.id,
-                    input.clone(),
-                    agent.clone(),
-                    model.clone(),
-                    variant.clone(),
-                ) {
-                    self.remove_optimistic_message(&session.id, &opt_id);
-                    self.set_session_status(&session.id, SessionStatus::Idle);
-                    self.sync_prompt_spinner_state();
-                    self.alert_dialog
-                        .set_message(&format!("Failed to send prompt:\n{}", err));
-                    self.alert_dialog.open();
-                    return Ok(());
-                }
-                self.set_session_status(&session.id, SessionStatus::Running);
-                self.prompt.set_spinner_task_kind(TaskKind::LlmRequest);
-                self.prompt.set_spinner_active(true);
             }
             Route::Session { session_id } => {
                 // Optimistic: show user message immediately before network call
@@ -2435,21 +2482,19 @@ impl App {
                 self.ensure_session_view(&session_id);
                 // Render immediately so the user sees their message before network I/O.
                 let _ = self.draw();
-                if let Err(err) = client.send_prompt(
-                    &session_id,
-                    input.clone(),
-                    agent.clone(),
-                    model.clone(),
-                    variant.clone(),
-                ) {
-                    self.remove_optimistic_message(&session_id, &opt_id);
-                    self.set_session_status(&session_id, SessionStatus::Idle);
-                    self.sync_prompt_spinner_state();
-                    self.alert_dialog
-                        .set_message(&format!("Failed to send prompt:\n{}", err));
-                    self.alert_dialog.open();
-                    return Ok(());
-                }
+                let event_tx = self.event_tx.clone();
+                thread::spawn(move || {
+                    let error = client
+                        .send_prompt(&session_id, input, agent, model, variant)
+                        .err()
+                        .map(|e| e.to_string());
+                    let _ =
+                        event_tx.send(Event::Custom(CustomEvent::PromptDispatchSessionFinished {
+                            session_id,
+                            optimistic_message_id: opt_id,
+                            error,
+                        }));
+                });
             }
             _ => {}
         }
@@ -2620,6 +2665,9 @@ impl App {
             }
         });
         self.model_select.set_current_model(current_key);
+        // Restore persisted recent models
+        self.model_select
+            .set_recent(self.context.load_recent_models());
         self.available_models = available_models;
         self.model_variants = variant_map;
         self.model_variant_selection.retain(|model_key, variant| {
@@ -3645,6 +3693,8 @@ fn map_api_message_part(part: &crate::api::MessagePart) -> Option<ContextMessage
             id: tool_result.tool_call_id.clone(),
             result: tool_result.content.clone(),
             is_error: tool_result.is_error,
+            title: tool_result.title.clone(),
+            metadata: tool_result.metadata.clone(),
         });
     }
 

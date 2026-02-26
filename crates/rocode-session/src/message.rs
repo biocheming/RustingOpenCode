@@ -23,6 +23,10 @@ pub struct SessionMessage {
     pub metadata: HashMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<MessageUsage>,
+    /// The finish reason from the LLM provider (e.g. "stop", "tool-calls").
+    /// Set during streaming when FinishStep is received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -151,6 +155,7 @@ impl SessionMessage {
             created_at: Utc::now(),
             metadata: HashMap::new(),
             usage: None,
+            finish: None,
         }
     }
 
@@ -163,6 +168,7 @@ impl SessionMessage {
             created_at: Utc::now(),
             metadata: HashMap::new(),
             usage: None,
+            finish: None,
         }
     }
 
@@ -175,6 +181,7 @@ impl SessionMessage {
             created_at: Utc::now(),
             metadata: HashMap::new(),
             usage: None,
+            finish: None,
         }
     }
 

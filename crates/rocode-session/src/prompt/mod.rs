@@ -1,8 +1,28 @@
+pub mod compaction_helpers;
+pub(crate) mod hooks;
+pub mod shell;
+pub mod subtask;
+pub mod tools_and_output;
+
+pub use compaction_helpers::{should_compact, trigger_compaction};
+pub(crate) use hooks::{
+    apply_chat_message_hook_outputs, apply_chat_messages_hook_outputs, session_message_hook_payload,
+};
+pub use shell::{resolve_command_template, shell_exec, CommandInput, ShellInput};
+#[cfg(test)]
+pub(crate) use shell::resolve_shell_invocation;
+pub use subtask::{tool_definitions_from_schemas, SubtaskExecutor, ToolSchema};
+pub use tools_and_output::{
+    create_structured_output_tool, extract_structured_output, generate_session_title,
+    generate_session_title_llm, insert_reminders, max_steps_for_agent, merge_tool_definitions,
+    resolve_tools, resolve_tools_with_mcp, resolve_tools_with_mcp_registry,
+    structured_output_system_prompt, was_plan_agent, ResolvedTool, StructuredOutputConfig,
+};
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -985,18 +1005,16 @@ impl SessionPrompt {
 
             let mut filtered_messages = Self::filter_compacted_messages(&session.messages);
 
-            let last_user = filtered_messages
+            let last_user_idx = filtered_messages
                 .iter()
-                .rev()
-                .find(|m| matches!(m.role, MessageRole::User));
+                .rposition(|m| matches!(m.role, MessageRole::User));
 
-            let last_assistant = filtered_messages
+            let last_assistant_idx = filtered_messages
                 .iter()
-                .rev()
-                .find(|m| matches!(m.role, MessageRole::Assistant));
+                .rposition(|m| matches!(m.role, MessageRole::Assistant));
 
-            let last_user = match last_user {
-                Some(m) => m,
+            let last_user_idx = match last_user_idx {
+                Some(idx) => idx,
                 None => return Err(anyhow::anyhow!("No user message found")),
             };
 
@@ -1007,14 +1025,24 @@ impl SessionPrompt {
                 continue;
             }
 
-            if let Some(ref assistant) = last_assistant {
-                let has_finish = assistant.parts.iter().any(|p| match &p.part_type {
-                    PartType::Text { text, .. } => !text.is_empty(),
-                    _ => false,
+            // Early exit: if the last assistant message has a terminal finish
+            // reason (not "tool-calls"/"tool_calls"/"unknown") and it came after
+            // the last user message, the conversation turn is complete.
+            // Mirrors TS prompt.ts:318-325.
+            // Uses index position instead of ID comparison because user IDs
+            // (uuid v4) and assistant IDs (different generator) have no
+            // guaranteed lexicographic ordering.
+            if let Some(assistant_idx) = last_assistant_idx {
+                let assistant = &filtered_messages[assistant_idx];
+                let is_terminal = assistant.finish.as_deref().is_some_and(|f| {
+                    !matches!(f, "tool-calls" | "tool_calls" | "unknown")
                 });
 
-                if has_finish && last_user.id < assistant.id {
-                    tracing::info!("Prompt loop complete for session {}", session_id);
+                if is_terminal && last_user_idx < assistant_idx {
+                    tracing::info!(
+                        finish = ?assistant.finish,
+                        "Prompt loop complete for session {}", session_id
+                    );
                     break;
                 }
             }
@@ -1069,8 +1097,11 @@ impl SessionPrompt {
                         );
                     }
                     Ok(CompactionResult::Stop) => {
-                        tracing::info!("LLM compaction returned stop for session {}", session_id);
-                        break;
+                        tracing::warn!("LLM compaction returned stop for session {}, falling back to simple compaction", session_id);
+                        if let Some(summary) = Self::trigger_compaction(session, &filtered_messages)
+                        {
+                            tracing::info!("Fallback compaction (from stop) complete: {}", summary);
+                        }
                     }
                     Err(e) => {
                         // Fallback to simple text truncation if LLM compaction fails.
@@ -1167,6 +1198,7 @@ impl SessionPrompt {
                 created_at: chrono::Utc::now(),
                 metadata: assistant_metadata,
                 usage: None,
+                finish: None,
             });
             session.touch();
             Self::emit_session_update(update_hook.as_ref(), session);
@@ -1558,7 +1590,14 @@ impl SessionPrompt {
                             tool_calls_keys = %tool_calls.keys().cloned().collect::<Vec<_>>().join(","),
                             "[DIAG] FinishStep received"
                         );
-                        finish_reason = fr;
+                        finish_reason = fr.clone();
+                        // Persist finish reason on the assistant message itself,
+                        // mirroring TS processor.ts:250. The prompt loop's
+                        // early-exit check reads this field to decide whether
+                        // to continue (tool-calls) or break (stop/end_turn).
+                        if let Some(assistant) = session.messages.get_mut(assistant_index) {
+                            assistant.finish = fr;
+                        }
                         prompt_tokens = usage.prompt_tokens;
                         completion_tokens = usage.completion_tokens;
                     }
@@ -1584,6 +1623,16 @@ impl SessionPrompt {
                         if Self::has_tool_result_after(session, assistant_index, &tool_call_id) {
                             continue;
                         }
+                        let assistant_message_id = session
+                            .messages
+                            .get(assistant_index)
+                            .map(|m| m.id.clone())
+                            .unwrap_or_default();
+                        let (attachments, state_attachments) = Self::normalize_tool_attachments(
+                            output.attachments.clone(),
+                            &session_id,
+                            &assistant_message_id,
+                        );
                         if let Some(entry) = tool_calls.get_mut(&tool_call_id) {
                             if let Some(next_input) = input.clone() {
                                 entry.input = next_input;
@@ -1604,7 +1653,7 @@ impl SessionPrompt {
                                     end: chrono::Utc::now().timestamp_millis(),
                                     compacted: None,
                                 },
-                                attachments: None,
+                                attachments: state_attachments.clone(),
                             };
                             if let Some(assistant) = session.messages.get_mut(assistant_index) {
                                 Self::upsert_tool_call_part(
@@ -1624,7 +1673,7 @@ impl SessionPrompt {
                             false,
                             Some(output.title),
                             Some(output.metadata),
-                            output.attachments,
+                            attachments,
                         ));
                     }
                     Ok(StreamEvent::ToolError {
@@ -1907,7 +1956,7 @@ impl SessionPrompt {
 
             if !matches!(
                 finish_reason.as_deref(),
-                Some("tool-calls") | Some("tool_calls")
+                Some("tool-calls") | Some("tool_calls") | Some("unknown")
             ) {
                 tracing::info!(
                     "Prompt loop complete for session {} with finish: {:?}",
@@ -2074,6 +2123,126 @@ impl SessionPrompt {
             created_at: chrono::Utc::now(),
             message_id: None,
         });
+    }
+
+    fn take_attachment_values(
+        metadata: &mut HashMap<String, serde_json::Value>,
+    ) -> Option<Vec<serde_json::Value>> {
+        let mut attachments = Vec::new();
+
+        if let Some(value) = metadata.remove("attachments") {
+            match value {
+                serde_json::Value::Array(values) => attachments.extend(values),
+                serde_json::Value::Null => {}
+                other => attachments.push(other),
+            }
+        }
+
+        if let Some(value) = metadata.remove("attachment") {
+            if !value.is_null() {
+                attachments.push(value);
+            }
+        }
+
+        if attachments.is_empty() {
+            None
+        } else {
+            Some(attachments)
+        }
+    }
+
+    fn normalize_tool_attachments(
+        raw_attachments: Option<Vec<serde_json::Value>>,
+        session_id: &str,
+        message_id: &str,
+    ) -> (
+        Option<Vec<serde_json::Value>>,
+        Option<Vec<crate::message_v2::FilePart>>,
+    ) {
+        let mut normalized_json = Vec::new();
+        let mut normalized_files = Vec::new();
+
+        for value in raw_attachments.unwrap_or_default() {
+            let Some(obj) = value.as_object() else {
+                continue;
+            };
+
+            let Some(mime) = obj.get("mime").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(url) = obj.get("url").and_then(|v| v.as_str()) else {
+                continue;
+            };
+
+            let filename = obj
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| {
+                    rocode_core::id::create(rocode_core::id::Prefix::Part, true, None)
+                });
+            let normalized_session_id = obj
+                .get("sessionID")
+                .or_else(|| obj.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(session_id)
+                .to_string();
+            let normalized_message_id = obj
+                .get("messageID")
+                .or_else(|| obj.get("message_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(message_id)
+                .to_string();
+
+            let mut normalized = serde_json::Map::new();
+            normalized.insert("type".to_string(), serde_json::json!("file"));
+            normalized.insert("id".to_string(), serde_json::json!(id.clone()));
+            normalized.insert(
+                "sessionID".to_string(),
+                serde_json::json!(normalized_session_id.clone()),
+            );
+            normalized.insert(
+                "messageID".to_string(),
+                serde_json::json!(normalized_message_id.clone()),
+            );
+            normalized.insert("mime".to_string(), serde_json::json!(mime));
+            normalized.insert("url".to_string(), serde_json::json!(url));
+            if let Some(name) = filename.clone() {
+                normalized.insert("filename".to_string(), serde_json::json!(name));
+            }
+
+            normalized_json.push(serde_json::Value::Object(normalized));
+            normalized_files.push(crate::message_v2::FilePart {
+                id,
+                session_id: normalized_session_id,
+                message_id: normalized_message_id,
+                mime: mime.to_string(),
+                url: url.to_string(),
+                filename,
+                source: None,
+            });
+        }
+
+        (
+            (!normalized_json.is_empty()).then_some(normalized_json),
+            (!normalized_files.is_empty()).then_some(normalized_files),
+        )
+    }
+
+    fn extract_tool_attachments_from_metadata(
+        metadata: &mut HashMap<String, serde_json::Value>,
+        session_id: &str,
+        message_id: &str,
+    ) -> (
+        Option<Vec<serde_json::Value>>,
+        Option<Vec<crate::message_v2::FilePart>>,
+    ) {
+        let raw_attachments = Self::take_attachment_values(metadata);
+        Self::normalize_tool_attachments(raw_attachments, session_id, message_id)
     }
 
     fn has_unresolved_tool_calls(message: &SessionMessage) -> bool {
@@ -2484,22 +2653,34 @@ impl SessionPrompt {
                         .await;
                 }
 
-                let (content, is_error, title, metadata, attachments) = match execution {
-                    Ok(result) => (
-                        result.output,
-                        false,
-                        Some(result.title),
-                        Some(result.metadata),
-                        None,
-                    ),
-                    Err(e) => (
-                        format!("Error: {}", e),
-                        true,
-                        Some("Tool Error".to_string()),
-                        None,
-                        None,
-                    ),
-                };
+                let (content, is_error, title, metadata, attachments, state_attachments) =
+                    match execution {
+                        Ok(result) => {
+                            let mut metadata = result.metadata;
+                            let (attachments, state_attachments) =
+                                Self::extract_tool_attachments_from_metadata(
+                                    &mut metadata,
+                                    &ctx.session_id,
+                                    &ctx.message_id,
+                                );
+                            (
+                                result.output,
+                                false,
+                                Some(result.title),
+                                Some(metadata),
+                                attachments,
+                                state_attachments,
+                            )
+                        }
+                        Err(e) => (
+                            format!("Error: {}", e),
+                            true,
+                            Some("Tool Error".to_string()),
+                            None,
+                            None,
+                            None,
+                        ),
+                    };
 
                 Self::push_tool_result_part(
                     &mut msg,
@@ -2535,7 +2716,7 @@ impl SessionPrompt {
                                 end: now,
                                 compacted: None,
                             },
-                            attachments: None,
+                            attachments: state_attachments.clone(),
                         }
                     };
                     Self::upsert_tool_call_part(
@@ -3020,12 +3201,13 @@ impl SessionPrompt {
                         serde_json::json!(usage.completion_tokens),
                     );
                 }
-                if let Some(reason) = finish_reason {
+                if let Some(ref reason) = finish_reason {
                     m.insert("finish_reason".to_string(), serde_json::json!(reason));
                 }
                 m
             },
             usage: None,
+            finish: finish_reason,
         }
     }
 
@@ -3275,7 +3457,7 @@ impl SessionPrompt {
             context: model
                 .map(|info| info.context_window)
                 .unwrap_or_else(|| get_model_context_limit(model_id)),
-            max_input: None,
+            max_input: model.and_then(|info| info.max_input_tokens),
             max_output: max_output_tokens
                 .or_else(|| model.map(|info| info.max_output_tokens))
                 .unwrap_or(8192),
@@ -3285,15 +3467,34 @@ impl SessionPrompt {
             return true;
         }
 
+        // Estimate total content size across ALL part types (not just text).
+        // This catches large tool results and tool call inputs that the
+        // token-based check misses (it relies on cached API response counts).
         let total_chars: usize = messages
             .iter()
             .flat_map(|m| m.parts.iter())
-            .filter_map(|p| match &p.part_type {
-                PartType::Text { text, .. } => Some(text.len()),
-                _ => None,
+            .map(|p| match &p.part_type {
+                PartType::Text { text, .. } => text.len(),
+                PartType::ToolResult { content, title, .. } => {
+                    content.len() + title.as_ref().map_or(0, |t| t.len())
+                }
+                PartType::ToolCall { input, raw, .. } => {
+                    let input_len = serde_json::to_string(input).map_or(0, |s| s.len());
+                    input_len + raw.as_ref().map_or(0, |r| r.len())
+                }
+                PartType::Reasoning { text } => text.len(),
+                _ => 0,
             })
             .sum();
 
+        // Hard cap: 5MB of content to stay under typical 6MB API body limits
+        // (leaves ~1MB for JSON overhead, tool definitions, system prompt).
+        const MAX_BODY_CHARS: usize = 5_000_000;
+        if total_chars > MAX_BODY_CHARS {
+            return true;
+        }
+
+        // Softer cap based on estimated token count.
         const MAX_CONTEXT_CHARS: usize = 200_000;
         total_chars > MAX_CONTEXT_CHARS
     }
@@ -3332,6 +3533,7 @@ impl SessionPrompt {
                 bool,
                 Option<String>,
                 Option<HashMap<String, serde_json::Value>>,
+                Option<Vec<serde_json::Value>>,
             ),
         > = messages
             .iter()
@@ -3343,10 +3545,16 @@ impl SessionPrompt {
                     is_error,
                     title,
                     metadata,
-                    ..
+                    attachments,
                 } => Some((
                     tool_call_id.clone(),
-                    (content.clone(), *is_error, title.clone(), metadata.clone()),
+                    (
+                        content.clone(),
+                        *is_error,
+                        title.clone(),
+                        metadata.clone(),
+                        attachments.clone(),
+                    ),
                 )),
                 _ => None,
             })
@@ -3406,6 +3614,8 @@ impl SessionPrompt {
                                 status,
                                 raw.as_deref().unwrap_or_default(),
                                 legacy_tool_results.get(id),
+                                &msg.session_id,
+                                &msg.id,
                             )
                         });
                         Some(V2Part::Tool(crate::message_v2::ToolPart {
@@ -3457,9 +3667,13 @@ impl SessionPrompt {
                     session_id: msg.session_id.clone(),
                     message_id: msg.id.clone(),
                     reason: msg
-                        .metadata
-                        .get("finish_reason")
-                        .and_then(|v| v.as_str())
+                        .finish
+                        .as_deref()
+                        .or_else(|| {
+                            msg.metadata
+                                .get("finish_reason")
+                                .and_then(|v| v.as_str())
+                        })
                         .unwrap_or("stop")
                         .to_string(),
                     snapshot: Some(snapshot.to_string()),
@@ -3590,10 +3804,14 @@ impl SessionPrompt {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
                         finish: msg
-                            .metadata
-                            .get("finish_reason")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
+                            .finish
+                            .clone()
+                            .or_else(|| {
+                                msg.metadata
+                                    .get("finish_reason")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            }),
                     }
                 }
             };
@@ -3615,7 +3833,10 @@ impl SessionPrompt {
             bool,
             Option<String>,
             Option<HashMap<String, serde_json::Value>>,
+            Option<Vec<serde_json::Value>>,
         )>,
+        session_id: &str,
+        message_id: &str,
     ) -> crate::ToolState {
         let now = chrono::Utc::now().timestamp_millis();
         match status {
@@ -3630,15 +3851,32 @@ impl SessionPrompt {
                 time: crate::RunningTime { start: now },
             },
             crate::ToolCallStatus::Completed => {
-                let (output, title, metadata) = tool_result
-                    .map(|(content, _, title, metadata)| {
+                let (output, title, mut metadata, part_attachments) = tool_result
+                    .map(|(content, _, title, metadata, attachments)| {
                         (
                             content.clone(),
                             title.clone().unwrap_or_else(|| tool_name.to_string()),
                             metadata.clone().unwrap_or_default(),
+                            attachments.clone(),
                         )
                     })
-                    .unwrap_or_else(|| (String::new(), tool_name.to_string(), HashMap::new()));
+                    .unwrap_or_else(|| {
+                        (String::new(), tool_name.to_string(), HashMap::new(), None)
+                    });
+
+                let mut merged_attachments = Vec::new();
+                if let Some(values) = part_attachments {
+                    merged_attachments.extend(values);
+                }
+                if let Some(values) = Self::take_attachment_values(&mut metadata) {
+                    merged_attachments.extend(values);
+                }
+                let (_, normalized_attachments) = Self::normalize_tool_attachments(
+                    (!merged_attachments.is_empty()).then_some(merged_attachments),
+                    session_id,
+                    message_id,
+                );
+
                 crate::ToolState::Completed {
                     input: input.clone(),
                     output,
@@ -3649,12 +3887,12 @@ impl SessionPrompt {
                         end: now,
                         compacted: None,
                     },
-                    attachments: None,
+                    attachments: normalized_attachments,
                 }
             }
             crate::ToolCallStatus::Error => {
                 let error = tool_result
-                    .map(|(content, _, _, _)| content.clone())
+                    .map(|(content, _, _, _, _)| content.clone())
                     .unwrap_or_else(|| format!("Tool execution failed: {}", tool_call_id));
                 crate::ToolState::Error {
                     input: input.clone(),
@@ -3928,794 +4166,11 @@ pub fn extract_file_references(template: &str) -> Vec<String> {
     result
 }
 
-pub fn tool_definitions_from_schemas(schemas: Vec<ToolSchema>) -> Vec<ToolDefinition> {
-    schemas
-        .into_iter()
-        .map(|s| ToolDefinition {
-            name: s.name,
-            description: Some(s.description),
-            parameters: s.parameters,
-        })
-        .collect()
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolSchema {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-}
-
-pub struct SubtaskExecutor {
-    pub agent_name: String,
-    pub prompt: String,
-    pub description: Option<String>,
-    pub model: Option<ModelRef>,
-    pub agent_params: AgentParams,
-}
-
-impl SubtaskExecutor {
-    pub fn new(agent_name: &str, prompt: &str) -> Self {
-        Self {
-            agent_name: agent_name.to_string(),
-            prompt: prompt.to_string(),
-            description: None,
-            model: None,
-            agent_params: AgentParams::default(),
-        }
-    }
-
-    pub fn with_description(mut self, description: &str) -> Self {
-        self.description = Some(description.to_string());
-        self
-    }
-
-    pub fn with_model(mut self, model: ModelRef) -> Self {
-        self.model = Some(model);
-        self
-    }
-
-    pub async fn execute(
-        &self,
-        provider: Arc<dyn Provider>,
-        tool_registry: &rocode_tool::ToolRegistry,
-        ctx: &rocode_tool::ToolContext,
-    ) -> anyhow::Result<String> {
-        let model = self.model.as_ref().cloned().unwrap_or(ModelRef {
-            provider_id: "default".to_string(),
-            model_id: "default".to_string(),
-        });
-        let model_ref = format!("{}:{}", model.provider_id, model.model_id);
-        let title = self
-            .description
-            .clone()
-            .unwrap_or_else(|| "Subtask".to_string());
-
-        let subsession_id = ctx
-            .do_create_subsession(
-                self.agent_name.clone(),
-                Some(title.clone()),
-                Some(model_ref),
-                vec!["todowrite".to_string(), "todoread".to_string()],
-            )
-            .await
-            .unwrap_or_else(|_| format!("task_{}_{}", self.agent_name, uuid::Uuid::new_v4()));
-
-        if let Ok(output) = ctx
-            .do_prompt_subsession(subsession_id.clone(), self.prompt.clone())
-            .await
-        {
-            return Ok(format!(
-                "task_id: {} (for resuming to continue this task if needed)\n\n<task_result>\n{}\n</task_result>",
-                subsession_id, output
-            ));
-        }
-
-        let output = self.execute_inline(provider, tool_registry, &[]).await?;
-        Ok(format!(
-            "task_id: {} (for resuming to continue this task if needed)\n\n<task_result>\n{}\n</task_result>",
-            subsession_id, output
-        ))
-    }
-
-    pub async fn execute_inline(
-        &self,
-        provider: Arc<dyn Provider>,
-        tool_registry: &rocode_tool::ToolRegistry,
-        disabled_tools: &[String],
-    ) -> anyhow::Result<String> {
-        let model = self.model.as_ref().cloned().unwrap_or(ModelRef {
-            provider_id: "default".to_string(),
-            model_id: "default".to_string(),
-        });
-        let disabled: HashSet<&str> = disabled_tools.iter().map(|s| s.as_str()).collect();
-        let tools = tool_registry.list_schemas().await;
-        let tool_defs: Vec<ToolDefinition> = tools
-            .into_iter()
-            .filter(|s| !disabled.contains(s.name.as_str()))
-            .map(|s| ToolDefinition {
-                name: s.name,
-                description: Some(s.description),
-                parameters: s.parameters,
-            })
-            .collect();
-
-        let messages = vec![Message::user(&self.prompt)];
-
-        let request = ChatRequest {
-            model: model.model_id,
-            messages,
-            max_tokens: Some(self.agent_params.max_tokens.unwrap_or(8192)),
-            temperature: self.agent_params.temperature,
-            system: None,
-            tools: Some(tool_defs),
-            stream: Some(false),
-            top_p: self.agent_params.top_p,
-            variant: None,
-            provider_options: None,
-        };
-
-        let response = provider.chat(request).await?;
-
-        let output = response
-            .choices
-            .first()
-            .and_then(|c| match &c.message.content {
-                Content::Text(text) => Some(text.clone()),
-                Content::Parts(parts) => parts.first().and_then(|p| p.text.clone()),
-            })
-            .unwrap_or_default();
-
-        Ok(output)
-    }
-}
-
-fn hook_payload_object(
-    payload: &serde_json::Value,
-) -> Option<&serde_json::Map<String, serde_json::Value>> {
-    payload
-        .get("output")
-        .and_then(|value| value.as_object())
-        .or_else(|| payload.as_object())
-        .or_else(|| payload.get("data").and_then(|value| value.as_object()))
-}
-
-fn session_message_hook_payload(message: &SessionMessage) -> serde_json::Value {
-    let mut payload = serde_json::to_value(message).unwrap_or_else(|_| serde_json::json!({}));
-    let Some(object) = payload.as_object_mut() else {
-        return payload;
-    };
-
-    object.insert(
-        "info".to_string(),
-        serde_json::json!({
-            "id": message.id,
-            "sessionID": message.session_id,
-            "role": hook_message_role(&message.role),
-            "time": { "created": message.created_at.timestamp_millis() },
-        }),
-    );
-
-    payload
-}
-
-fn hook_message_role(role: &crate::MessageRole) -> &'static str {
-    match role {
-        crate::MessageRole::User => "user",
-        crate::MessageRole::Assistant => "assistant",
-        crate::MessageRole::System => "system",
-        crate::MessageRole::Tool => "tool",
-    }
-}
-
-fn apply_chat_messages_hook_outputs(
-    messages: &mut Vec<SessionMessage>,
-    hook_outputs: Vec<rocode_plugin::HookOutput>,
-) {
-    for output in hook_outputs {
-        let Some(payload) = output.payload.as_ref() else {
-            continue;
-        };
-        let Some(object) = hook_payload_object(payload) else {
-            continue;
-        };
-        let Some(next_messages) = object.get("messages").and_then(|value| value.as_array()) else {
-            continue;
-        };
-        let parsed = serde_json::from_value::<Vec<SessionMessage>>(serde_json::Value::Array(
-            next_messages.clone(),
-        ));
-        if let Ok(next) = parsed {
-            *messages = next;
-        }
-    }
-}
-
-fn apply_chat_message_hook_outputs(
-    message: &mut SessionMessage,
-    hook_outputs: Vec<rocode_plugin::HookOutput>,
-) {
-    for output in hook_outputs {
-        let Some(payload) = output.payload.as_ref() else {
-            continue;
-        };
-        let Some(object) = hook_payload_object(payload) else {
-            continue;
-        };
-        if let Some(next_message) = object.get("message") {
-            if let Ok(parsed) = serde_json::from_value::<SessionMessage>(next_message.clone()) {
-                *message = parsed;
-            }
-        }
-        if let Some(next_parts) = object.get("parts").and_then(|value| value.as_array()) {
-            let parsed = serde_json::from_value::<Vec<crate::MessagePart>>(
-                serde_json::Value::Array(next_parts.clone()),
-            );
-            if let Ok(parts) = parsed {
-                message.parts = parts;
-            }
-        }
-    }
-}
-
-pub fn should_compact(messages: &[SessionMessage], max_tokens: u64) -> bool {
-    let total_chars: usize = messages
-        .iter()
-        .map(|m| {
-            m.parts
-                .iter()
-                .filter_map(|p| match &p.part_type {
-                    PartType::Text { text, .. } => Some(text.len()),
-                    _ => None,
-                })
-                .sum::<usize>()
-        })
-        .sum();
-
-    let estimated_tokens = total_chars / 4;
-    estimated_tokens > max_tokens as usize
-}
-
-pub fn trigger_compaction(session: &mut Session, messages: &[SessionMessage]) -> Option<String> {
-    if !should_compact(messages, 100000) {
-        return None;
-    }
-
-    let text_content: String = messages
-        .iter()
-        .rev()
-        .take(10)
-        .flat_map(|m| {
-            m.parts.iter().filter_map(|p| match &p.part_type {
-                PartType::Text { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let summary = format!(
-        "[Context Compaction Triggered]\nRecent messages summarized:\n{}",
-        &text_content[..text_content.len().min(500)]
-    );
-
-    // Persist the compaction summary as a Compaction part on a new assistant message.
-    let mut compaction_msg = SessionMessage::assistant(session.id.clone());
-    compaction_msg.parts.push(crate::MessagePart {
-        id: format!("prt_{}", uuid::Uuid::new_v4()),
-        part_type: PartType::Compaction {
-            summary: summary.clone(),
-        },
-        created_at: chrono::Utc::now(),
-        message_id: None,
-    });
-    session.messages.push(compaction_msg);
-
-    // Set the compacting timestamp on the session.
-    session.time.compacting = Some(chrono::Utc::now().timestamp_millis());
-    session.touch();
-
-    Some(summary)
-}
-
-// Additional prompt functions for advanced features
-
-const STRUCTURED_OUTPUT_DESCRIPTION: &str = r#"Use this tool to return your final response in the requested structured format.
-
-IMPORTANT:
-- You MUST call this tool exactly once at the end of your response
-- The input must be valid JSON matching the required schema
-- Complete all necessary research and tool calls BEFORE calling this tool
-- This tool provides your final answer - no further actions are taken after calling it"#;
-
-const STRUCTURED_OUTPUT_SYSTEM_PROMPT: &str = r#"IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema."#;
-
-pub struct StructuredOutputConfig {
-    pub schema: serde_json::Value,
-}
-
-pub fn create_structured_output_tool(schema: serde_json::Value) -> ToolDefinition {
-    let mut tool_schema = schema;
-    if let Some(obj) = tool_schema.as_object_mut() {
-        obj.remove("$schema");
-    }
-
-    ToolDefinition {
-        name: "StructuredOutput".to_string(),
-        description: Some(STRUCTURED_OUTPUT_DESCRIPTION.to_string()),
-        parameters: tool_schema,
-    }
-}
-
-pub fn structured_output_system_prompt() -> String {
-    STRUCTURED_OUTPUT_SYSTEM_PROMPT.to_string()
-}
-
-pub fn extract_structured_output(parts: &[crate::MessagePart]) -> Option<serde_json::Value> {
-    for part in parts {
-        if let PartType::ToolCall { name, input, .. } = &part.part_type {
-            if name == "StructuredOutput" {
-                return Some(input.clone());
-            }
-        }
-    }
-    None
-}
-
-const PROMPT_PLAN: &str = r#"You are in PLAN mode. The user wants you to create a plan before executing.
-
-## Your task:
-1. Understand the user's request thoroughly
-2. Explore the codebase to understand the current state
-3. Create a detailed plan in the plan file
-4. Use the plan_exit tool when done planning
-
-## Important:
-- Do NOT make any edits or run commands (except read operations)
-- Only create/modify the plan file
-- Ask clarifying questions if needed
-- Use explore subagent to understand the codebase"#;
-
-const BUILD_SWITCH: &str = r#"The user has approved your plan and wants you to execute it.
-
-## Your task:
-1. Execute the plan step by step
-2. Make the necessary changes to the codebase
-3. Test your changes
-4. Verify the implementation matches the plan
-
-## Important:
-- You may now use all tools including edit, write, bash
-- Follow the plan closely but adapt as needed
-- Report progress to the user"#;
-
-pub fn insert_reminders(
-    messages: &[SessionMessage],
-    agent_name: &str,
-    was_plan: bool,
-) -> Vec<SessionMessage> {
-    let last_user_idx = messages
-        .iter()
-        .rposition(|m| matches!(m.role, MessageRole::User));
-
-    if let Some(idx) = last_user_idx {
-        let mut messages = messages.to_vec();
-
-        if agent_name == "plan" {
-            let reminder_text = PROMPT_PLAN.to_string();
-            messages[idx].parts.push(crate::MessagePart {
-                id: format!("prt_{}", uuid::Uuid::new_v4()),
-                part_type: PartType::Text {
-                    text: reminder_text,
-                    synthetic: None,
-                    ignored: None,
-                },
-                created_at: chrono::Utc::now(),
-                message_id: None,
-            });
-        }
-
-        if was_plan && agent_name == "build" {
-            let reminder_text = BUILD_SWITCH.to_string();
-            messages[idx].parts.push(crate::MessagePart {
-                id: format!("prt_{}", uuid::Uuid::new_v4()),
-                part_type: PartType::Text {
-                    text: reminder_text,
-                    synthetic: None,
-                    ignored: None,
-                },
-                created_at: chrono::Utc::now(),
-                message_id: None,
-            });
-        }
-
-        messages
-    } else {
-        messages.to_vec()
-    }
-}
-
-pub fn was_plan_agent(messages: &[SessionMessage]) -> bool {
-    messages.iter().any(|m| {
-        if let Some(agent) = m.metadata.get("agent") {
-            agent.as_str() == Some("plan")
-        } else {
-            false
-        }
-    })
-}
-
-pub struct ResolvedTool {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-}
-
-pub fn merge_tool_definitions(
-    base: Vec<ToolDefinition>,
-    extra: Vec<ToolDefinition>,
-) -> Vec<ToolDefinition> {
-    let mut merged: HashMap<String, ToolDefinition> = HashMap::new();
-    for tool in base.into_iter().chain(extra) {
-        merged.insert(tool.name.clone(), tool);
-    }
-
-    let mut tools: Vec<ToolDefinition> = merged.into_values().collect();
-    tools.sort_by(|a, b| a.name.cmp(&b.name));
-    tools
-}
-
-pub async fn resolve_tools_with_mcp(
-    tool_registry: &rocode_tool::ToolRegistry,
-    mcp_tools: Vec<ToolDefinition>,
-) -> Vec<ToolDefinition> {
-    let base = tool_registry
-        .list_schemas()
-        .await
-        .into_iter()
-        .map(|s| ToolDefinition {
-            name: s.name,
-            description: Some(s.description),
-            parameters: s.parameters,
-        })
-        .collect();
-
-    merge_tool_definitions(base, mcp_tools)
-}
-
-pub async fn resolve_tools_with_mcp_registry(
-    tool_registry: &rocode_tool::ToolRegistry,
-    mcp_registry: Option<&rocode_mcp::McpToolRegistry>,
-) -> Vec<ToolDefinition> {
-    let dynamic_mcp_tools = if let Some(registry) = mcp_registry {
-        registry
-            .list()
-            .await
-            .into_iter()
-            .map(|tool| ToolDefinition {
-                name: tool.full_name,
-                description: tool.description,
-                parameters: tool.input_schema,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    resolve_tools_with_mcp(tool_registry, dynamic_mcp_tools).await
-}
-
-pub async fn resolve_tools(tool_registry: &rocode_tool::ToolRegistry) -> Vec<ToolDefinition> {
-    resolve_tools_with_mcp_registry(tool_registry, None).await
-}
-
-pub fn max_steps_for_agent(agent_steps: Option<u32>) -> u32 {
-    agent_steps.unwrap_or(MAX_STEPS)
-}
-
-pub fn generate_session_title(first_user_message: &str) -> String {
-    let first_line = first_user_message.lines().next().unwrap_or("").trim();
-
-    if first_line.len() > 100 {
-        format!("{}...", &first_line[..97])
-    } else if first_line.is_empty() {
-        "New Session".to_string()
-    } else {
-        first_line.to_string()
-    }
-}
-
-/// Generate a session title using an LLM (matching TS `ensureTitle`).
-/// Falls back to `generate_session_title` on any failure.
-pub async fn generate_session_title_llm(
-    first_user_message: &str,
-    provider: Arc<dyn Provider>,
-    model_id: &str,
-) -> String {
-    let fallback = generate_session_title(first_user_message);
-
-    let request = ChatRequest {
-        model: model_id.to_string(),
-        messages: vec![Message {
-            role: Role::User,
-            content: Content::Text(format!(
-                "Generate a short title (under 80 chars) for this conversation. \
-                     Reply with ONLY the title, no quotes or explanation.\n\n{}",
-                first_user_message
-            )),
-            cache_control: None,
-            provider_options: None,
-        }],
-        tools: None,
-        system: Some(
-            "You generate concise conversation titles. Reply with only the title.".to_string(),
-        ),
-        max_tokens: Some(100),
-        temperature: Some(0.0),
-        top_p: None,
-        stream: None,
-        provider_options: None,
-        variant: None,
-    };
-
-    match provider.chat(request).await {
-        Ok(response) => {
-            // Extract text from the first choice
-            let text = response
-                .choices
-                .first()
-                .map(|c| match &c.message.content {
-                    Content::Text(t) => t.clone(),
-                    Content::Parts(parts) => parts
-                        .iter()
-                        .filter_map(|p| p.text.clone())
-                        .collect::<Vec<_>>()
-                        .join(""),
-                })
-                .unwrap_or_default();
-
-            // Clean up: remove thinking tags, take first non-empty line
-            let cleaned = text
-                .replace(|c: char| c == '"' || c == '\'', "")
-                .lines()
-                .map(|l| l.trim())
-                .find(|l| !l.is_empty() && !l.starts_with("<think>"))
-                .unwrap_or("")
-                .to_string();
-
-            if cleaned.is_empty() {
-                fallback
-            } else if cleaned.len() > 100 {
-                format!("{}...", &cleaned[..97])
-            } else {
-                cleaned
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to generate title via LLM, using fallback");
-            fallback
-        }
-    }
-}
-
-/// Input for the `shell()` function.
-#[derive(Debug, Clone)]
-pub struct ShellInput {
-    pub session_id: String,
-    pub command_str: String,
-    pub agent: Option<String>,
-    pub model: Option<ModelRef>,
-    pub abort: Option<CancellationToken>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ShellInvocation {
-    program: String,
-    args: Vec<String>,
-}
-
-fn resolve_shell_invocation(shell_env: Option<&str>, command: &str) -> ShellInvocation {
-    let shell = shell_env
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("/bin/bash")
-        .to_string();
-    let shell_name = Path::new(&shell)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let escaped = serde_json::to_string(command).unwrap_or_else(|_| "\"\"".to_string());
-
-    let args = match shell_name.as_str() {
-        "nu" | "fish" => vec!["-c".to_string(), command.to_string()],
-        "zsh" => vec![
-            "-c".to_string(),
-            "-l".to_string(),
-            format!(
-                r#"
-[[ -f ~/.zshenv ]] && source ~/.zshenv >/dev/null 2>&1 || true
-[[ -f "${{ZDOTDIR:-$HOME}}/.zshrc" ]] && source "${{ZDOTDIR:-$HOME}}/.zshrc" >/dev/null 2>&1 || true
-eval {}
-"#,
-                escaped
-            ),
-        ],
-        "bash" => vec![
-            "-c".to_string(),
-            "-l".to_string(),
-            format!(
-                r#"
-shopt -s expand_aliases
-[[ -f ~/.bashrc ]] && source ~/.bashrc >/dev/null 2>&1 || true
-eval {}
-"#,
-                escaped
-            ),
-        ],
-        "cmd" => vec!["/c".to_string(), command.to_string()],
-        "powershell" | "pwsh" => vec![
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            command.to_string(),
-        ],
-        _ => vec!["-c".to_string(), command.to_string()],
-    };
-
-    ShellInvocation {
-        program: shell,
-        args,
-    }
-}
-
-/// Execute a shell command in the session context (matching TS `SessionPrompt.shell`).
-///
-/// Creates a user message + assistant message with a tool call part recording
-/// the shell execution and its output. The command is provided by the user
-/// through the session UI and is intentionally executed as-is.
-pub async fn shell_exec(input: &ShellInput, session: &mut Session) -> anyhow::Result<String> {
-    // Create synthetic user message
-    let _user_msg = session.add_user_message("The following tool was executed by the user");
-
-    // Create assistant message with tool call
-    let assistant_msg = session.add_assistant_message();
-    let call_id = format!("call_{}", uuid::Uuid::new_v4());
-    assistant_msg.add_tool_call(
-        &call_id,
-        "bash",
-        serde_json::json!({ "command": input.command_str }),
-    );
-
-    let invocation =
-        resolve_shell_invocation(std::env::var("SHELL").ok().as_deref(), &input.command_str);
-    let abort = input.abort.clone().unwrap_or_else(CancellationToken::new);
-
-    let mut command = tokio::process::Command::new(&invocation.program);
-    command
-        .args(&invocation.args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = command.spawn()?;
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-
-    let stdout_task = child.stdout.take().map(|mut pipe| {
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).to_string()
-        })
-    });
-    let stderr_task = child.stderr.take().map(|mut pipe| {
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).to_string()
-        })
-    });
-
-    let mut aborted = false;
-    tokio::select! {
-        _ = child.wait() => {}
-        _ = abort.cancelled() => {
-            aborted = true;
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-    }
-
-    if let Some(task) = stdout_task {
-        if let Ok(out) = task.await {
-            stdout = out;
-        }
-    }
-    if let Some(task) = stderr_task {
-        if let Ok(out) = task.await {
-            stderr = out;
-        }
-    }
-
-    let mut result = if stderr.is_empty() {
-        stdout
-    } else if stdout.is_empty() {
-        stderr
-    } else {
-        format!("{}\n{}", stdout, stderr)
-    };
-    if aborted {
-        result.push_str("\n\n<metadata>\nUser aborted the command\n</metadata>");
-    }
-
-    // Record the tool result
-    assistant_msg.add_tool_result(&call_id, &result, aborted);
-
-    Ok(result)
-}
-
-/// Input for the `command()` function.
-#[derive(Debug, Clone)]
-pub struct CommandInput {
-    pub session_id: String,
-    pub command: String,
-    pub arguments: String,
-    pub agent: Option<String>,
-    pub model: Option<String>,
-    pub message_id: Option<String>,
-    pub variant: Option<String>,
-}
-
-/// Resolve a command template with arguments (matching TS `SessionPrompt.command`).
-///
-/// Replaces `$1`, `$2`, etc. placeholders with positional arguments,
-/// and `$ARGUMENTS` with the full argument string.
-pub fn resolve_command_template(template: &str, arguments: &str) -> String {
-    let args: Vec<&str> = arguments.split_whitespace().collect();
-
-    // Find the highest placeholder index
-    let mut max_index = 0u32;
-    let placeholder_re = regex::Regex::new(r"\$(\d+)").unwrap();
-    for cap in placeholder_re.captures_iter(template) {
-        if let Ok(idx) = cap[1].parse::<u32>() {
-            if idx > max_index {
-                max_index = idx;
-            }
-        }
-    }
-
-    let has_arguments_placeholder = template.contains("$ARGUMENTS");
-
-    // Replace $N placeholders
-    let mut result = placeholder_re
-        .replace_all(template, |caps: &regex::Captures| {
-            let idx: usize = caps[1].parse().unwrap_or(0);
-            if idx == 0 || idx > args.len() {
-                return String::new();
-            }
-            let arg_idx = idx - 1;
-            // Last placeholder swallows remaining args
-            if idx as u32 == max_index {
-                args[arg_idx..].join(" ")
-            } else {
-                args.get(arg_idx).unwrap_or(&"").to_string()
-            }
-        })
-        .to_string();
-
-    // Replace $ARGUMENTS
-    result = result.replace("$ARGUMENTS", arguments);
-
-    // If no placeholders and user provided arguments, append them
-    if max_index == 0 && !has_arguments_placeholder && !arguments.trim().is_empty() {
-        result = format!("{}\n\n{}", result, arguments);
-    }
-
-    result.trim().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use crate::message::MessagePart;
     use futures::stream;
     use rocode_provider::{
         ChatRequest, ChatResponse, ModelInfo, ProviderError, StreamEvent, StreamResult, StreamUsage,
@@ -4735,6 +4190,7 @@ mod tests {
                     name: "Static Model".to_string(),
                     provider: "mock".to_string(),
                     context_window,
+                    max_input_tokens: None,
                     max_output_tokens,
                     supports_vision: false,
                     supports_tools: false,
@@ -5025,6 +4481,7 @@ mod tests {
                 name: "Test Model".to_string(),
                 provider: "mock".to_string(),
                 context_window: 8192,
+                max_input_tokens: None,
                 max_output_tokens: 1024,
                 supports_vision: false,
                 supports_tools: false,
@@ -5131,6 +4588,7 @@ mod tests {
                 name: "Test Model".to_string(),
                 provider: "mock".to_string(),
                 context_window: 8192,
+                max_input_tokens: None,
                 max_output_tokens: 1024,
                 supports_vision: false,
                 supports_tools: true,
@@ -6023,6 +5481,62 @@ mod tests {
         assert!(compact);
     }
 
+    #[test]
+    fn should_compact_counts_tool_results() {
+        let provider = StaticModelProvider::with_model("big-model", 1_000_000, 65536);
+        // Create a message with a large tool result (>5MB)
+        let mut msg = SessionMessage::assistant("ses_test");
+        let large_content = "x".repeat(5_100_000);
+        msg.parts.push(crate::MessagePart {
+            id: "part_1".to_string(),
+            part_type: PartType::ToolResult {
+                tool_call_id: "tc_1".to_string(),
+                content: large_content,
+                is_error: false,
+                title: None,
+                metadata: None,
+                attachments: None,
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+
+        let compact = SessionPrompt::should_compact(&[msg], &provider, "big-model", None);
+        assert!(
+            compact,
+            "should trigger compaction for >5MB tool result content"
+        );
+    }
+
+    #[test]
+    fn should_compact_uses_max_input_tokens() {
+        // Provider with explicit max_input_tokens
+        let provider = StaticModelProvider {
+            model: Some(ModelInfo {
+                id: "limited-model".to_string(),
+                name: "Limited Model".to_string(),
+                provider: "mock".to_string(),
+                context_window: 1_000_000,
+                max_input_tokens: Some(50_000),
+                max_output_tokens: 8192,
+                supports_vision: false,
+                supports_tools: false,
+                cost_per_million_input: 0.0,
+                cost_per_million_output: 0.0,
+            }),
+        };
+        let mut msg = SessionMessage::user("ses_test", "hello");
+        // Set token usage just above the max_input limit
+        msg.metadata
+            .insert("tokens_input".to_string(), serde_json::json!(48_000_u64));
+
+        let compact = SessionPrompt::should_compact(&[msg], &provider, "limited-model", None);
+        assert!(
+            compact,
+            "should trigger compaction when input tokens approach max_input_tokens"
+        );
+    }
+
     // ── PartInput serde round-trip tests ──
 
     #[test]
@@ -6396,6 +5910,220 @@ mod tests {
         assert_eq!(
             SessionPrompt::repair_tool_call_name("read_html_file", &tools),
             "invalid"
+        );
+    }
+
+    #[test]
+    fn extract_tool_attachments_from_metadata_moves_attachment_payload_out() {
+        let mut metadata = HashMap::new();
+        metadata.insert("note".to_string(), serde_json::json!("ok"));
+        metadata.insert(
+            "attachments".to_string(),
+            serde_json::json!([{ "mime": "application/pdf", "url": "data:application/pdf;base64,AA==" }]),
+        );
+        metadata.insert(
+            "attachment".to_string(),
+            serde_json::json!({ "mime": "image/png", "url": "data:image/png;base64,BB==" }),
+        );
+
+        let (attachments, file_parts) =
+            SessionPrompt::extract_tool_attachments_from_metadata(&mut metadata, "ses_1", "msg_1");
+
+        assert_eq!(metadata.get("note").and_then(|v| v.as_str()), Some("ok"));
+        assert!(!metadata.contains_key("attachments"));
+        assert!(!metadata.contains_key("attachment"));
+        assert_eq!(attachments.as_ref().map(|v| v.len()), Some(2));
+        assert_eq!(file_parts.as_ref().map(|v| v.len()), Some(2));
+    }
+
+    #[test]
+    fn legacy_tool_state_to_v2_recovers_attachments_from_tool_result_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "attachment".to_string(),
+            serde_json::json!({ "mime": "application/pdf", "url": "data:application/pdf;base64,AA==" }),
+        );
+        metadata.insert(
+            "preview".to_string(),
+            serde_json::json!("PDF read successfully"),
+        );
+
+        let tool_result = (
+            "PDF read successfully".to_string(),
+            false,
+            Some("Read".to_string()),
+            Some(metadata),
+            None,
+        );
+
+        let state = SessionPrompt::legacy_tool_state_to_v2(
+            "tool-call-1",
+            "read",
+            &serde_json::json!({ "file_path": "report.pdf" }),
+            &crate::ToolCallStatus::Completed,
+            "",
+            Some(&tool_result),
+            "ses_1",
+            "msg_1",
+        );
+
+        match state {
+            crate::ToolState::Completed {
+                metadata,
+                attachments,
+                ..
+            } => {
+                assert!(!metadata.contains_key("attachment"));
+                assert_eq!(attachments.as_ref().map(|v| v.len()), Some(1));
+                assert_eq!(
+                    attachments
+                        .as_ref()
+                        .and_then(|v| v.first())
+                        .map(|f| f.mime.as_str()),
+                    Some("application/pdf")
+                );
+            }
+            _ => panic!("expected completed state"),
+        }
+    }
+
+    /// Regression test for the prompt loop early-exit bug:
+    /// When the assistant message has text + tool calls and finish="tool-calls",
+    /// the loop must NOT break at the top-of-loop check.
+    /// Previously, the check used `has_finish = !text.is_empty()` which caused
+    /// premature exit when models emit text before tool calls.
+    #[test]
+    fn early_exit_does_not_break_on_tool_calls_finish() {
+        // Simulate: user message at index 0, assistant at index 1
+        let user = SessionMessage::user("s1", "hello");
+        let mut assistant = SessionMessage::assistant("s1");
+        // Assistant has text content (model explained before calling tools)
+        assistant.parts.push(MessagePart {
+            id: "prt_text".to_string(),
+            part_type: PartType::Text {
+                text: "Let me read those files for you.".to_string(),
+                synthetic: None,
+                ignored: None,
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+        // finish_reason is "tool-calls" — loop should continue, not break
+        assistant.finish = Some("tool-calls".to_string());
+
+        let messages = vec![user, assistant];
+
+        let last_user_idx = messages
+            .iter()
+            .rposition(|m| matches!(m.role, MessageRole::User))
+            .unwrap();
+        let last_assistant_idx = messages
+            .iter()
+            .rposition(|m| matches!(m.role, MessageRole::Assistant));
+
+        // The early-exit check from the prompt loop
+        let should_break = if let Some(assistant_idx) = last_assistant_idx {
+            let assistant = &messages[assistant_idx];
+            let is_terminal = assistant.finish.as_deref().is_some_and(|f| {
+                !matches!(f, "tool-calls" | "tool_calls" | "unknown")
+            });
+            is_terminal && last_user_idx < assistant_idx
+        } else {
+            false
+        };
+
+        assert!(
+            !should_break,
+            "early-exit must NOT trigger when finish='tool-calls'"
+        );
+    }
+
+    /// Verify that the early-exit check DOES break when finish is terminal
+    /// (e.g. "stop") and assistant is after the last user message.
+    #[test]
+    fn early_exit_breaks_on_terminal_finish() {
+        let user = SessionMessage::user("s1", "hello");
+        let mut assistant = SessionMessage::assistant("s1");
+        assistant.parts.push(MessagePart {
+            id: "prt_text".to_string(),
+            part_type: PartType::Text {
+                text: "Here is my response.".to_string(),
+                synthetic: None,
+                ignored: None,
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+        assistant.finish = Some("stop".to_string());
+
+        let messages = vec![user, assistant];
+
+        let last_user_idx = messages
+            .iter()
+            .rposition(|m| matches!(m.role, MessageRole::User))
+            .unwrap();
+        let last_assistant_idx = messages
+            .iter()
+            .rposition(|m| matches!(m.role, MessageRole::Assistant));
+
+        let should_break = if let Some(assistant_idx) = last_assistant_idx {
+            let assistant = &messages[assistant_idx];
+            let is_terminal = assistant.finish.as_deref().is_some_and(|f| {
+                !matches!(f, "tool-calls" | "tool_calls" | "unknown")
+            });
+            is_terminal && last_user_idx < assistant_idx
+        } else {
+            false
+        };
+
+        assert!(
+            should_break,
+            "early-exit MUST trigger when finish='stop'"
+        );
+    }
+
+    /// Verify that the early-exit check does NOT break when finish is None
+    /// (assistant message still streaming / no FinishStep received yet).
+    #[test]
+    fn early_exit_does_not_break_when_finish_is_none() {
+        let user = SessionMessage::user("s1", "hello");
+        let mut assistant = SessionMessage::assistant("s1");
+        assistant.parts.push(MessagePart {
+            id: "prt_text".to_string(),
+            part_type: PartType::Text {
+                text: "partial response...".to_string(),
+                synthetic: None,
+                ignored: None,
+            },
+            created_at: chrono::Utc::now(),
+            message_id: None,
+        });
+        // finish is None — still streaming
+        assistant.finish = None;
+
+        let messages = vec![user, assistant];
+
+        let last_user_idx = messages
+            .iter()
+            .rposition(|m| matches!(m.role, MessageRole::User))
+            .unwrap();
+        let last_assistant_idx = messages
+            .iter()
+            .rposition(|m| matches!(m.role, MessageRole::Assistant));
+
+        let should_break = if let Some(assistant_idx) = last_assistant_idx {
+            let assistant = &messages[assistant_idx];
+            let is_terminal = assistant.finish.as_deref().is_some_and(|f| {
+                !matches!(f, "tool-calls" | "tool_calls" | "unknown")
+            });
+            is_terminal && last_user_idx < assistant_idx
+        } else {
+            false
+        };
+
+        assert!(
+            !should_break,
+            "early-exit must NOT trigger when finish is None"
         );
     }
 }

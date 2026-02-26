@@ -1,6 +1,6 @@
 [package]
 name = "rocode-plugin"
-version = "2026.2.24"
+version = "2026.2.26"
 edition = "2021"
 
 [dependencies]

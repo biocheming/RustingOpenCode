@@ -8,6 +8,15 @@ use serde_json::Value;
 
 use crate::theme::Theme;
 
+/// Rich tool result info that carries title and metadata through the rendering pipeline.
+#[derive(Clone, Debug, Default)]
+pub struct ToolResultInfo {
+    pub output: String,
+    pub is_error: bool,
+    pub title: Option<String>,
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+}
+
 #[derive(Clone, Copy)]
 pub enum ToolState {
     Pending,
@@ -39,22 +48,36 @@ pub fn tool_glyph(name: &str) -> &'static str {
         "websearch" | "web_search" => "◈",
         "task" | "subagent" => "#",
         "apply_patch" | "applyPatch" => "%",
+        "batch" => "⫘",
+        "question" => "?",
         "todowrite" | "todo_write" | "todoRead" | "todo_read" => "☐",
         _ => "⚙",
     }
 }
 
 /// Returns true if this tool typically produces block-level output
-fn is_block_tool(name: &str, result: Option<&(String, bool)>) -> bool {
+fn is_block_tool(name: &str, result: Option<&ToolResultInfo>) -> bool {
+    // Check display.mode override from metadata
+    if let Some(info) = result {
+        if let Some(mode) = info
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("display.mode"))
+            .and_then(|v| v.as_str())
+        {
+            return mode == "block";
+        }
+    }
+
     let normalized = normalize_tool_name(name);
     // Tools that always produce block output
     match normalized.as_str() {
-        "bash" | "shell" | "apply_patch" => return true,
+        "bash" | "shell" | "apply_patch" | "batch" | "question" => return true,
         _ => {}
     }
     // Otherwise, check result length
-    if let Some((result_text, _)) = result {
-        result_text.lines().count() > BLOCK_RESULT_THRESHOLD
+    if let Some(info) = result {
+        info.output.lines().count() > BLOCK_RESULT_THRESHOLD
     } else {
         false
     }
@@ -89,7 +112,7 @@ pub fn render_tool_call(
     name: &str,
     arguments: &str,
     state: ToolState,
-    tool_results: &HashMap<String, (String, bool)>,
+    tool_results: &HashMap<String, ToolResultInfo>,
     show_tool_details: bool,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
@@ -101,11 +124,11 @@ pub fn render_tool_call(
     let block_mode = is_block_tool(name, result);
     let normalized = normalize_tool_name(name);
     let read_summary = if is_read_tool(&normalized) {
-        result.and_then(|(result_text, is_error)| {
-            if *is_error {
+        result.and_then(|info| {
+            if info.is_error {
                 None
             } else {
-                Some(parse_read_summary(result_text))
+                Some(parse_read_summary(&info.output))
             }
         })
     } else {
@@ -113,8 +136,7 @@ pub fn render_tool_call(
     };
 
     let glyph = tool_glyph(name);
-    let is_denied =
-        result.is_some_and(|(result_text, is_error)| *is_error && is_denied_result(result_text));
+    let is_denied = result.is_some_and(|info| info.is_error && is_denied_result(&info.output));
 
     let (state_icon, icon_style, name_style) = styles_for_state(state, is_denied, theme);
 
@@ -129,9 +151,18 @@ pub fn render_tool_call(
             Span::styled(name.to_string(), name_style.bg(bg)),
         ];
 
-        if let Some(argument_preview) = tool_argument_preview(&normalized, arguments) {
+        let argument_preview = tool_argument_preview(&normalized, arguments);
+        if let Some(ref preview) = argument_preview {
             main_spans.push(Span::styled(
-                format!("  {}", argument_preview),
+                format!("  {}", preview),
+                Style::default().fg(theme.text_muted).bg(bg),
+            ));
+        } else if let Some(title) = result
+            .and_then(|info| info.title.as_deref())
+            .filter(|t| !t.is_empty())
+        {
+            main_spans.push(Span::styled(
+                format!("  {}", format_preview_line(title, 60)),
                 Style::default().fg(theme.text_muted).bg(bg),
             ));
         }
@@ -156,8 +187,11 @@ pub fn render_tool_call(
 
         lines.push(Line::from(main_spans));
 
-        if let Some((result_text, is_error)) = result {
-            if *is_error {
+        if let Some(info) = result {
+            let result_text = &info.output;
+            let is_error = info.is_error;
+
+            if is_error {
                 let mut iter = result_text.lines();
                 if let Some(first_line) = iter.next() {
                     lines.push(block_content_line(
@@ -178,8 +212,21 @@ pub fn render_tool_call(
                         ));
                     }
                 }
+            } else if render_display_hints(info, theme, bg, &mut lines) {
+                // Display hints handled the rendering
             } else if is_read_tool(&normalized) {
                 // Read output is very large and noisy; keep it summarized in the header only.
+            } else if normalized == "batch" {
+                render_batch_result_block(
+                    result_text,
+                    arguments,
+                    show_tool_details,
+                    theme,
+                    bg,
+                    &mut lines,
+                );
+            } else if normalized == "question" {
+                render_question_result_block(result_text, arguments, theme, bg, &mut lines);
             } else if show_tool_details {
                 let output_lines = result_text.lines().collect::<Vec<_>>();
                 let (list_root, list_entries) = if is_list_tool(&normalized) {
@@ -258,9 +305,9 @@ pub fn render_tool_call(
     }
 
     // Inline result summary for completed non-block tools
-    if let Some((result_text, is_error)) = result {
-        if *is_error {
-            let first_line = result_text.lines().next().unwrap_or(result_text).trim();
+    if let Some(info) = result {
+        if info.is_error {
+            let first_line = info.output.lines().next().unwrap_or(&info.output).trim();
             main_spans.push(Span::styled(
                 format!(" — {}", format_preview_line(first_line, 96)),
                 Style::default().fg(theme.error),
@@ -274,26 +321,41 @@ pub fn render_tool_call(
                 ));
             }
         } else {
-            let line_count = result_text.lines().count();
-            if line_count <= 1 {
-                let summary = result_text.trim();
-                if !summary.is_empty() && summary.len() <= 80 {
+            // Check for display.summary override
+            let display_summary = info
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("display.summary"))
+                .and_then(|v| v.as_str());
+
+            if let Some(summary) = display_summary {
+                main_spans.push(Span::styled(
+                    format!(" — {}", format_preview_line(summary, 80)),
+                    Style::default().fg(theme.text_muted),
+                ));
+            } else {
+                let result_text = &info.output;
+                let line_count = result_text.lines().count();
+                if line_count <= 1 {
+                    let summary = result_text.trim();
+                    if !summary.is_empty() && summary.len() <= 80 {
+                        main_spans.push(Span::styled(
+                            format!(" — {}", summary),
+                            Style::default().fg(theme.text_muted),
+                        ));
+                    }
+                } else if let Some(first_line) =
+                    result_text.lines().find(|line| !line.trim().is_empty())
+                {
                     main_spans.push(Span::styled(
-                        format!(" — {}", summary),
+                        format!(
+                            " — {} (+{} lines)",
+                            format_preview_line(first_line, 72),
+                            line_count.saturating_sub(1)
+                        ),
                         Style::default().fg(theme.text_muted),
                     ));
                 }
-            } else if let Some(first_line) =
-                result_text.lines().find(|line| !line.trim().is_empty())
-            {
-                main_spans.push(Span::styled(
-                    format!(
-                        " — {} (+{} lines)",
-                        format_preview_line(first_line, 72),
-                        line_count.saturating_sub(1)
-                    ),
-                    Style::default().fg(theme.text_muted),
-                ));
             }
         }
     }
@@ -301,6 +363,302 @@ pub fn render_tool_call(
     lines.push(Line::from(main_spans));
 
     lines
+}
+
+/// Render structured display hints from tool metadata.
+/// Returns true if any display hints were rendered, false to fall through to default rendering.
+fn render_display_hints(
+    info: &ToolResultInfo,
+    theme: &Theme,
+    bg: ratatui::style::Color,
+    lines: &mut Vec<Line<'static>>,
+) -> bool {
+    let metadata = match info.metadata.as_ref() {
+        Some(m) => m,
+        None => return false,
+    };
+
+    let has_fields = metadata.contains_key("display.fields");
+    let has_summary = metadata.contains_key("display.summary");
+
+    if !has_fields && !has_summary {
+        return false;
+    }
+
+    // Render display.summary as the summary line
+    if let Some(summary) = metadata.get("display.summary").and_then(|v| v.as_str()) {
+        lines.push(block_content_line(
+            format_preview_line(summary, 96),
+            Style::default().fg(theme.text_muted),
+            theme,
+            bg,
+        ));
+    }
+
+    // Render display.fields as key-value pairs
+    if let Some(fields) = metadata.get("display.fields").and_then(|v| v.as_array()) {
+        for field in fields {
+            let key = field.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+            let value = field.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            lines.push(block_content_line(
+                format!("{}: {}", key, format_preview_line(value, 88 - key.len())),
+                Style::default().fg(theme.text),
+                theme,
+                bg,
+            ));
+        }
+    }
+
+    true
+}
+
+/// Render batch tool results as a list of sub-tool entries instead of raw JSON.
+fn render_batch_result_block(
+    result_text: &str,
+    arguments: &str,
+    show_tool_details: bool,
+    theme: &Theme,
+    bg: ratatui::style::Color,
+    lines: &mut Vec<Line<'static>>,
+) {
+    // Parse sub-tool names from arguments for labeling
+    let arg_parsed = serde_json::from_str::<Value>(arguments).ok();
+    let calls = arg_parsed
+        .as_ref()
+        .and_then(|v| v.get("toolCalls").or_else(|| v.get("tool_calls")))
+        .and_then(|v| v.as_array());
+
+    // Try to parse the result as JSON array.
+    // The batch tool output is: "All N tools...\n\nResults:\n[{...}]"
+    // so we need to extract the JSON after "Results:\n".
+    let json_text = result_text
+        .find("Results:\n")
+        .map(|pos| &result_text[pos + "Results:\n".len()..])
+        .unwrap_or(result_text);
+    let result_parsed = serde_json::from_str::<Value>(json_text).ok();
+    let result_array = result_parsed.as_ref().and_then(|v| {
+        v.as_array()
+            .or_else(|| v.get("results").and_then(|r| r.as_array()))
+    });
+
+    if let Some(results) = result_array {
+        let total = results.len();
+        let ok_count = results
+            .iter()
+            .filter(|r| r.get("success").and_then(|v| v.as_bool()).unwrap_or(true))
+            .count();
+        let fail_count = total - ok_count;
+
+        // Summary line: "5 tools: 5 ok" or "5 tools: 3 ok, 2 failed"
+        let summary = if fail_count == 0 {
+            format!("{} tools: all ok", total)
+        } else {
+            format!("{} tools: {} ok, {} failed", total, ok_count, fail_count)
+        };
+        let summary_color = if fail_count > 0 {
+            theme.warning
+        } else {
+            theme.text_muted
+        };
+        lines.push(block_content_line(
+            summary,
+            Style::default().fg(summary_color),
+            theme,
+            bg,
+        ));
+
+        if !show_tool_details {
+            return;
+        }
+
+        // Render each sub-tool as a mini entry
+        for (i, result_entry) in results.iter().enumerate() {
+            let sub_name = calls
+                .and_then(|c| c.get(i))
+                .and_then(|c| {
+                    c.get("tool")
+                        .or_else(|| c.get("name"))
+                        .or_else(|| c.get("tool_name"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("?");
+            let sub_glyph = tool_glyph(sub_name);
+
+            let is_ok = result_entry
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let (icon, icon_color) = if is_ok {
+                ("●", theme.success)
+            } else {
+                ("✗", theme.error)
+            };
+
+            // Extract a short preview of the sub-tool result
+            let sub_result = result_entry
+                .get("output")
+                .or_else(|| result_entry.get("result"))
+                .or_else(|| result_entry.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let first_line = sub_result
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
+            let line_count = sub_result.lines().count();
+
+            let mut spans = vec![
+                block_prefix(theme, bg),
+                Span::styled("  ", Style::default().bg(bg)),
+                Span::styled(format!("{} ", icon), Style::default().fg(icon_color).bg(bg)),
+                Span::styled(
+                    format!("{} ", sub_glyph),
+                    Style::default().fg(theme.tool_icon).bg(bg),
+                ),
+                Span::styled(
+                    sub_name.to_string(),
+                    Style::default()
+                        .fg(theme.primary)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(bg),
+                ),
+            ];
+
+            // Add sub-tool argument preview if available
+            if let Some(call_args) = calls.and_then(|c| c.get(i)) {
+                let sub_args_str = call_args.get("parameters").map(|v| v.to_string());
+                if let Some(ref args_json) = sub_args_str {
+                    let sub_normalized = normalize_tool_name(sub_name);
+                    if let Some(preview) = tool_argument_preview(&sub_normalized, args_json) {
+                        spans.push(Span::styled(
+                            format!("  {}", format_preview_line(&preview, 40)),
+                            Style::default().fg(theme.text_muted).bg(bg),
+                        ));
+                    }
+                }
+            }
+
+            // Add result summary
+            if !is_ok {
+                let err_preview = format_preview_line(first_line, 48);
+                if !err_preview.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  {}", err_preview),
+                        Style::default().fg(theme.error).bg(bg),
+                    ));
+                }
+            } else if line_count > 1 {
+                spans.push(Span::styled(
+                    format!("  (+{} lines)", line_count),
+                    Style::default().fg(theme.text_muted).bg(bg),
+                ));
+            }
+
+            lines.push(Line::from(spans));
+        }
+    } else if show_tool_details {
+        // Fallback: couldn't parse as structured batch result, show raw lines
+        let output_lines: Vec<&str> = result_text.lines().collect();
+        let line_count = output_lines.len();
+        lines.push(block_content_line(
+            format!("({} lines of output)", line_count),
+            Style::default().fg(theme.text_muted),
+            theme,
+            bg,
+        ));
+        for line in output_lines.iter().take(8) {
+            lines.push(block_content_line(
+                format_preview_line(line, 96),
+                Style::default().fg(theme.text),
+                theme,
+                bg,
+            ));
+        }
+        if line_count > 8 {
+            lines.push(block_content_line(
+                format!("… ({} more lines)", line_count - 8),
+                Style::default().fg(theme.text_muted),
+                theme,
+                bg,
+            ));
+        }
+    }
+}
+
+/// Render question tool results: show each Q&A pair instead of raw JSON.
+fn render_question_result_block(
+    result_text: &str,
+    arguments: &str,
+    theme: &Theme,
+    bg: ratatui::style::Color,
+    lines: &mut Vec<Line<'static>>,
+) {
+    // Parse questions from arguments
+    let arg_parsed = serde_json::from_str::<Value>(arguments).ok();
+    let questions = arg_parsed
+        .as_ref()
+        .and_then(|v| v.get("questions"))
+        .and_then(|v| v.as_array());
+
+    // Parse answers from result
+    let result_parsed = serde_json::from_str::<Value>(result_text).ok();
+    let answers = result_parsed
+        .as_ref()
+        .and_then(|v| v.get("answers"))
+        .and_then(|v| v.as_array());
+
+    if let Some(qs) = questions {
+        for (i, q) in qs.iter().enumerate() {
+            let q_text = q.get("question").and_then(|v| v.as_str()).unwrap_or("?");
+            // Show question
+            lines.push(block_content_line(
+                format!("Q: {}", format_preview_line(q_text, 88)),
+                Style::default().fg(theme.info),
+                theme,
+                bg,
+            ));
+            // Show options if any
+            if let Some(opts) = q.get("options").and_then(|v| v.as_array()) {
+                for opt in opts.iter() {
+                    let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                    let desc = opt.get("description").and_then(|v| v.as_str());
+                    let opt_text = match desc {
+                        Some(d) => format!("  · {} — {}", label, format_preview_line(d, 64)),
+                        None => format!("  · {}", label),
+                    };
+                    lines.push(block_content_line(
+                        opt_text,
+                        Style::default().fg(theme.text_muted),
+                        theme,
+                        bg,
+                    ));
+                }
+            }
+            // Show answer
+            let answer = answers
+                .and_then(|a| a.get(i))
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no answer)");
+            lines.push(block_content_line(
+                format!("A: {}", format_preview_line(answer, 88)),
+                Style::default().fg(theme.success),
+                theme,
+                bg,
+            ));
+        }
+    } else {
+        // Fallback: just show the raw result compactly
+        let first_line = result_text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(result_text);
+        lines.push(block_content_line(
+            format_preview_line(first_line, 88),
+            Style::default().fg(theme.text),
+            theme,
+            bg,
+        ));
+    }
 }
 
 fn block_prefix(theme: &Theme, background: ratatui::style::Color) -> Span<'static> {
@@ -466,17 +824,61 @@ fn tool_argument_preview(normalized_name: &str, arguments: &str) -> Option<Strin
         };
     }
 
+    if normalized_name == "batch" {
+        if let Some(calls) = parsed
+            .as_ref()
+            .and_then(|v| v.get("toolCalls").or_else(|| v.get("tool_calls")))
+            .and_then(|v| v.as_array())
+        {
+            let count = calls.len();
+            let names: Vec<String> = calls
+                .iter()
+                .filter_map(|call| {
+                    call.get("tool")
+                        .or_else(|| call.get("name"))
+                        .or_else(|| call.get("tool_name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            // Deduplicate while preserving order
+            let mut seen = std::collections::HashSet::new();
+            let unique: Vec<&str> = names
+                .iter()
+                .filter(|n| seen.insert(n.as_str()))
+                .map(|n| n.as_str())
+                .collect();
+            return if unique.is_empty() {
+                Some(format!("{} tools", count))
+            } else {
+                Some(format!("{} tools ({})", count, unique.join(", ")))
+            };
+        }
+    }
+
     if normalized_name == "question" {
-        if let Some(count) = object
+        if let Some(questions) = object
             .and_then(|value| value.get("questions"))
             .and_then(|value| value.as_array())
-            .map(Vec::len)
         {
-            return Some(format!(
-                "Asked {} question{}",
-                count,
-                if count == 1 { "" } else { "s" }
-            ));
+            let count = questions.len();
+            // Show the first question text as preview
+            let first_q = questions
+                .first()
+                .and_then(|q| q.get("question").and_then(|v| v.as_str()));
+            return match first_q {
+                Some(text) if count == 1 => Some(format_preview_line(text, 72)),
+                Some(text) => Some(format!(
+                    "{} (+{} more)",
+                    format_preview_line(text, 52),
+                    count - 1
+                )),
+                None => Some(format!(
+                    "{} question{}",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                )),
+            };
         }
     }
 
@@ -736,5 +1138,19 @@ mod tests {
             format_read_summary(&summary).as_deref(),
             Some("4.0 KB, 256 lines")
         );
+    }
+
+    #[test]
+    fn batch_preview_shows_tool_count_and_names() {
+        let args = r#"{"toolCalls":[{"tool":"read","parameters":{"file_path":"/tmp/a.txt"}},{"tool":"edit","parameters":{"file_path":"/tmp/b.txt"}},{"tool":"read","parameters":{"file_path":"/tmp/c.txt"}}]}"#;
+        let preview = tool_argument_preview("batch", args);
+        assert_eq!(preview.as_deref(), Some("3 tools (read, edit)"));
+    }
+
+    #[test]
+    fn batch_preview_with_no_names_shows_count_only() {
+        let args = r#"{"toolCalls":[{},{}]}"#;
+        let preview = tool_argument_preview("batch", args);
+        assert_eq!(preview.as_deref(), Some("2 tools"));
     }
 }

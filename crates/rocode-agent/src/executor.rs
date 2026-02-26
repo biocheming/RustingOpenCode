@@ -205,7 +205,7 @@ impl AgentExecutor {
                 }
 
                 let (content, is_error) = match result {
-                    Ok(output) => (output, false),
+                    Ok(tool_result) => (tool_result.output, false),
                     Err(e) => (e.to_string(), true),
                 };
 
@@ -288,9 +288,7 @@ impl AgentExecutor {
                             "error": validation_error,
                         }),
                     };
-                    result = self
-                        .execute_tool_without_subsessions(&invalid_call)
-                        .await;
+                    result = self.execute_tool_without_subsessions(&invalid_call).await;
                 }
 
                 let (content, is_error) = match result {
@@ -423,11 +421,11 @@ impl AgentExecutor {
                 }
 
                 match execution {
-                    Ok(output) => {
+                    Ok(tool_result) => {
                         self.conversation.add_tool_result(
                             &effective_tool_call.id,
                             &effective_tool_call.name,
-                            output.clone(),
+                            tool_result.output.clone(),
                             false,
                         );
                         emitted.push(Ok(StreamEvent::ToolResult {
@@ -435,9 +433,9 @@ impl AgentExecutor {
                             tool_name: effective_tool_call.name.clone(),
                             input: Some(effective_tool_call.arguments.clone()),
                             output: rocode_provider::ToolResultOutput {
-                                output,
-                                title: "Tool Result".to_string(),
-                                metadata: HashMap::new(),
+                                output: tool_result.output,
+                                title: tool_result.title,
+                                metadata: tool_result.metadata,
                                 attachments: None,
                             },
                         }));
@@ -524,7 +522,10 @@ impl AgentExecutor {
         Ok((content, tool_calls))
     }
 
-    async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String, ToolError> {
+    async fn execute_tool(
+        &self,
+        tool_call: &ToolCall,
+    ) -> Result<rocode_tool::ToolResult, ToolError> {
         if self.disabled_tools.contains(&tool_call.name) {
             return Err(ToolError::PermissionDenied(format!(
                 "Tool '{}' is disabled for this subagent session",
@@ -553,7 +554,6 @@ impl AgentExecutor {
         self.tools
             .execute(&tool_call.name, tool_call.arguments.clone(), ctx)
             .await
-            .map(|r| r.output)
     }
 
     async fn execute_tool_without_subsessions(

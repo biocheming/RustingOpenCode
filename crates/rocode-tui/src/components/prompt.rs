@@ -363,10 +363,7 @@ impl Prompt {
 
         let status_line = Paragraph::new(self.render_status_line(&theme))
             .style(Style::default().bg(theme.background));
-        frame.render_widget(
-            status_line,
-            chunks[3],
-        );
+        frame.render_widget(status_line, chunks[3]);
     }
 
     pub fn tick_spinner(&mut self, delta_ms: u64) -> bool {

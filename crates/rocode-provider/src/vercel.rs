@@ -37,6 +37,7 @@ impl VercelProvider {
             name: "v0 1.0 (Markdown)".to_string(),
             provider: "vercel".to_string(),
             context_window: 128000,
+            max_input_tokens: None,
             max_output_tokens: 8192,
             supports_vision: true,
             supports_tools: false,

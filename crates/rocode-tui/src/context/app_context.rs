@@ -265,6 +265,19 @@ impl AppContext {
         self.ui_kv.write().set_bool("semantic_highlight", *enabled);
     }
 
+    /// Load persisted recent models list: Vec<(provider, model_id)>.
+    pub fn load_recent_models(&self) -> Vec<(String, String)> {
+        let raw = self.ui_kv.read().get_string("recent_models", "[]");
+        serde_json::from_str::<Vec<(String, String)>>(&raw).unwrap_or_default()
+    }
+
+    /// Save recent models list to disk.
+    pub fn save_recent_models(&self, recent: &[(String, String)]) {
+        if let Ok(json) = serde_json::to_string(recent) {
+            self.ui_kv.write().set_string("recent_models", &json);
+        }
+    }
+
     pub fn toggle_theme_mode(&self) -> bool {
         let current = normalize_theme_name(&self.current_theme_name());
         let Some((base, variant)) = split_theme_variant(&current) else {

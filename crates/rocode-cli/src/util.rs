@@ -26,7 +26,10 @@ pub(crate) fn parse_bool_env(value: &str) -> bool {
     )
 }
 
-pub(crate) fn append_cli_file_attachments(input: &mut String, files: &[PathBuf]) -> anyhow::Result<()> {
+pub(crate) fn append_cli_file_attachments(
+    input: &mut String,
+    files: &[PathBuf],
+) -> anyhow::Result<()> {
     for file_path in files {
         let resolved = if file_path.is_absolute() {
             file_path.clone()

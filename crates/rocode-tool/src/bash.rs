@@ -208,7 +208,11 @@ impl Tool for BashTool {
 
         // Register in global process registry
         if let Some(pid) = child_pid {
-            let label = command.split_whitespace().next().unwrap_or("bash").to_string();
+            let label = command
+                .split_whitespace()
+                .next()
+                .unwrap_or("bash")
+                .to_string();
             global_registry().register(pid, format!("bash: {}", label), ProcessKind::Bash);
         }
 

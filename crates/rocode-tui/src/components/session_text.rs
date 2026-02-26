@@ -32,7 +32,9 @@ pub fn render_reasoning_part(
     collapsed: bool,
     preview_lines: usize,
 ) -> ReasoningRender {
-    let cleaned = strip_think_tags(&text.replace("[REDACTED]", "")).trim().to_string();
+    let cleaned = strip_think_tags(&text.replace("[REDACTED]", ""))
+        .trim()
+        .to_string();
     if cleaned.is_empty() {
         return ReasoningRender {
             lines: Vec::new(),
@@ -46,9 +48,7 @@ pub fn render_reasoning_part(
     let total_content_lines = content_lines.len();
     let collapsible = total_content_lines > preview_lines;
 
-    let header_style = Style::default()
-        .fg(theme.info)
-        .add_modifier(Modifier::BOLD);
+    let header_style = Style::default().fg(theme.info).add_modifier(Modifier::BOLD);
 
     if collapsible && collapsed {
         lines.push(Line::from(Span::styled(
@@ -58,10 +58,7 @@ pub fn render_reasoning_part(
         return ReasoningRender { lines, collapsible };
     }
 
-    lines.push(Line::from(Span::styled(
-        "▼ Thinking",
-        header_style,
-    )));
+    lines.push(Line::from(Span::styled("▼ Thinking", header_style)));
 
     let visible_count = if collapsible && collapsed {
         preview_lines

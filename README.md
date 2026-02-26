@@ -7,8 +7,15 @@ RustingOpenCode（简称 ROCode）是 OpenCode 的 Rust 实现与演进版本，
 ## 当前状态
 
 - 品牌名：`RustingOpenCode` / `ROCode`
-- 版本标识：`v2026.2.25`
+- 版本标识：`v2026.2.26`
 - 可执行命令：`rocode`
+
+## 本轮更新（2026-02-26）
+
+- 会话引擎修复了 tool-calls 场景的提前退出问题：现在基于 `finish` 原因判断是否结束回合。
+- 服务端与存储层完成增量持久化链路收敛：流式阶段异步刷盘，结束时仅 flush 当前会话。
+- 工具链补齐大 payload 控制：`read` 二进制内容改为 metadata 附件，`batch` 聚合附件并压缩文本输出。
+- TUI 增强异步 optimistic 交互：用户消息先渲染，网络请求后台执行，失败时回滚本地状态。
 
 ## 功能概览
 

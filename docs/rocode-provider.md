@@ -1,6 +1,6 @@
 # rocode-provider
 
-文档基线：v2026.2.25（更新日期：2026-02-25）
+文档基线：v2026.2.26（更新日期：2026-02-26）
 
 `rocode-provider` 是多模型供应商适配层，负责请求构建、流式响应解析、重试和模型能力查询。
 
@@ -21,12 +21,13 @@
 - `transform.rs`：消息去重、cache hint、interleaved thinking 规范化
 - `<vendor>.rs`：各厂商适配实现
 
-## 当前分支变化（v2026.2.25）
+## 当前分支变化（v2026.2.26）
 
 - `transform.rs` 强化了 Provider 兼容层：包含 `dedup_messages`、`normalize_messages`、`normalize_messages_for_caching`、`apply_interleaved_thinking` 等路径。
 - 新增统一 `OUTPUT_TOKEN_MAX = 32000` 默认值，与 TS 侧行为对齐。
 - OpenAI 适配对 `/chat/completions` 响应采用宽松解析（nullish 字段、`tool_calls.function.arguments` 容错），减少第三方兼容 API 失败率。
 - Anthropic 适配支持 reasoning/thinking 内容映射，并附带 `interleaved-thinking`、`fine-grained-tool-streaming` 相关 beta header。
+- `ModelInfo` 新增 `max_input_tokens` 字段；各 provider 内置模型已补齐该字段（暂无明确上限时为 `None`），为 compaction/token 预算提供更准确输入上限。
 
 ## 关键导出
 

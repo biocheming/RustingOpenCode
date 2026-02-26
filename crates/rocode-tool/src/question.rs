@@ -112,16 +112,47 @@ impl Tool for QuestionTool {
         }
 
         let response = QuestionResponse {
-            answers: all_answers,
+            answers: all_answers.clone(),
         };
 
         let output = serde_json::to_string_pretty(&response)
             .unwrap_or_else(|_| format!("{:?}", response.answers));
 
+        // Build display hints for TUI rendering
+        let mut metadata = std::collections::HashMap::new();
+
+        // display.fields: Q&A pairs
+        let fields: Vec<serde_json::Value> = input
+            .questions
+            .iter()
+            .zip(all_answers.iter())
+            .map(|(q, a)| {
+                serde_json::json!({
+                    "key": q.question,
+                    "value": a,
+                })
+            })
+            .collect();
+        metadata.insert(
+            "display.fields".to_string(),
+            serde_json::Value::Array(fields),
+        );
+
+        // display.summary
+        let summary = if input.questions.len() == 1 {
+            format!("1 question answered")
+        } else {
+            format!("{} questions answered", input.questions.len())
+        };
+        metadata.insert(
+            "display.summary".to_string(),
+            serde_json::Value::String(summary),
+        );
+
         Ok(ToolResult {
             title: "User response received".to_string(),
             output,
-            metadata: std::collections::HashMap::new(),
+            metadata,
             truncated: false,
         })
     }

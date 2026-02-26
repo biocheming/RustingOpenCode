@@ -75,6 +75,8 @@ pub enum MessagePart {
         id: String,
         result: String,
         is_error: bool,
+        title: Option<String>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
     },
 }
 

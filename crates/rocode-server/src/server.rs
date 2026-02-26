@@ -208,8 +208,8 @@ pub struct ServerState {
     pub tool_registry: Arc<rocode_tool::ToolRegistry>,
     pub auth_manager: Arc<AuthManager>,
     pub event_bus: broadcast::Sender<String>,
-    session_repo: Option<SessionRepository>,
-    message_repo: Option<MessageRepository>,
+    pub(crate) session_repo: Option<SessionRepository>,
+    pub(crate) message_repo: Option<MessageRepository>,
 }
 
 impl ServerState {
@@ -320,6 +320,33 @@ impl ServerState {
         Ok(())
     }
 
+    /// Flush a single session (and its messages) to storage inside a transaction.
+    /// Used after prompt ends — avoids scanning all sessions.
+    pub async fn flush_session_to_storage(&self, session_id: &str) -> anyhow::Result<()> {
+        let Some(session_repo) = &self.session_repo else {
+            return Ok(());
+        };
+
+        let session = {
+            let manager = self.sessions.lock().await;
+            manager.get(session_id).cloned()
+        };
+
+        let Some(session) = session else {
+            return Ok(());
+        };
+
+        let mut stored: rocode_types::Session =
+            serde_json::from_value(serde_json::to_value(&session)?)?;
+        let messages = std::mem::take(&mut stored.messages);
+
+        session_repo
+            .flush_with_messages(&stored, &messages)
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn sync_sessions_to_storage(&self) -> anyhow::Result<()> {
         let (Some(session_repo), Some(message_repo)) = (&self.session_repo, &self.message_repo)
         else {
@@ -331,6 +358,7 @@ impl ServerState {
             manager.list().into_iter().cloned().collect()
         };
 
+        // Clean up sessions that were deleted in-memory but still persisted.
         let snapshot_ids: HashSet<String> = snapshot.iter().map(|s| s.id.clone()).collect();
         let persisted = session_repo.list(None, 100_000).await?;
 
@@ -341,23 +369,15 @@ impl ServerState {
             }
         }
 
+        // Flush each session transactionally (upsert session + messages + delete stale).
         for session in snapshot {
             let mut stored_session: rocode_types::Session =
                 serde_json::from_value(serde_json::to_value(&session)?)?;
-            let stored_messages: Vec<rocode_types::SessionMessage> =
-                stored_session.messages.clone();
-            stored_session.messages.clear();
+            let stored_messages = std::mem::take(&mut stored_session.messages);
 
-            if session_repo.get(&stored_session.id).await?.is_some() {
-                session_repo.update(&stored_session).await?;
-            } else {
-                session_repo.create(&stored_session).await?;
-            }
-
-            message_repo.delete_for_session(&stored_session.id).await?;
-            for message in stored_messages {
-                message_repo.create(&message).await?;
-            }
+            session_repo
+                .flush_with_messages(&stored_session, &stored_messages)
+                .await?;
         }
 
         Ok(())

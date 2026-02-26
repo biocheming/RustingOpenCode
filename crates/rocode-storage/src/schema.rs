@@ -53,11 +53,11 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL,
     role TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    
+
     -- Provider/model info
     provider_id TEXT,
     model_id TEXT,
-    
+
     -- Token usage
     tokens_input INTEGER DEFAULT 0,
     tokens_output INTEGER DEFAULT 0,
@@ -65,10 +65,13 @@ CREATE TABLE IF NOT EXISTS messages (
     tokens_cache_read INTEGER DEFAULT 0,
     tokens_cache_write INTEGER DEFAULT 0,
     cost REAL DEFAULT 0.0,
-    
+
+    -- LLM finish reason (e.g. "stop", "tool-calls")
+    finish TEXT,
+
     -- Complete message data (JSON)
     data TEXT,
-    
+
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 "#;
@@ -176,6 +179,11 @@ CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);
 CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
 "#;
 
+/// Add finish column to messages table for existing databases.
+/// New databases get it from CREATE TABLE; this handles upgrades.
+pub const ADD_MESSAGES_FINISH_COLUMN: &str =
+    "ALTER TABLE messages ADD COLUMN finish TEXT";
+
 /// All migration statements to run
 pub const ALL_MIGRATIONS: &[&str] = &[
     CREATE_SESSIONS_TABLE,
@@ -185,4 +193,5 @@ pub const ALL_MIGRATIONS: &[&str] = &[
     CREATE_PERMISSIONS_TABLE,
     CREATE_SESSION_SHARES_TABLE,
     CREATE_INDEXES,
+    ADD_MESSAGES_FINISH_COLUMN,
 ];

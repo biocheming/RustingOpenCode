@@ -664,7 +664,8 @@ impl ToolContext {
     pub fn with_get_agent_info<F, Fut>(mut self, callback: F) -> Self
     where
         F: Fn(String) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<Option<TaskAgentInfo>, ToolError>> + Send + 'static,
+        Fut:
+            std::future::Future<Output = Result<Option<TaskAgentInfo>, ToolError>> + Send + 'static,
     {
         self.get_agent_info = Some(Arc::new(move |name| Box::pin(callback(name))));
         self

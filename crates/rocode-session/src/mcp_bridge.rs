@@ -24,10 +24,7 @@ impl Tool for McpBridgeTool {
     }
 
     fn description(&self) -> &str {
-        self.tool
-            .description
-            .as_deref()
-            .unwrap_or("MCP tool")
+        self.tool.description.as_deref().unwrap_or("MCP tool")
     }
 
     fn parameters(&self) -> serde_json::Value {

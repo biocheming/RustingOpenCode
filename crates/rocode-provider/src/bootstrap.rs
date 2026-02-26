@@ -2416,6 +2416,7 @@ fn state_model_to_runtime(provider_id: &str, model: &ProviderModel) -> RuntimeMo
         name: model.name.clone(),
         provider: provider_id.to_string(),
         context_window: model.limit.context,
+        max_input_tokens: model.limit.input,
         max_output_tokens: model.limit.output,
         supports_vision: model.capabilities.input.image
             || model.capabilities.output.image

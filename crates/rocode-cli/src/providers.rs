@@ -49,7 +49,9 @@ pub(crate) fn select_model(
 
 const DEFAULT_PLUGIN_SERVER_URL: &str = "http://127.0.0.1:4096";
 
-pub(crate) async fn setup_providers(config: &rocode_config::Config) -> anyhow::Result<ProviderRegistry> {
+pub(crate) async fn setup_providers(
+    config: &rocode_config::Config,
+) -> anyhow::Result<ProviderRegistry> {
     let auth_store = load_plugin_auth_store(config).await;
 
     // Convert config providers to bootstrap format

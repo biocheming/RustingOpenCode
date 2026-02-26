@@ -236,6 +236,7 @@ impl OpenAIProvider {
                 name: "GPT-4o".to_string(),
                 provider: "openai".to_string(),
                 context_window: 128000,
+                max_input_tokens: None,
                 max_output_tokens: 16384,
                 supports_vision: true,
                 supports_tools: true,
@@ -247,6 +248,7 @@ impl OpenAIProvider {
                 name: "GPT-4o Mini".to_string(),
                 provider: "openai".to_string(),
                 context_window: 128000,
+                max_input_tokens: None,
                 max_output_tokens: 16384,
                 supports_vision: true,
                 supports_tools: true,
@@ -258,6 +260,7 @@ impl OpenAIProvider {
                 name: "GPT-4 Turbo".to_string(),
                 provider: "openai".to_string(),
                 context_window: 128000,
+                max_input_tokens: None,
                 max_output_tokens: 4096,
                 supports_vision: true,
                 supports_tools: true,
@@ -269,6 +272,7 @@ impl OpenAIProvider {
                 name: "o1 Preview".to_string(),
                 provider: "openai".to_string(),
                 context_window: 128000,
+                max_input_tokens: None,
                 max_output_tokens: 32768,
                 supports_vision: false,
                 supports_tools: false,
@@ -280,6 +284,7 @@ impl OpenAIProvider {
                 name: "o1 Mini".to_string(),
                 provider: "openai".to_string(),
                 context_window: 128000,
+                max_input_tokens: None,
                 max_output_tokens: 65536,
                 supports_vision: false,
                 supports_tools: false,
@@ -394,7 +399,11 @@ impl OpenAIProvider {
                         }
                         for tc in tool_calls {
                             let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-                            let id = if let Some(id) = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                            let id = if let Some(id) = tc
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                            {
                                 let id = id.to_string();
                                 state.tool_call_ids.insert(index, id.clone());
                                 id
@@ -446,7 +455,11 @@ impl OpenAIProvider {
                                         arguments_preview = %arguments_value.to_string().chars().take(200).collect::<String>(),
                                         "[DIAG-SSE] arguments field is NOT a string"
                                     );
-                                    if arguments_value.is_object() && !arguments_value.as_object().map_or(true, |o| o.is_empty()) {
+                                    if arguments_value.is_object()
+                                        && !arguments_value
+                                            .as_object()
+                                            .map_or(true, |o| o.is_empty())
+                                    {
                                         let serialized = arguments_value.to_string();
                                         events.push(StreamEvent::ToolCallDelta {
                                             id,

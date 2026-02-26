@@ -270,12 +270,21 @@ fn handle_binary_file(
     let msg = format!("{} read successfully ({} bytes)", file_type, content.len());
 
     let output = format!(
-        "<path>{}</path>\n<type>binary</type>\n<mime>{}</mime>\n<size>{}</size>\n<total-lines>0</total-lines>\n<data-url>\n{}\n</data-url>",
+        "<path>{}</path>\n<type>binary</type>\n<mime>{}</mime>\n<size>{}</size>\n<total-lines>0</total-lines>\n<content>\n{}\n</content>",
         path.display(),
         mime,
         content.len(),
-        data_url
+        msg
     );
+
+    let mut attachment = serde_json::Map::new();
+    attachment.insert("type".to_string(), serde_json::json!("file"));
+    attachment.insert("mime".to_string(), serde_json::json!(mime));
+    attachment.insert("url".to_string(), serde_json::json!(data_url));
+    if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+        attachment.insert("filename".to_string(), serde_json::json!(filename));
+    }
+    let attachment_value = serde_json::Value::Object(attachment);
 
     Ok(ToolResult {
         title,
@@ -286,6 +295,8 @@ fn handle_binary_file(
             m.insert("truncated".into(), serde_json::json!(false));
             m.insert("mime".into(), serde_json::json!(mime));
             m.insert("size".into(), serde_json::json!(content.len()));
+            m.insert("attachment".into(), attachment_value.clone());
+            m.insert("attachments".into(), serde_json::json!([attachment_value]));
             m
         },
         truncated: false,
@@ -588,5 +599,38 @@ mod tests {
             }
             other => panic!("unexpected error: {}", other),
         }
+    }
+
+    #[test]
+    fn binary_read_keeps_output_compact_and_moves_payload_to_metadata_attachments() {
+        let path = Path::new("/tmp/sample.pdf");
+        let content = vec![0u8, 1u8, 2u8, 3u8];
+        let result = handle_binary_file(path, &content, "application/pdf", "sample.pdf".into())
+            .expect("binary read should succeed");
+
+        assert!(
+            !result.output.contains("data:application/pdf;base64"),
+            "output should not inline base64 data"
+        );
+        assert!(result.output.contains("PDF read successfully"));
+
+        let attachments = result
+            .metadata
+            .get("attachments")
+            .and_then(|v| v.as_array())
+            .expect("attachments should exist");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0].get("mime").and_then(|v| v.as_str()),
+            Some("application/pdf")
+        );
+        assert!(
+            attachments[0]
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|v| v.starts_with("data:application/pdf;base64,"))
+                .unwrap_or(false),
+            "attachment url should contain data-url"
+        );
     }
 }

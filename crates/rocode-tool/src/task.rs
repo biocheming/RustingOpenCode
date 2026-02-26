@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{Metadata, PermissionRequest, TaskAgentInfo, TaskAgentModel, Tool, ToolContext, ToolError, ToolResult};
+use crate::{
+    Metadata, PermissionRequest, TaskAgentInfo, TaskAgentModel, Tool, ToolContext, ToolError,
+    ToolResult,
+};
 
 pub struct TaskTool;
 

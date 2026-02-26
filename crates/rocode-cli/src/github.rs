@@ -9,8 +9,8 @@ use futures::StreamExt;
 use rocode_agent::{AgentExecutor, AgentInfo, AgentRegistry};
 use rocode_config::loader::load_config;
 use rocode_provider::StreamEvent;
-use rocode_tool::registry::create_default_registry;
 use rocode_session::system::{EnvironmentContext, SystemPrompt};
+use rocode_tool::registry::create_default_registry;
 
 use crate::cli::GithubCommands;
 use crate::providers::setup_providers;
@@ -335,7 +335,7 @@ pub(crate) fn build_prompt_data_for_issue(
         github_inline(issue.get("state").and_then(|v| v.as_str()))
     ));
 
-// PLACEHOLDER_CHUNK_4
+    // PLACEHOLDER_CHUNK_4
 
     let mut comment_lines = Vec::new();
     if let Some(items) = comments.as_array() {
@@ -382,7 +382,7 @@ pub(crate) fn build_prompt_data_for_pr(
     let files = gh_api_json("GET", &files_endpoint, None, token)?;
     let reviews = gh_api_json("GET", &reviews_endpoint, None, token)?;
 
-// PLACEHOLDER_CHUNK_5
+    // PLACEHOLDER_CHUNK_5
 
     let mut lines = github_action_context_lines();
     lines.push(String::new());
@@ -443,7 +443,7 @@ pub(crate) fn build_prompt_data_for_pr(
             .unwrap_or(0)
     ));
 
-// PLACEHOLDER_CHUNK_6
+    // PLACEHOLDER_CHUNK_6
 
     let mut comment_lines = Vec::new();
     if let Some(items) = issue_comments.as_array() {
@@ -487,7 +487,7 @@ pub(crate) fn build_prompt_data_for_pr(
         lines.push("</pull_request_changed_files>".to_string());
     }
 
-// PLACEHOLDER_CHUNK_7
+    // PLACEHOLDER_CHUNK_7
 
     let mut review_blocks = Vec::new();
     if let Some(items) = reviews.as_array() {
@@ -605,7 +605,7 @@ pub(crate) fn prompt_from_github_context(
             None
         };
 
-// PLACEHOLDER_CHUNK_9
+        // PLACEHOLDER_CHUNK_9
 
         if exact_mention {
             if let Some((file, line, diff_hunk)) = review_context {
@@ -728,7 +728,7 @@ pub(crate) fn gh_api_json(
         cmd.env("GH_TOKEN", token);
     }
 
-// PLACEHOLDER_CHUNK_11
+    // PLACEHOLDER_CHUNK_11
 
     let mut child = cmd
         .stdin(if body.is_some() {
@@ -891,7 +891,11 @@ pub(crate) fn gh_run(args: &[&str], token: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn github_default_branch(owner: &str, repo: &str, token: Option<&str>) -> anyhow::Result<String> {
+pub(crate) fn github_default_branch(
+    owner: &str,
+    repo: &str,
+    token: Option<&str>,
+) -> anyhow::Result<String> {
     let endpoint = format!("repos/{owner}/{repo}");
     let value = gh_api_json("GET", &endpoint, None, token)?;
     let branch = value
@@ -954,7 +958,10 @@ pub(crate) fn github_generate_branch_name(prefix: &str, issue_number: Option<u64
     format!("rocode/{}-{}", prefix, stamp)
 }
 
-pub(crate) fn github_checkout_new_branch(prefix: &str, issue_number: Option<u64>) -> anyhow::Result<String> {
+pub(crate) fn github_checkout_new_branch(
+    prefix: &str,
+    issue_number: Option<u64>,
+) -> anyhow::Result<String> {
     let branch = github_generate_branch_name(prefix, issue_number);
     git_run(&["checkout", "-b", &branch])?;
     Ok(branch)
@@ -1138,7 +1145,7 @@ pub(crate) async fn generate_agent_response(
         executor = executor.with_system_prompt(full_prompt);
     }
 
-// PLACEHOLDER_CHUNK_18
+    // PLACEHOLDER_CHUNK_18
 
     let stream = executor.execute_streaming(prompt.to_string()).await?;
     let mut stream = std::pin::pin!(stream);
@@ -1193,8 +1200,7 @@ pub(crate) async fn handle_github_command(action: GithubCommands) -> anyhow::Res
             }
         }
 
-// PLACEHOLDER_CHUNK_19
-
+        // PLACEHOLDER_CHUNK_19
         GithubCommands::Install => {
             let git_check = ProcessCommand::new("git")
                 .args(["rev-parse", "--is-inside-work-tree"])
@@ -1247,8 +1253,7 @@ pub(crate) async fn handle_github_command(action: GithubCommands) -> anyhow::Res
             println!("  3. Comment `/oc summarize` on an issue or PR to trigger the agent");
         }
 
-// PLACEHOLDER_CHUNK_20
-
+        // PLACEHOLDER_CHUNK_20
         GithubCommands::Run { event, token } => {
             ensure_gh_available()?;
             let token = token.as_deref().filter(|t| !t.trim().is_empty());
@@ -1307,7 +1312,7 @@ pub(crate) async fn handle_github_command(action: GithubCommands) -> anyhow::Res
                 .map(|(owner, repo)| github_footer(owner, repo))
                 .unwrap_or_default();
 
-// PLACEHOLDER_CHUNK_21
+            // PLACEHOLDER_CHUNK_21
 
             let prereq_result: anyhow::Result<()> = (|| {
                 if is_user_event && repo_ctx.is_none() {
@@ -1367,7 +1372,7 @@ pub(crate) async fn handle_github_command(action: GithubCommands) -> anyhow::Res
                 }
             }
 
-// PLACEHOLDER_CHUNK_22
+            // PLACEHOLDER_CHUNK_22
 
             let run_result: anyhow::Result<()> = async {
                 let user_prompt = prompt_from_github_context(&event_name, &payload)?;
@@ -1417,7 +1422,7 @@ pub(crate) async fn handle_github_command(action: GithubCommands) -> anyhow::Res
                     }
                 }
 
-// PLACEHOLDER_CHUNK_23
+                // PLACEHOLDER_CHUNK_23
 
                 let response_text = generate_agent_response(&final_prompt, model, "build").await?;
 
@@ -1482,8 +1487,7 @@ pub(crate) async fn handle_github_command(action: GithubCommands) -> anyhow::Res
                         }
                     }
 
-// PLACEHOLDER_CHUNK_24
-
+                // PLACEHOLDER_CHUNK_24
                 } else if is_user_event {
                     let (owner, repo) = repo_ctx.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("Missing repository context while posting response.")
@@ -1533,7 +1537,7 @@ pub(crate) async fn handle_github_command(action: GithubCommands) -> anyhow::Res
                             anyhow::anyhow!("Missing prepared base branch while creating PR.")
                         })?;
 
-// PLACEHOLDER_CHUNK_25
+                        // PLACEHOLDER_CHUNK_25
 
                         let summary = github_summary_title(
                             &response_text,
@@ -1583,7 +1587,7 @@ pub(crate) async fn handle_github_command(action: GithubCommands) -> anyhow::Res
             }
             .await;
 
-// PLACEHOLDER_CHUNK_26
+            // PLACEHOLDER_CHUNK_26
 
             if let Err(err) = run_result {
                 if is_user_event {

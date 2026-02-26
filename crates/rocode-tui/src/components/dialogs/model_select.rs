@@ -88,6 +88,19 @@ impl ModelSelectDialog {
         }
     }
 
+    /// Return a slice of the recent models list for persistence.
+    pub fn recent(&self) -> &[(String, String)] {
+        &self.recent
+    }
+
+    /// Replace the recent models list (used on startup to restore persisted state).
+    pub fn set_recent(&mut self, recent: Vec<(String, String)>) {
+        self.recent = recent;
+        if self.recent.len() > RECENT_LIMIT {
+            self.recent.truncate(RECENT_LIMIT);
+        }
+    }
+
     pub fn open(&mut self) {
         self.open = true;
         self.query.clear();
@@ -134,7 +147,6 @@ impl ModelSelectDialog {
                 _ => None,
             })
     }
-
 
     /// Rebuild the flat row list from models, applying search filter and grouping.
     fn rebuild(&mut self) {
@@ -225,7 +237,6 @@ impl ModelSelectDialog {
         self.scroll_offset = 0;
     }
 
-
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.open {
             return;
@@ -295,18 +306,30 @@ impl ModelSelectDialog {
             s
         };
 
-        let visible_rows = self.rows.iter().enumerate().skip(scroll).take(list_area.height as usize);
+        let visible_rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(list_area.height as usize);
         let content_width = list_area.width as usize;
 
         for (row_idx, (abs_idx, row)) in visible_rows.enumerate() {
             let y = list_area.y + row_idx as u16;
-            let row_area = Rect { x: list_area.x, y, width: list_area.width, height: 1 };
+            let row_area = Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 1,
+            };
 
             match row {
                 Row::Header(label) => {
                     let line = Line::from(Span::styled(
                         format!(" {}", label),
-                        Style::default().fg(theme.text_muted).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.text_muted)
+                            .add_modifier(Modifier::BOLD),
                     ));
                     frame.render_widget(Paragraph::new(line), row_area);
                 }
@@ -333,7 +356,14 @@ impl ModelSelectDialog {
 
                     let line = Line::from(vec![
                         Span::styled(check, base.fg(theme.success)),
-                        Span::styled(&m.name, base.fg(if is_current { theme.primary } else { theme.text })),
+                        Span::styled(
+                            &m.name,
+                            base.fg(if is_current {
+                                theme.primary
+                            } else {
+                                theme.text
+                            }),
+                        ),
                         Span::styled(" ".repeat(padding), base),
                         Span::styled(ctx_str, base.fg(theme.text_muted)),
                     ]);

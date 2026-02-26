@@ -120,6 +120,7 @@ fn test_model_info_clone() {
         name: "Test Model".to_string(),
         provider: "test".to_string(),
         context_window: 128000,
+        max_input_tokens: None,
         max_output_tokens: 4096,
         supports_vision: true,
         supports_tools: true,

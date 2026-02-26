@@ -1,6 +1,6 @@
 # rocode-tui
 
-文档基线：v2026.2.25（更新日期：2026-02-25）
+文档基线：v2026.2.26（更新日期：2026-02-26）
 
 `rocode-tui` 提供终端交互界面，包括首页、会话视图、输入框、侧栏、对话框、快捷键与主题系统。
 
@@ -8,7 +8,7 @@
 
 - `APP_NAME`: `RustingOpenCode`
 - `APP_SHORT_NAME`: `ROCode`
-- `APP_VERSION_DATE`: `v2026.2.25`
+- `APP_VERSION_DATE`: `v2026.2.26`
 - `APP_TAGLINE`: `A Rusted OpenCode Version`
 
 定义位置：`crates/rocode-tui/src/branding.rs`
@@ -36,9 +36,13 @@
 - 更细致的消息块布局与状态行
 - syntect 代码高亮与路径感知补全
 - 侧栏支持分段折叠、滚动条、鼠标点击命中与进程面板（可选择/终止 Plugin/Bash 进程）
-- 首页底栏增加 MCP 连接数和版本信息对齐展示（`ROCode v2026.2.25`）
+- 首页底栏增加 MCP 连接数和版本信息对齐展示（`ROCode v2026.2.26`）
 - 新增 Provider 对话框数据流：优先读取 `/provider/known`，可直接提交 API Key 并刷新模型列表
 - reasoning 渲染支持可折叠 Thinking 视图，避免长推理块占满会话窗口
+- prompt 提交改为异步后台派发 + optimistic UI：本地消息先展示，网络请求完成后通过事件回填/回滚，减少“输入后长时间无响应”的体感延迟。
+- Model Select 新增最近模型列表持久化（启动恢复、切换后保存），减少重复检索成本。
+- 工具结果渲染支持 `title/metadata` 透传与 `display.*` hints；`batch/question` 有专门渲染分支，信息密度更高。
+- Assistant 活跃态判断改为结合 `finish` 字段，回合结束后可更稳定停止“正在输出”状态。
 
 ## 开发建议
 
