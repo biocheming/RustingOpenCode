@@ -1,16 +1,20 @@
 pub mod compaction_helpers;
+mod file_parts;
 pub(crate) mod hooks;
+mod message_building;
 pub mod shell;
 pub mod subtask;
+mod tool_calls;
+mod tool_execution;
 pub mod tools_and_output;
 
 pub use compaction_helpers::{should_compact, trigger_compaction};
 pub(crate) use hooks::{
     apply_chat_message_hook_outputs, apply_chat_messages_hook_outputs, session_message_hook_payload,
 };
-pub use shell::{resolve_command_template, shell_exec, CommandInput, ShellInput};
 #[cfg(test)]
 pub(crate) use shell::resolve_shell_invocation;
+pub use shell::{resolve_command_template, shell_exec, CommandInput, ShellInput};
 pub use subtask::{tool_definitions_from_schemas, SubtaskExecutor, ToolSchema};
 pub use tools_and_output::{
     create_structured_output_tool, extract_structured_output, generate_session_title,
@@ -19,33 +23,19 @@ pub use tools_and_output::{
     structured_output_system_prompt, was_plan_agent, ResolvedTool, StructuredOutputConfig,
 };
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use base64::Engine;
 use futures::StreamExt;
 use rocode_plugin::{HookContext, HookEvent};
 use rocode_provider::transform::{apply_caching, ProviderType};
-use rocode_provider::{
-    get_model_context_limit, ChatRequest, ChatResponse, Content, ContentPart, Message, Provider,
-    Role, StreamEvent, ToolDefinition,
-};
+use rocode_provider::{ChatRequest, Provider, StreamEvent, ToolDefinition};
 
-use crate::compaction::{
-    run_compaction, CompactionConfig, CompactionEngine, CompactionResult, MessageForPrune,
-    ModelLimits, PruneToolPart, TokenUsage, ToolPartStatus,
-};
-use crate::message_v2::{
-    AssistantTime, AssistantTokens, CacheTokens, CompactionPart as V2CompactionPart, MessageInfo,
-    MessagePath, MessageWithParts, ModelRef as V2ModelRef, Part as V2Part, StepFinishPart,
-    StepStartPart, StepTokens, UserTime,
-};
-use crate::summary::{summarize_into_session, SummarizeInput};
-use crate::system::SystemPrompt;
+use crate::compaction::{run_compaction, CompactionResult};
+use crate::message_v2::ModelRef as V2ModelRef;
 use crate::{MessageRole, PartType, Session, SessionMessage, SessionStateManager};
 
 const MAX_STEPS: u32 = 100;
@@ -138,7 +128,7 @@ struct StreamToolState {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-struct PersistedSubsession {
+pub(super) struct PersistedSubsession {
     agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
@@ -149,7 +139,7 @@ struct PersistedSubsession {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PersistedSubsessionTurn {
+pub(super) struct PersistedSubsessionTurn {
     prompt: String,
     output: String,
 }
@@ -172,6 +162,70 @@ pub struct SessionPrompt {
 }
 
 impl SessionPrompt {
+    fn text_from_prompt_parts(parts: &[PartInput]) -> String {
+        parts
+            .iter()
+            .filter_map(|p| match p {
+                PartInput::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn truncate_debug_text(value: &str, max_chars: usize) -> String {
+        if value.chars().count() <= max_chars {
+            return value.to_string();
+        }
+        let mut out = value.chars().take(max_chars).collect::<String>();
+        out.push_str("...[truncated]");
+        out
+    }
+
+    fn annotate_latest_user_message(
+        session: &mut Session,
+        input: &PromptInput,
+        system_prompt: Option<&str>,
+    ) {
+        let Some(user_msg) = session
+            .messages
+            .iter_mut()
+            .rfind(|m| matches!(m.role, MessageRole::User))
+        else {
+            return;
+        };
+
+        if let Some(agent) = input.agent.as_deref() {
+            user_msg
+                .metadata
+                .insert("resolved_agent".to_string(), serde_json::json!(agent));
+        }
+
+        if let Some(system) = system_prompt {
+            user_msg.metadata.insert(
+                "resolved_system_prompt".to_string(),
+                serde_json::json!(Self::truncate_debug_text(system, 8000)),
+            );
+            user_msg.metadata.insert(
+                "resolved_system_prompt_applied".to_string(),
+                serde_json::json!(true),
+            );
+        } else if input.agent.is_some() {
+            user_msg.metadata.insert(
+                "resolved_system_prompt_applied".to_string(),
+                serde_json::json!(false),
+            );
+        }
+
+        let user_prompt = Self::text_from_prompt_parts(&input.parts);
+        if !user_prompt.is_empty() {
+            user_msg.metadata.insert(
+                "resolved_user_prompt".to_string(),
+                serde_json::json!(Self::truncate_debug_text(&user_prompt, 8000)),
+            );
+        }
+    }
+
     fn has_tool_result_after(session: &Session, message_index: usize, tool_call_id: &str) -> bool {
         session.messages.iter().skip(message_index + 1).any(|msg| {
             msg.parts.iter().any(|part| {
@@ -301,462 +355,7 @@ impl SessionPrompt {
         Ok(())
     }
 
-    async fn add_file_part(
-        &self,
-        msg: &mut SessionMessage,
-        raw_url: &str,
-        filename: Option<&str>,
-        mime: Option<&str>,
-        project_root: &str,
-    ) {
-        let filename = filename
-            .filter(|name| !name.is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| Self::filename_from_url(raw_url));
-        let mime = mime
-            .filter(|m| !m.is_empty())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-
-        if raw_url.starts_with("mcp://") {
-            self.add_mcp_resource_part(msg, raw_url, &filename, &mime)
-                .await;
-            return;
-        }
-
-        if raw_url.starts_with("data:") {
-            self.add_data_url_part(msg, raw_url, &filename, &mime).await;
-            return;
-        }
-
-        if raw_url.starts_with("file://") {
-            self.add_file_url_part(msg, raw_url, &filename, &mime, project_root)
-                .await;
-            return;
-        }
-
-        msg.add_file(raw_url.to_string(), filename, mime);
-    }
-
-    async fn add_mcp_resource_part(
-        &self,
-        msg: &mut SessionMessage,
-        raw_url: &str,
-        filename: &str,
-        mime: &str,
-    ) {
-        let Some((client_name, uri)) = Self::parse_mcp_resource_url(raw_url) else {
-            msg.add_text(format!("Failed to parse MCP resource URL: {}", raw_url));
-            msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-            return;
-        };
-
-        msg.add_text(format!("Reading MCP resource: {} ({})", filename, uri));
-
-        let Some(registry) = &self.mcp_clients else {
-            msg.add_text(
-                "MCP client registry is not configured; unable to read resource content."
-                    .to_string(),
-            );
-            msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-            return;
-        };
-
-        let Some(client) = registry.get(&client_name).await else {
-            msg.add_text(format!("MCP client `{}` is not connected.", client_name));
-            msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-            return;
-        };
-
-        match client.read_resource(&uri).await {
-            Ok(result) => {
-                let mut text_chunks = Vec::new();
-                let mut binary_chunks = Vec::new();
-                for content in result.contents {
-                    if let Some(text) = content.text {
-                        if !text.trim().is_empty() {
-                            text_chunks.push(text);
-                        }
-                        continue;
-                    }
-
-                    if content.blob.is_some() {
-                        binary_chunks.push(
-                            content
-                                .mime_type
-                                .clone()
-                                .unwrap_or_else(|| mime.to_string()),
-                        );
-                    }
-                }
-
-                if !text_chunks.is_empty() {
-                    msg.add_text(SystemPrompt::mcp_resource_reminder(
-                        filename,
-                        &uri,
-                        &text_chunks.join("\n\n"),
-                    ));
-                }
-
-                let has_binary = !binary_chunks.is_empty();
-                for mime in binary_chunks {
-                    msg.add_text(format!("[Binary content: {}]", mime));
-                }
-
-                if text_chunks.is_empty() && !has_binary {
-                    msg.add_text(format!("MCP resource `{}` returned no readable text.", uri));
-                }
-            }
-            Err(err) => {
-                msg.add_text(format!("Failed to read MCP resource `{}`: {}", uri, err));
-            }
-        }
-
-        msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-    }
-
-    async fn add_data_url_part(
-        &self,
-        msg: &mut SessionMessage,
-        raw_url: &str,
-        filename: &str,
-        mime: &str,
-    ) {
-        if let Some(text) = Self::decode_data_url_text(raw_url, mime) {
-            msg.add_text(format!(
-                "Called the Read tool with the following input: {}",
-                serde_json::json!({ "filePath": filename })
-            ));
-            msg.add_text(text);
-        }
-
-        msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-    }
-
-    async fn add_file_url_part(
-        &self,
-        msg: &mut SessionMessage,
-        raw_url: &str,
-        filename: &str,
-        mime: &str,
-        project_root: &str,
-    ) {
-        let parsed = match url::Url::parse(raw_url) {
-            Ok(url) => url,
-            Err(err) => {
-                msg.add_text(format!("Invalid file URL `{}`: {}", raw_url, err));
-                msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-                return;
-            }
-        };
-
-        let file_path = match parsed.to_file_path() {
-            Ok(path) => path,
-            Err(_) => {
-                msg.add_text(format!("Invalid file path URL `{}`", raw_url));
-                msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-                return;
-            }
-        };
-
-        let metadata = match tokio::fs::metadata(&file_path).await {
-            Ok(meta) => meta,
-            Err(err) => {
-                msg.add_text(format!(
-                    "Read tool failed to read {} with error: {}",
-                    file_path.display(),
-                    err
-                ));
-                msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-                return;
-            }
-        };
-
-        if metadata.is_dir() {
-            let listing = Self::read_directory_preview(&file_path).await;
-            msg.add_text(format!(
-                "Called the Read tool with the following input: {}",
-                serde_json::json!({ "filePath": file_path.display().to_string() })
-            ));
-            msg.add_text(listing);
-            msg.add_file(
-                raw_url.to_string(),
-                filename.to_string(),
-                "application/x-directory".to_string(),
-            );
-            return;
-        }
-
-        let bytes = match tokio::fs::read(&file_path).await {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                msg.add_text(format!(
-                    "Read tool failed to read {} with error: {}",
-                    file_path.display(),
-                    err
-                ));
-                msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-                return;
-            }
-        };
-
-        if Self::is_binary_asset_mime(mime) {
-            let data_url = format!(
-                "data:{};base64,{}",
-                mime,
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            );
-            msg.add_file(data_url, filename.to_string(), mime.to_string());
-            return;
-        }
-
-        let mut text = String::from_utf8_lossy(&bytes).to_string();
-        let mut read_args = serde_json::json!({
-            "filePath": file_path.display().to_string(),
-        });
-
-        if let Some((start, end)) = self.resolve_file_line_window(&file_path, &parsed).await {
-            text = Self::slice_lines(&text, start, end);
-            if let Some(obj) = read_args.as_object_mut() {
-                obj.insert("offset".to_string(), serde_json::json!(start));
-                if let Some(end) = end {
-                    obj.insert(
-                        "limit".to_string(),
-                        serde_json::json!(end.saturating_sub(start).saturating_add(1)),
-                    );
-                }
-            }
-        }
-
-        msg.add_text(format!(
-            "Called the Read tool with the following input: {}",
-            read_args
-        ));
-        msg.add_text(text);
-        Self::inject_instruction_prompt(msg, &file_path, Path::new(project_root));
-        msg.add_file(raw_url.to_string(), filename.to_string(), mime.to_string());
-    }
-
-    fn inject_instruction_prompt(msg: &mut SessionMessage, file_path: &Path, project_root: &Path) {
-        let mut loaded = Self::loaded_instruction_paths(msg);
-        let mut prompt_chunks = Vec::new();
-
-        for instruction in crate::instruction::resolve_agents_for_file(file_path, project_root) {
-            if loaded.insert(instruction.path.clone()) {
-                prompt_chunks.push(format!(
-                    "Instructions from: {}\n{}",
-                    instruction.path, instruction.content
-                ));
-            }
-        }
-
-        if prompt_chunks.is_empty() {
-            return;
-        }
-
-        msg.add_text(SystemPrompt::system_reminder(&prompt_chunks.join("\n\n")));
-        Self::store_loaded_instruction_paths(msg, loaded);
-    }
-
-    fn loaded_instruction_paths(msg: &SessionMessage) -> HashSet<String> {
-        msg.metadata
-            .get("loaded_instruction_files")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(ToString::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn store_loaded_instruction_paths(msg: &mut SessionMessage, loaded: HashSet<String>) {
-        if loaded.is_empty() {
-            return;
-        }
-
-        let mut paths: Vec<String> = loaded.into_iter().collect();
-        paths.sort();
-        msg.metadata.insert(
-            "loaded_instruction_files".to_string(),
-            serde_json::json!(paths),
-        );
-    }
-
-    async fn resolve_file_line_window(
-        &self,
-        file_path: &Path,
-        file_url: &url::Url,
-    ) -> Option<(usize, Option<usize>)> {
-        let (start, mut end) = Self::parse_line_window(file_url)?;
-        if end == Some(start) {
-            if let Some(symbol_end) = self.lookup_symbol_end_line(file_path, start).await {
-                end = Some(symbol_end);
-            }
-        }
-        Some((start, end))
-    }
-
-    async fn lookup_symbol_end_line(&self, file_path: &Path, start_line: usize) -> Option<usize> {
-        let registry = self.lsp_registry.as_ref()?;
-        let clients = registry.list().await;
-        if clients.is_empty() {
-            return None;
-        }
-
-        let content = tokio::fs::read_to_string(file_path).await.ok();
-        for (_, client) in clients {
-            if let Some(content) = content.as_deref() {
-                let language = rocode_lsp::detect_language(file_path);
-                let _ = client.open_document(file_path, content, language).await;
-            }
-
-            let symbols = match client.document_symbol(file_path).await {
-                Ok(symbols) => symbols,
-                Err(_) => continue,
-            };
-
-            for symbol in symbols {
-                let symbol_start = symbol.location.range.start.line as usize + 1;
-                if symbol_start != start_line {
-                    continue;
-                }
-
-                let symbol_end = symbol.location.range.end.line as usize + 1;
-                if symbol_end >= start_line {
-                    return Some(symbol_end);
-                }
-            }
-        }
-
-        None
-    }
-
-    fn parse_line_window(file_url: &url::Url) -> Option<(usize, Option<usize>)> {
-        let start = file_url.query_pairs().find_map(|(key, value)| {
-            if key != "start" {
-                return None;
-            }
-            value.parse::<usize>().ok().map(|n| n.max(1))
-        })?;
-
-        let end = file_url.query_pairs().find_map(|(key, value)| {
-            if key != "end" {
-                return None;
-            }
-            value.parse::<usize>().ok().map(|n| n.max(1))
-        });
-
-        Some((start, end))
-    }
-
-    fn decode_data_url_text(url: &str, mime: &str) -> Option<String> {
-        if !Self::is_text_mime(mime) {
-            return None;
-        }
-
-        let (metadata, payload) = url.split_once(',')?;
-        if metadata.contains(";base64") {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(payload.as_bytes())
-                .ok()?;
-            return Some(String::from_utf8_lossy(&bytes).to_string());
-        }
-
-        Some(payload.to_string())
-    }
-
-    fn parse_mcp_resource_url(url: &str) -> Option<(String, String)> {
-        let parsed = url::Url::parse(url).ok()?;
-        if parsed.scheme() != "mcp" {
-            return None;
-        }
-
-        let client_name = parsed.host_str()?.to_string();
-        let mut uri = parsed.path().trim_start_matches('/').to_string();
-        if let Some(query) = parsed.query() {
-            if !query.is_empty() {
-                if !uri.is_empty() {
-                    uri.push('?');
-                }
-                uri.push_str(query);
-            }
-        }
-
-        if uri.is_empty() {
-            return None;
-        }
-
-        Some((client_name, uri))
-    }
-
-    fn filename_from_url(url: &str) -> String {
-        if let Ok(parsed) = url::Url::parse(url) {
-            if let Some(last) = parsed
-                .path_segments()
-                .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
-            {
-                return last.to_string();
-            }
-        }
-        String::new()
-    }
-
-    fn is_text_mime(mime: &str) -> bool {
-        mime.starts_with("text/")
-            || matches!(
-                mime,
-                "application/json"
-                    | "application/xml"
-                    | "application/javascript"
-                    | "application/typescript"
-                    | "application/x-sh"
-                    | "application/x-shellscript"
-            )
-    }
-
-    fn is_binary_asset_mime(mime: &str) -> bool {
-        mime.starts_with("image/") || mime == "application/pdf"
-    }
-
-    fn slice_lines(text: &str, start: usize, end: Option<usize>) -> String {
-        let lines: Vec<&str> = text.lines().collect();
-        if lines.is_empty() {
-            return String::new();
-        }
-
-        let start_idx = start.saturating_sub(1).min(lines.len());
-        let end_idx = end.unwrap_or(lines.len()).min(lines.len());
-        if start_idx >= end_idx {
-            return String::new();
-        }
-
-        lines[start_idx..end_idx].join("\n")
-    }
-
-    async fn read_directory_preview(path: &Path) -> String {
-        let mut entries = match tokio::fs::read_dir(path).await {
-            Ok(entries) => entries,
-            Err(err) => return format!("Failed to list directory {}: {}", path.display(), err),
-        };
-
-        let mut names = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            names.push(entry.file_name().to_string_lossy().to_string());
-            if names.len() >= 200 {
-                names.push("... (truncated)".to_string());
-                break;
-            }
-        }
-
-        if names.is_empty() {
-            return format!("Directory is empty: {}", path.display());
-        }
-
-        names.sort();
-        names.join("\n")
-    }
+    // --- file_parts methods moved to file_parts.rs ---
 
     async fn start(&self, session_id: &str) -> Option<CancellationToken> {
         let state = self.state.lock().await;
@@ -846,7 +445,53 @@ impl SessionPrompt {
             None => return Err(anyhow::anyhow!("Session already running")),
         };
 
+        // Keep model/provider resolution aligned for both hook payloads and prompt loop.
+        let model_id = input
+            .model
+            .as_ref()
+            .map(|m| m.model_id.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let provider_id = input
+            .model
+            .as_ref()
+            .map(|m| m.provider_id.clone())
+            .unwrap_or_else(|| "anthropic".to_string());
+
         self.create_user_message(&input, session).await?;
+        Self::annotate_latest_user_message(session, &input, system_prompt.as_deref());
+
+        // TS parity: trigger `chat.message` when the user message is created.
+        if let Some(user_message) = session
+            .messages
+            .iter()
+            .rfind(|m| matches!(m.role, MessageRole::User))
+            .cloned()
+        {
+            let mut hook_ctx = HookContext::new(HookEvent::ChatMessage)
+                .with_session(&input.session_id)
+                .with_data("model_id", serde_json::json!(&model_id))
+                .with_data("provider_id", serde_json::json!(&provider_id))
+                .with_data("message_id", serde_json::json!(&user_message.id))
+                .with_data("message", session_message_hook_payload(&user_message))
+                .with_data("parts", serde_json::json!(&user_message.parts));
+
+            if let Some(agent) = input.agent.as_deref() {
+                hook_ctx = hook_ctx.with_data("agent", serde_json::json!(agent));
+            }
+            if let Some(variant) = input.variant.as_deref() {
+                hook_ctx = hook_ctx.with_data("variant", serde_json::json!(variant));
+            }
+
+            let hook_outputs = rocode_plugin::trigger_collect(hook_ctx).await;
+            if let Some(current_user_message) = session
+                .messages
+                .iter_mut()
+                .rfind(|m| matches!(m.role, MessageRole::User))
+            {
+                apply_chat_message_hook_outputs(current_user_message, hook_outputs);
+            }
+        }
+
         session.touch();
         Self::emit_session_update(update_hook.as_ref(), session);
 
@@ -861,16 +506,6 @@ impl SessionPrompt {
         }
 
         let session_id = input.session_id.clone();
-        let model_id = input
-            .model
-            .as_ref()
-            .map(|m| m.model_id.clone())
-            .unwrap_or_else(|| "default".to_string());
-        let provider_id = input
-            .model
-            .as_ref()
-            .map(|m| m.provider_id.clone())
-            .unwrap_or_else(|| "anthropic".to_string());
 
         let result = Self::loop_inner(
             session_id.clone(),
@@ -1034,9 +669,10 @@ impl SessionPrompt {
             // guaranteed lexicographic ordering.
             if let Some(assistant_idx) = last_assistant_idx {
                 let assistant = &filtered_messages[assistant_idx];
-                let is_terminal = assistant.finish.as_deref().is_some_and(|f| {
-                    !matches!(f, "tool-calls" | "tool_calls" | "unknown")
-                });
+                let is_terminal = assistant
+                    .finish
+                    .as_deref()
+                    .is_some_and(|f| !matches!(f, "tool-calls" | "tool_calls" | "unknown"));
 
                 if is_terminal && last_user_idx < assistant_idx {
                     tracing::info!(
@@ -1117,6 +753,13 @@ impl SessionPrompt {
                     }
                 }
             }
+
+            tracing::info!(
+                step = step,
+                session_id = %session_id,
+                message_count = filtered_messages.len(),
+                "[plugin-seq] prompt loop step start"
+            );
 
             tracing::info!("Prompt loop step {} for session {}", step, session_id);
 
@@ -1217,6 +860,9 @@ impl SessionPrompt {
             let mut finish_reason: Option<String> = None;
             let mut prompt_tokens: u64 = 0;
             let mut completion_tokens: u64 = 0;
+            let mut reasoning_tokens: u64 = 0;
+            let mut cache_read_tokens: u64 = 0;
+            let mut cache_write_tokens: u64 = 0;
             let mut executed_local_tools_this_step = false;
             let mut last_emit = Instant::now() - Duration::from_millis(50);
 
@@ -1346,11 +992,24 @@ impl SessionPrompt {
                             tracing::warn!(tool_call_id = %id, "ignoring ToolCallEnd with empty tool name");
                             continue;
                         }
-                        let raw_input = serde_json::to_string(&input).unwrap_or_default();
+                        // Avoid double-encoding: if the provider returned
+                        // Value::String (e.g. flush path for incomplete JSON),
+                        // use the string content directly as raw_input and try
+                        // to parse it into an object for entry.input.
+                        let (raw_input, parsed_input) = match &input {
+                            serde_json::Value::String(s) => {
+                                let parsed = Self::parse_json_or_string(s);
+                                (s.clone(), parsed)
+                            }
+                            other => (
+                                serde_json::to_string(other).unwrap_or_default(),
+                                other.clone(),
+                            ),
+                        };
                         tracing::info!(
                             tool_call_id = %id,
                             tool_name = %name,
-                            input_type = %if input.is_object() { "object" } else if input.is_string() { "string" } else { "other" },
+                            input_type = %if parsed_input.is_object() { "object" } else if parsed_input.is_string() { "string" } else { "other" },
                             raw_input_len = raw_input.len(),
                             raw_input_preview = %raw_input.chars().take(200).collect::<String>(),
                             "[DIAG] ToolCallEnd received"
@@ -1371,7 +1030,7 @@ impl SessionPrompt {
                                 });
                         entry.name = name.clone();
                         entry.raw_input = raw_input.clone();
-                        entry.input = input.clone();
+                        entry.input = parsed_input;
                         entry.status = crate::ToolCallStatus::Running;
                         entry.state = crate::ToolState::Running {
                             input: entry.input.clone(),
@@ -1600,6 +1259,9 @@ impl SessionPrompt {
                         }
                         prompt_tokens = usage.prompt_tokens;
                         completion_tokens = usage.completion_tokens;
+                        reasoning_tokens = usage.reasoning_tokens;
+                        cache_read_tokens = usage.cache_read_tokens;
+                        cache_write_tokens = usage.cache_write_tokens;
                     }
                     Ok(StreamEvent::Usage {
                         prompt_tokens: pt,
@@ -1756,11 +1418,36 @@ impl SessionPrompt {
                     serde_json::json!({
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
+                        "reasoning_tokens": reasoning_tokens,
+                        "cache_read_tokens": cache_read_tokens,
+                        "cache_write_tokens": cache_write_tokens,
                     }),
+                );
+                assistant_msg
+                    .metadata
+                    .insert("tokens_input".to_string(), serde_json::json!(prompt_tokens));
+                assistant_msg.metadata.insert(
+                    "tokens_output".to_string(),
+                    serde_json::json!(completion_tokens),
+                );
+                assistant_msg.metadata.insert(
+                    "tokens_reasoning".to_string(),
+                    serde_json::json!(reasoning_tokens),
+                );
+                assistant_msg.metadata.insert(
+                    "tokens_cache_read".to_string(),
+                    serde_json::json!(cache_read_tokens),
+                );
+                assistant_msg.metadata.insert(
+                    "tokens_cache_write".to_string(),
+                    serde_json::json!(cache_write_tokens),
                 );
                 assistant_msg.usage = Some(crate::message::MessageUsage {
                     input_tokens: prompt_tokens,
                     output_tokens: completion_tokens,
+                    reasoning_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
                     ..Default::default()
                 });
             }
@@ -1859,7 +1546,7 @@ impl SessionPrompt {
                 }
             }
 
-            let mut has_tool_calls = session
+            let has_tool_calls = session
                 .messages
                 .get(assistant_index)
                 .map(Self::has_unresolved_tool_calls)
@@ -1868,41 +1555,11 @@ impl SessionPrompt {
             tracing::info!(
                 has_tool_calls = has_tool_calls,
                 finish_reason = %finish_reason.as_deref().unwrap_or("None"),
-                "[DIAG] post-stream: before chat.message plugin hook"
+                "[DIAG] post-stream: before tool execution check"
             );
 
             session.touch();
             Self::emit_session_update(update_hook.as_ref(), session);
-
-            // Plugin hook: chat.message — notify plugins of new assistant message
-            if let Some(assistant_message) = session.messages.get(assistant_index).cloned() {
-                let hook_outputs = rocode_plugin::trigger_collect(
-                    HookContext::new(HookEvent::ChatMessage)
-                        .with_session(&session_id)
-                        .with_data("model_id", serde_json::json!(&model_id))
-                        .with_data("provider_id", serde_json::json!(&provider_id))
-                        .with_data("message_id", serde_json::json!(&assistant_message.id))
-                        .with_data("has_tool_calls", serde_json::json!(has_tool_calls))
-                        .with_data("message", session_message_hook_payload(&assistant_message))
-                        .with_data("parts", serde_json::json!(&assistant_message.parts)),
-                )
-                .await;
-                tracing::info!("[DIAG] post-stream: chat.message plugin hook completed");
-                if let Some(current_message) = session.messages.get_mut(assistant_index) {
-                    apply_chat_message_hook_outputs(current_message, hook_outputs);
-                }
-                has_tool_calls = session
-                    .messages
-                    .get(assistant_index)
-                    .map(Self::has_unresolved_tool_calls)
-                    .unwrap_or(false);
-            }
-
-            tracing::info!(
-                has_tool_calls = has_tool_calls,
-                finish_reason = %finish_reason.as_deref().unwrap_or("None"),
-                "[DIAG] post-stream: after chat.message hook, before tool execution check"
-            );
 
             if has_tool_calls {
                 tracing::info!("Processing tool calls for session {}", session_id);
@@ -1998,1216 +1655,6 @@ impl SessionPrompt {
         if force || elapsed >= Duration::from_millis(50) {
             Self::emit_session_update(update_hook, session);
             *last_emit = Instant::now();
-        }
-    }
-
-    fn upsert_tool_call_part(
-        message: &mut SessionMessage,
-        tool_call_id: &str,
-        tool_name: Option<&str>,
-        input: Option<serde_json::Value>,
-        raw_input: Option<String>,
-        status: Option<crate::ToolCallStatus>,
-        tool_state: Option<crate::ToolState>,
-    ) {
-        let mut input = input;
-        let mut raw_input = raw_input;
-        let mut status = status;
-        if let Some(state) = tool_state.as_ref() {
-            let (state_input, state_raw, state_status) = Self::state_projection(state);
-            input = Some(state_input);
-            // Only override raw_input if state_projection returns Some.
-            // Running/Completed/Error states return None for raw, but the
-            // caller may have explicitly provided a raw value that should
-            // be preserved.
-            if state_raw.is_some() {
-                raw_input = state_raw;
-            }
-            status = Some(state_status);
-        }
-
-        let mut found = false;
-        for part in &mut message.parts {
-            if let PartType::ToolCall {
-                id,
-                name,
-                input: part_input,
-                status: part_status,
-                raw,
-                state,
-            } = &mut part.part_type
-            {
-                if id == tool_call_id {
-                    if let Some(next_name) = tool_name {
-                        if !next_name.is_empty() {
-                            *name = next_name.to_string();
-                        }
-                    }
-                    if let Some(next_input) = input.as_ref() {
-                        *part_input = next_input.clone();
-                    }
-                    if let Some(next_raw) = raw_input.as_ref() {
-                        *raw = Some(next_raw.clone());
-                    }
-                    if let Some(next_status) = status.as_ref() {
-                        *part_status = next_status.clone();
-                    }
-                    if let Some(next_state) = tool_state.as_ref() {
-                        *state = Some(next_state.clone());
-                    }
-                    found = true;
-                    break;
-                }
-            }
-        }
-
-        if found {
-            return;
-        }
-
-        message.parts.push(crate::MessagePart {
-            id: rocode_core::id::create(rocode_core::id::Prefix::Part, true, None),
-            part_type: PartType::ToolCall {
-                id: tool_call_id.to_string(),
-                name: tool_name.unwrap_or_default().to_string(),
-                input: input.unwrap_or_else(|| serde_json::json!({})),
-                status: status.unwrap_or(crate::ToolCallStatus::Pending),
-                raw: raw_input,
-                state: tool_state,
-            },
-            created_at: chrono::Utc::now(),
-            message_id: None,
-        });
-    }
-
-    fn state_projection(
-        state: &crate::ToolState,
-    ) -> (serde_json::Value, Option<String>, crate::ToolCallStatus) {
-        match state {
-            crate::ToolState::Pending { input, raw } => (
-                input.clone(),
-                Some(raw.clone()),
-                crate::ToolCallStatus::Pending,
-            ),
-            crate::ToolState::Running { input, .. } => {
-                (input.clone(), None, crate::ToolCallStatus::Running)
-            }
-            crate::ToolState::Completed { input, .. } => {
-                (input.clone(), None, crate::ToolCallStatus::Completed)
-            }
-            crate::ToolState::Error { input, .. } => {
-                (input.clone(), None, crate::ToolCallStatus::Error)
-            }
-        }
-    }
-
-    fn push_tool_result_part(
-        message: &mut SessionMessage,
-        tool_call_id: String,
-        content: String,
-        is_error: bool,
-        title: Option<String>,
-        metadata: Option<HashMap<String, serde_json::Value>>,
-        attachments: Option<Vec<serde_json::Value>>,
-    ) {
-        message.parts.push(crate::MessagePart {
-            id: rocode_core::id::create(rocode_core::id::Prefix::Part, true, None),
-            part_type: PartType::ToolResult {
-                tool_call_id,
-                content,
-                is_error,
-                title,
-                metadata,
-                attachments,
-            },
-            created_at: chrono::Utc::now(),
-            message_id: None,
-        });
-    }
-
-    fn take_attachment_values(
-        metadata: &mut HashMap<String, serde_json::Value>,
-    ) -> Option<Vec<serde_json::Value>> {
-        let mut attachments = Vec::new();
-
-        if let Some(value) = metadata.remove("attachments") {
-            match value {
-                serde_json::Value::Array(values) => attachments.extend(values),
-                serde_json::Value::Null => {}
-                other => attachments.push(other),
-            }
-        }
-
-        if let Some(value) = metadata.remove("attachment") {
-            if !value.is_null() {
-                attachments.push(value);
-            }
-        }
-
-        if attachments.is_empty() {
-            None
-        } else {
-            Some(attachments)
-        }
-    }
-
-    fn normalize_tool_attachments(
-        raw_attachments: Option<Vec<serde_json::Value>>,
-        session_id: &str,
-        message_id: &str,
-    ) -> (
-        Option<Vec<serde_json::Value>>,
-        Option<Vec<crate::message_v2::FilePart>>,
-    ) {
-        let mut normalized_json = Vec::new();
-        let mut normalized_files = Vec::new();
-
-        for value in raw_attachments.unwrap_or_default() {
-            let Some(obj) = value.as_object() else {
-                continue;
-            };
-
-            let Some(mime) = obj.get("mime").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(url) = obj.get("url").and_then(|v| v.as_str()) else {
-                continue;
-            };
-
-            let filename = obj
-                .get("filename")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string);
-            let id = obj
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string)
-                .unwrap_or_else(|| {
-                    rocode_core::id::create(rocode_core::id::Prefix::Part, true, None)
-                });
-            let normalized_session_id = obj
-                .get("sessionID")
-                .or_else(|| obj.get("session_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(session_id)
-                .to_string();
-            let normalized_message_id = obj
-                .get("messageID")
-                .or_else(|| obj.get("message_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(message_id)
-                .to_string();
-
-            let mut normalized = serde_json::Map::new();
-            normalized.insert("type".to_string(), serde_json::json!("file"));
-            normalized.insert("id".to_string(), serde_json::json!(id.clone()));
-            normalized.insert(
-                "sessionID".to_string(),
-                serde_json::json!(normalized_session_id.clone()),
-            );
-            normalized.insert(
-                "messageID".to_string(),
-                serde_json::json!(normalized_message_id.clone()),
-            );
-            normalized.insert("mime".to_string(), serde_json::json!(mime));
-            normalized.insert("url".to_string(), serde_json::json!(url));
-            if let Some(name) = filename.clone() {
-                normalized.insert("filename".to_string(), serde_json::json!(name));
-            }
-
-            normalized_json.push(serde_json::Value::Object(normalized));
-            normalized_files.push(crate::message_v2::FilePart {
-                id,
-                session_id: normalized_session_id,
-                message_id: normalized_message_id,
-                mime: mime.to_string(),
-                url: url.to_string(),
-                filename,
-                source: None,
-            });
-        }
-
-        (
-            (!normalized_json.is_empty()).then_some(normalized_json),
-            (!normalized_files.is_empty()).then_some(normalized_files),
-        )
-    }
-
-    fn extract_tool_attachments_from_metadata(
-        metadata: &mut HashMap<String, serde_json::Value>,
-        session_id: &str,
-        message_id: &str,
-    ) -> (
-        Option<Vec<serde_json::Value>>,
-        Option<Vec<crate::message_v2::FilePart>>,
-    ) {
-        let raw_attachments = Self::take_attachment_values(metadata);
-        Self::normalize_tool_attachments(raw_attachments, session_id, message_id)
-    }
-
-    fn has_unresolved_tool_calls(message: &SessionMessage) -> bool {
-        message.parts.iter().any(|part| {
-            let PartType::ToolCall {
-                name,
-                input,
-                status,
-                raw,
-                state,
-                ..
-            } = &part.part_type
-            else {
-                return false;
-            };
-
-            if name.trim().is_empty() {
-                return false;
-            }
-
-            Self::tool_call_input_for_execution(status, input, raw.as_deref(), state.as_ref())
-                .is_some()
-        })
-    }
-
-    fn parse_json_or_string(raw: &str) -> serde_json::Value {
-        // First try standard JSON parse.
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
-            return val;
-        }
-        // Some providers emit arguments with trailing commas, BOM, or other
-        // minor deviations. Try stripping common noise before giving up.
-        let cleaned = raw
-            .trim()
-            .trim_start_matches('\u{feff}') // BOM
-            .trim();
-        if cleaned != raw {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(cleaned) {
-                return val;
-            }
-        }
-        // If the raw string looks like it could be a JSON object with issues,
-        // wrap it so tools can still access it via the registry normalizer.
-        tracing::warn!(
-            raw_len = raw.len(),
-            raw_preview = %if raw.len() > 200 { &raw[..200] } else { raw },
-            "tool call arguments failed JSON parse, wrapping as string"
-        );
-        serde_json::Value::String(raw.to_string())
-    }
-
-    fn invalid_tool_payload(tool_name: &str, error: &str) -> serde_json::Value {
-        serde_json::json!({
-            "tool": tool_name,
-            "error": error,
-        })
-    }
-
-    fn tool_call_input_for_execution(
-        status: &crate::ToolCallStatus,
-        input: &serde_json::Value,
-        raw: Option<&str>,
-        state: Option<&crate::ToolState>,
-    ) -> Option<serde_json::Value> {
-        tracing::info!(
-            status = %format!("{:?}", status),
-            input_type = %if input.is_object() { format!("object(keys={})", input.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default()) } else if input.is_string() { format!("string(len={})", input.as_str().map(|s| s.len()).unwrap_or(0)) } else { format!("{:?}", input) },
-            raw_len = %raw.map(|r| r.len()).unwrap_or(0),
-            raw_preview = %raw.unwrap_or("None").chars().take(200).collect::<String>(),
-            state_variant = %match state {
-                Some(crate::ToolState::Pending { .. }) => "Pending",
-                Some(crate::ToolState::Running { .. }) => "Running",
-                Some(crate::ToolState::Completed { .. }) => "Completed",
-                Some(crate::ToolState::Error { .. }) => "Error",
-                None => "None",
-            },
-            "[DIAG] tool_call_input_for_execution entry"
-        );
-        let (state_input, state_raw) = match state {
-            Some(crate::ToolState::Pending { input, raw }) => {
-                (Some(input.clone()), Some(raw.as_str()))
-            }
-            Some(crate::ToolState::Running { input, .. })
-            | Some(crate::ToolState::Completed { input, .. })
-            | Some(crate::ToolState::Error { input, .. }) => (Some(input.clone()), None),
-            None => (None, None),
-        };
-
-        let raw_input = state_raw.or(raw).map(str::trim).filter(|s| !s.is_empty());
-
-        match status {
-            // TS parity: tool execution begins on "tool-call" (running state),
-            // not on partial/pending input fragments.
-            crate::ToolCallStatus::Pending => None,
-            crate::ToolCallStatus::Running => {
-                // Try raw input first (most authoritative source).
-                if let Some(raw) = raw_input {
-                    let parsed = Self::parse_json_or_string(raw);
-                    // If parse_json_or_string returned a non-empty object, use it.
-                    if parsed.is_object() && parsed.as_object().map_or(false, |o| !o.is_empty()) {
-                        return Some(parsed);
-                    }
-                    // If it returned a Value::String, the registry normalizer
-                    // will try to parse it again. Still usable.
-                    if parsed.is_string() {
-                        return Some(parsed);
-                    }
-                }
-
-                // Fall back to state_input or PartType input.
-                let fallback = state_input.unwrap_or_else(|| input.clone());
-
-                // If the fallback is an empty object but the PartType input is
-                // a string (e.g. Value::String wrapping JSON), try to parse it.
-                if fallback.is_object() && fallback.as_object().map_or(false, |o| o.is_empty()) {
-                    // Try the PartType's input directly — it might be a
-                    // Value::String containing valid JSON.
-                    if let Some(s) = input.as_str() {
-                        if let Ok(parsed @ serde_json::Value::Object(_)) = serde_json::from_str(s) {
-                            tracing::debug!(
-                                "tool_call_input_for_execution: recovered args from input string"
-                            );
-                            return Some(parsed);
-                        }
-                    }
-                    // Also try raw from PartType even if state_raw was empty.
-                    if let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) {
-                        if let Ok(parsed @ serde_json::Value::Object(_)) = serde_json::from_str(raw)
-                        {
-                            tracing::debug!(
-                                "tool_call_input_for_execution: recovered args from raw field"
-                            );
-                            return Some(parsed);
-                        }
-                    }
-                }
-
-                Some(fallback)
-            }
-            crate::ToolCallStatus::Completed | crate::ToolCallStatus::Error => None,
-        }
-    }
-
-    fn append_delta_part(message: &mut SessionMessage, reasoning: bool, delta: &str) {
-        if delta.is_empty() {
-            return;
-        }
-
-        for part in message.parts.iter_mut().rev() {
-            match (&mut part.part_type, reasoning) {
-                (PartType::Reasoning { text }, true) => {
-                    text.push_str(delta);
-                    return;
-                }
-                (PartType::Text { text, .. }, false) => {
-                    text.push_str(delta);
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        message.parts.push(crate::MessagePart {
-            id: rocode_core::id::create(rocode_core::id::Prefix::Part, true, None),
-            part_type: if reasoning {
-                PartType::Reasoning {
-                    text: delta.to_string(),
-                }
-            } else {
-                PartType::Text {
-                    text: delta.to_string(),
-                    synthetic: None,
-                    ignored: None,
-                }
-            },
-            created_at: chrono::Utc::now(),
-            message_id: None,
-        });
-    }
-
-    /// Mark any tool calls that lack a corresponding tool result as aborted.
-    ///
-    /// When the prompt loop is cancelled mid-execution, some tool calls in the
-    /// assistant messages may not have received their results yet. This mirrors
-    /// the TS abort handling in processor.ts that sets incomplete tool parts to
-    /// error status with "Tool execution aborted".
-    fn abort_pending_tool_calls(session: &mut Session) {
-        // Collect all tool call IDs that already have a result
-        let mut resolved_call_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for msg in &session.messages {
-            for part in &msg.parts {
-                if let PartType::ToolResult { tool_call_id, .. } = &part.part_type {
-                    resolved_call_ids.insert(tool_call_id.clone());
-                }
-            }
-        }
-
-        // Find unresolved tool calls and add error results
-        let mut pending_calls: Vec<String> = Vec::new();
-        for msg in &session.messages {
-            for part in &msg.parts {
-                if let PartType::ToolCall { id, .. } = &part.part_type {
-                    if !resolved_call_ids.contains(id) {
-                        pending_calls.push(id.clone());
-                    }
-                }
-            }
-        }
-
-        if pending_calls.is_empty() {
-            return;
-        }
-
-        tracing::info!(
-            count = pending_calls.len(),
-            "Marking pending tool calls as aborted"
-        );
-
-        // Add error results as a tool-role message so providers that enforce
-        // role semantics (for example Anthropic) can ingest it correctly.
-        let mut tool_results_msg = SessionMessage::tool(session.id.clone());
-        for call_id in pending_calls {
-            tool_results_msg.add_tool_result(&call_id, "Tool execution aborted", true);
-        }
-        session.messages.push(tool_results_msg);
-    }
-
-    pub async fn execute_tool_calls(
-        session: &mut Session,
-        tool_registry: Arc<rocode_tool::ToolRegistry>,
-        ctx: rocode_tool::ToolContext,
-        provider: Arc<dyn Provider>,
-        provider_id: &str,
-        model_id: &str,
-    ) -> anyhow::Result<()> {
-        Self::execute_tool_calls_with_hook(
-            session,
-            tool_registry,
-            ctx,
-            provider,
-            provider_id,
-            model_id,
-            None,
-            None,
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn execute_tool_calls_with_hook(
-        session: &mut Session,
-        tool_registry: Arc<rocode_tool::ToolRegistry>,
-        ctx: rocode_tool::ToolContext,
-        provider: Arc<dyn Provider>,
-        provider_id: &str,
-        model_id: &str,
-        update_hook: Option<&SessionUpdateHook>,
-        agent_lookup: Option<Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>>,
-    ) -> anyhow::Result<usize> {
-        let Some(last_assistant_index) = session
-            .messages
-            .iter()
-            .rposition(|m| matches!(m.role, MessageRole::Assistant))
-        else {
-            return Ok(0);
-        };
-
-        let resolved_call_ids: HashSet<String> = session
-            .messages
-            .iter()
-            .skip(last_assistant_index + 1)
-            .flat_map(|m| m.parts.iter())
-            .filter_map(|p| match &p.part_type {
-                PartType::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
-                _ => None,
-            })
-            .collect();
-
-        let tool_calls: Vec<(String, String, serde_json::Value)> = session.messages
-            [last_assistant_index]
-            .parts
-            .iter()
-            .filter_map(|p| match &p.part_type {
-                PartType::ToolCall {
-                    id,
-                    name,
-                    input,
-                    status,
-                    raw,
-                    state,
-                    ..
-                } if !resolved_call_ids.contains(id) && !name.trim().is_empty() => {
-                    Self::tool_call_input_for_execution(
-                        status,
-                        input,
-                        raw.as_deref(),
-                        state.as_ref(),
-                    )
-                    .map(|args| (id.clone(), name.clone(), args))
-                }
-                _ => None,
-            })
-            .collect();
-
-        if tool_calls.is_empty() {
-            return Ok(0);
-        }
-
-        if let Some(assistant_msg) = session.messages.get_mut(last_assistant_index) {
-            for (call_id, tool_name, input) in &tool_calls {
-                Self::upsert_tool_call_part(
-                    assistant_msg,
-                    call_id,
-                    Some(tool_name),
-                    Some(input.clone()),
-                    None,
-                    Some(crate::ToolCallStatus::Running),
-                    Some(crate::ToolState::Running {
-                        input: input.clone(),
-                        title: None,
-                        metadata: None,
-                        time: crate::RunningTime {
-                            start: chrono::Utc::now().timestamp_millis(),
-                        },
-                    }),
-                );
-            }
-        }
-
-        // Emit update so TUI shows tools in "Running" state immediately.
-        Self::emit_session_update(update_hook, session);
-
-        let subsessions = Arc::new(Mutex::new(Self::load_persisted_subsessions(session)));
-        let default_model = format!("{}:{}", provider_id, model_id);
-        let ctx = Self::with_persistent_subsession_callbacks(
-            ctx,
-            subsessions.clone(),
-            provider,
-            tool_registry.clone(),
-            default_model,
-            agent_lookup,
-        )
-        .with_registry(tool_registry.clone());
-        let available_tool_ids: HashSet<String> =
-            tool_registry.list_ids().await.into_iter().collect();
-
-        let mut executed_calls = 0usize;
-        let tool_results_msg = {
-            let mut msg = SessionMessage::tool(ctx.session_id.clone());
-            for (call_id, tool_name, input) in tool_calls {
-                tracing::info!(
-                    tool_call_id = %call_id,
-                    tool_name = %tool_name,
-                    input_type = %if input.is_object() { "object" } else if input.is_string() { "string" } else { "other" },
-                    input_keys = %if input.is_object() {
-                        input.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default()
-                    } else {
-                        input.to_string().chars().take(120).collect::<String>()
-                    },
-                    "[DIAG] executing tool call"
-                );
-                let mut tool_ctx = ctx.clone();
-                tool_ctx.call_id = Some(call_id.clone());
-                let repaired_tool_name =
-                    Self::repair_tool_call_name(&tool_name, &available_tool_ids);
-                let mut effective_tool_name = repaired_tool_name.clone();
-                let mut effective_input =
-                    if repaired_tool_name == "invalid" && tool_name != "invalid" {
-                        Self::invalid_tool_payload(
-                            &tool_name,
-                            &format!("Unknown tool requested by model: {}", tool_name),
-                        )
-                    } else {
-                        input
-                    };
-
-                let mut execution = tool_registry
-                    .execute(
-                        &effective_tool_name,
-                        effective_input.clone(),
-                        tool_ctx.clone(),
-                    )
-                    .await;
-
-                if effective_tool_name != "invalid"
-                    && available_tool_ids.contains("invalid")
-                    && matches!(&execution, Err(rocode_tool::ToolError::InvalidArguments(_)))
-                {
-                    let validation_error = execution
-                        .as_ref()
-                        .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "Invalid arguments".to_string());
-                    tracing::info!(
-                        tool_name = %tool_name,
-                        error = %validation_error,
-                        "tool call validation failed, routing to invalid tool"
-                    );
-                    effective_tool_name = "invalid".to_string();
-                    effective_input = Self::invalid_tool_payload(&tool_name, &validation_error);
-                    execution = tool_registry
-                        .execute(
-                            &effective_tool_name,
-                            effective_input.clone(),
-                            tool_ctx.clone(),
-                        )
-                        .await;
-                }
-
-                let (content, is_error, title, metadata, attachments, state_attachments) =
-                    match execution {
-                        Ok(result) => {
-                            let mut metadata = result.metadata;
-                            let (attachments, state_attachments) =
-                                Self::extract_tool_attachments_from_metadata(
-                                    &mut metadata,
-                                    &ctx.session_id,
-                                    &ctx.message_id,
-                                );
-                            (
-                                result.output,
-                                false,
-                                Some(result.title),
-                                Some(metadata),
-                                attachments,
-                                state_attachments,
-                            )
-                        }
-                        Err(e) => (
-                            format!("Error: {}", e),
-                            true,
-                            Some("Tool Error".to_string()),
-                            None,
-                            None,
-                            None,
-                        ),
-                    };
-
-                Self::push_tool_result_part(
-                    &mut msg,
-                    call_id.clone(),
-                    content.clone(),
-                    is_error,
-                    title.clone(),
-                    metadata.clone(),
-                    attachments.clone(),
-                );
-                executed_calls += 1;
-
-                if let Some(assistant_msg) = session.messages.get_mut(last_assistant_index) {
-                    let now = chrono::Utc::now().timestamp_millis();
-                    let next_state = if is_error {
-                        crate::ToolState::Error {
-                            input: effective_input.clone(),
-                            error: content.clone(),
-                            metadata: None,
-                            time: crate::ErrorTime {
-                                start: now,
-                                end: now,
-                            },
-                        }
-                    } else {
-                        crate::ToolState::Completed {
-                            input: effective_input.clone(),
-                            output: content.clone(),
-                            title: title.clone().unwrap_or_else(|| "Tool Result".to_string()),
-                            metadata: metadata.clone().unwrap_or_default(),
-                            time: crate::CompletedTime {
-                                start: now,
-                                end: now,
-                                compacted: None,
-                            },
-                            attachments: state_attachments.clone(),
-                        }
-                    };
-                    Self::upsert_tool_call_part(
-                        assistant_msg,
-                        &call_id,
-                        Some(&effective_tool_name),
-                        Some(effective_input),
-                        None,
-                        Some(if is_error {
-                            crate::ToolCallStatus::Error
-                        } else {
-                            crate::ToolCallStatus::Completed
-                        }),
-                        Some(next_state),
-                    );
-                }
-
-                // Emit update after each tool completes so TUI renders results incrementally.
-                Self::emit_session_update(update_hook, session);
-            }
-            msg
-        };
-
-        if !tool_results_msg.parts.is_empty() {
-            session.messages.push(tool_results_msg);
-        }
-        let persisted = subsessions.lock().await.clone();
-        Self::save_persisted_subsessions(session, &persisted);
-        Ok(executed_calls)
-    }
-
-    fn repair_tool_call_name(tool_name: &str, available_tool_ids: &HashSet<String>) -> String {
-        if available_tool_ids.contains(tool_name) {
-            return tool_name.to_string();
-        }
-
-        let lower = tool_name.to_ascii_lowercase();
-        if lower != tool_name && available_tool_ids.contains(&lower) {
-            tracing::info!(
-                original = tool_name,
-                repaired = %lower,
-                "repairing tool call name via lowercase match"
-            );
-            return lower;
-        }
-
-        if available_tool_ids.contains("invalid") {
-            tracing::warn!(
-                tool_name = tool_name,
-                "unknown tool call, routing to invalid tool"
-            );
-            return "invalid".to_string();
-        }
-
-        tool_name.to_string()
-    }
-
-    fn mcp_tools_from_session(session: &Session) -> Vec<ToolDefinition> {
-        session
-            .metadata
-            .get("mcp_tools")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        let name = item.get("name").and_then(|v| v.as_str())?.to_string();
-                        let description = item
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let parameters = item
-                            .get("parameters")
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!({"type":"object"}));
-                        Some(ToolDefinition {
-                            name,
-                            description,
-                            parameters,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn load_persisted_subsessions(session: &Session) -> HashMap<String, PersistedSubsession> {
-        session
-            .metadata
-            .get("subsessions")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or_default()
-    }
-
-    fn save_persisted_subsessions(
-        session: &mut Session,
-        subsessions: &HashMap<String, PersistedSubsession>,
-    ) {
-        if subsessions.is_empty() {
-            session.metadata.remove("subsessions");
-            return;
-        }
-        if let Ok(value) = serde_json::to_value(subsessions) {
-            session.metadata.insert("subsessions".to_string(), value);
-        }
-    }
-
-    fn with_persistent_subsession_callbacks(
-        ctx: rocode_tool::ToolContext,
-        subsessions: Arc<Mutex<HashMap<String, PersistedSubsession>>>,
-        provider: Arc<dyn Provider>,
-        tool_registry: Arc<rocode_tool::ToolRegistry>,
-        default_model: String,
-        agent_lookup: Option<Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>>,
-    ) -> rocode_tool::ToolContext {
-        let ctx = if let Some(lookup) = agent_lookup {
-            ctx.with_get_agent_info(move |name| {
-                let lookup = lookup.clone();
-                async move { Ok(lookup(&name)) }
-            })
-        } else {
-            ctx
-        };
-
-        let ctx = ctx.with_get_last_model({
-            let default_model = default_model.clone();
-            move |_session_id| {
-                let default_model = default_model.clone();
-                async move { Ok(Some(default_model)) }
-            }
-        });
-
-        let ctx = ctx.with_create_subsession({
-            let subsessions = subsessions.clone();
-            move |agent, _title, model, disabled_tools| {
-                let subsessions = subsessions.clone();
-                async move {
-                    let session_id = format!("task_{}_{}", agent, uuid::Uuid::new_v4().simple());
-                    let mut state = subsessions.lock().await;
-                    state.insert(
-                        session_id.clone(),
-                        PersistedSubsession {
-                            agent,
-                            model,
-                            disabled_tools,
-                            history: Vec::new(),
-                        },
-                    );
-                    Ok(session_id)
-                }
-            }
-        });
-
-        ctx.with_prompt_subsession(move |session_id, prompt| {
-            let subsessions = subsessions.clone();
-            let provider = provider.clone();
-            let tool_registry = tool_registry.clone();
-            let default_model = default_model.clone();
-
-            async move {
-                let current = {
-                    let state = subsessions.lock().await;
-                    state.get(&session_id).cloned()
-                }
-                .ok_or_else(|| {
-                    rocode_tool::ToolError::ExecutionError(format!(
-                        "Unknown subagent session: {}. Start without task_id first.",
-                        session_id
-                    ))
-                })?;
-
-                let output = Self::execute_persisted_subsession_prompt(
-                    &current,
-                    &prompt,
-                    provider,
-                    tool_registry,
-                    &default_model,
-                )
-                .await
-                .map_err(|e| rocode_tool::ToolError::ExecutionError(e.to_string()))?;
-
-                let mut state = subsessions.lock().await;
-                if let Some(existing) = state.get_mut(&session_id) {
-                    existing.history.push(PersistedSubsessionTurn {
-                        prompt,
-                        output: output.clone(),
-                    });
-                }
-                Ok(output)
-            }
-        })
-    }
-
-    async fn execute_persisted_subsession_prompt(
-        subsession: &PersistedSubsession,
-        prompt: &str,
-        provider: Arc<dyn Provider>,
-        tool_registry: Arc<rocode_tool::ToolRegistry>,
-        default_model: &str,
-    ) -> anyhow::Result<String> {
-        let mut model =
-            Self::parse_model_string(subsession.model.as_deref().unwrap_or(default_model));
-        if model.provider_id == "default" && model.model_id == "default" {
-            model = Self::parse_model_string(default_model);
-        }
-
-        let composed_prompt = Self::compose_subsession_prompt(&subsession.history, prompt);
-        let mut executor =
-            SubtaskExecutor::new(&subsession.agent, &composed_prompt).with_model(model);
-        executor.agent_params = AgentParams {
-            max_tokens: Some(2048),
-            temperature: Some(0.2),
-            top_p: None,
-        };
-
-        executor
-            .execute_inline(provider, &tool_registry, &subsession.disabled_tools)
-            .await
-    }
-
-    fn parse_model_string(raw: &str) -> ModelRef {
-        if let Some((provider_id, model_id)) = raw.split_once(':').or_else(|| raw.split_once('/')) {
-            return ModelRef {
-                provider_id: provider_id.to_string(),
-                model_id: model_id.to_string(),
-            };
-        }
-        if raw.is_empty() {
-            return ModelRef {
-                provider_id: "default".to_string(),
-                model_id: "default".to_string(),
-            };
-        }
-        ModelRef {
-            provider_id: "default".to_string(),
-            model_id: raw.to_string(),
-        }
-    }
-
-    fn compose_subsession_prompt(history: &[PersistedSubsessionTurn], prompt: &str) -> String {
-        if history.is_empty() {
-            return prompt.to_string();
-        }
-
-        let history_text = history
-            .iter()
-            .rev()
-            .take(8)
-            .rev()
-            .map(|turn| format!("User:\n{}\n\nAssistant:\n{}", turn.prompt, turn.output))
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n");
-
-        format!(
-            "Continue this subtask session.\n\nPrevious conversation:\n{}\n\nNew request:\n{}",
-            history_text, prompt
-        )
-    }
-
-    fn build_chat_messages(
-        session_messages: &[SessionMessage],
-        system_prompt: Option<&str>,
-    ) -> anyhow::Result<Vec<Message>> {
-        let mut messages = Vec::new();
-
-        if let Some(system) = system_prompt {
-            messages.push(Message::system(system));
-        }
-
-        for msg in session_messages {
-            // Skip messages with no parts — empty Tool/Assistant messages
-            // confuse providers (especially Anthropic which rejects empty content).
-            if msg.parts.is_empty() {
-                continue;
-            }
-
-            if matches!(msg.role, MessageRole::Assistant)
-                && msg
-                    .parts
-                    .iter()
-                    .any(|p| matches!(p.part_type, PartType::ToolResult { .. }))
-            {
-                // Backward-compat: old sessions may carry tool_result parts on
-                // assistant messages. Split those into a synthetic tool-role
-                // message to preserve provider role expectations.
-                let mut assistant_parts = Vec::new();
-                let mut tool_parts = Vec::new();
-                for part in &msg.parts {
-                    if matches!(part.part_type, PartType::ToolResult { .. }) {
-                        tool_parts.push(part.clone());
-                    } else {
-                        assistant_parts.push(part.clone());
-                    }
-                }
-
-                if !assistant_parts.is_empty() {
-                    messages.push(Message {
-                        role: Role::Assistant,
-                        content: Self::parts_to_content(&assistant_parts),
-                        cache_control: None,
-                        provider_options: None,
-                    });
-                }
-                if !tool_parts.is_empty() {
-                    messages.push(Message {
-                        role: Role::Tool,
-                        content: Self::parts_to_content(&tool_parts),
-                        cache_control: None,
-                        provider_options: None,
-                    });
-                }
-                continue;
-            }
-
-            let content = Self::parts_to_content(&msg.parts);
-            let role = match msg.role {
-                MessageRole::User => Role::User,
-                MessageRole::Assistant => Role::Assistant,
-                MessageRole::System => Role::System,
-                MessageRole::Tool => Role::Tool,
-            };
-
-            messages.push(Message {
-                role,
-                content,
-                cache_control: None,
-                provider_options: None,
-            });
-        }
-
-        Ok(messages)
-    }
-
-    fn parts_to_content(parts: &[crate::MessagePart]) -> Content {
-        let has_parts = parts
-            .iter()
-            .any(|p| !matches!(p.part_type, PartType::Text { .. }));
-
-        if !has_parts {
-            let text = parts
-                .iter()
-                .filter_map(|p| match &p.part_type {
-                    PartType::Text { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Content::Text(text);
-        }
-
-        let content_parts: Vec<ContentPart> = parts
-            .iter()
-            .filter_map(|p| match &p.part_type {
-                PartType::Text { text, .. } => Some(ContentPart {
-                    content_type: "text".to_string(),
-                    text: Some(text.clone()),
-                    image_url: None,
-                    tool_use: None,
-                    tool_result: None,
-                    cache_control: None,
-                    filename: None,
-                    media_type: None,
-                    provider_options: None,
-                }),
-                PartType::ToolCall {
-                    id, name, input, ..
-                } => Some(ContentPart {
-                    content_type: "tool_use".to_string(),
-                    text: None,
-                    image_url: None,
-                    tool_use: Some(rocode_provider::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    }),
-                    tool_result: None,
-                    cache_control: None,
-                    filename: None,
-                    media_type: None,
-                    provider_options: None,
-                }),
-                PartType::ToolResult {
-                    tool_call_id,
-                    content,
-                    is_error,
-                    ..
-                } => Some(ContentPart {
-                    content_type: "tool_result".to_string(),
-                    text: None,
-                    image_url: None,
-                    tool_use: None,
-                    tool_result: Some(rocode_provider::ToolResult {
-                        tool_use_id: tool_call_id.clone(),
-                        content: content.clone(),
-                        is_error: Some(*is_error),
-                    }),
-                    cache_control: None,
-                    filename: None,
-                    media_type: None,
-                    provider_options: None,
-                }),
-                _ => None,
-            })
-            .collect();
-
-        Content::Parts(content_parts)
-    }
-
-    #[allow(dead_code)]
-    fn process_response(response: &ChatResponse) -> SessionMessage {
-        let now = chrono::Utc::now();
-
-        let content = response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or(Content::Text(String::new()));
-
-        let finish_reason = response
-            .choices
-            .first()
-            .and_then(|c| c.finish_reason.clone());
-
-        let parts = match content {
-            Content::Text(text) => vec![crate::MessagePart {
-                id: format!("prt_{}", uuid::Uuid::new_v4()),
-                part_type: PartType::Text {
-                    text,
-                    synthetic: None,
-                    ignored: None,
-                },
-                created_at: now,
-                message_id: None,
-            }],
-            Content::Parts(content_parts) => content_parts
-                .into_iter()
-                .filter_map(|p| match p.content_type.as_str() {
-                    "text" => p.text.map(|text| crate::MessagePart {
-                        id: format!("prt_{}", uuid::Uuid::new_v4()),
-                        part_type: PartType::Text {
-                            text,
-                            synthetic: None,
-                            ignored: None,
-                        },
-                        created_at: now,
-                        message_id: None,
-                    }),
-                    "tool_use" => p.tool_use.map(|tu| crate::MessagePart {
-                        id: format!("prt_{}", uuid::Uuid::new_v4()),
-                        part_type: PartType::ToolCall {
-                            id: tu.id,
-                            name: tu.name,
-                            input: tu.input,
-                            status: crate::ToolCallStatus::Running,
-                            raw: None,
-                            state: None,
-                        },
-                        created_at: now,
-                        message_id: None,
-                    }),
-                    _ => None,
-                })
-                .collect(),
-        };
-
-        SessionMessage {
-            id: format!("msg_{}", uuid::Uuid::new_v4()),
-            session_id: String::new(),
-            role: MessageRole::Assistant,
-            parts,
-            created_at: now,
-            metadata: {
-                let mut m = HashMap::new();
-                if let Some(usage) = &response.usage {
-                    m.insert(
-                        "tokens_input".to_string(),
-                        serde_json::json!(usage.prompt_tokens),
-                    );
-                    m.insert(
-                        "tokens_output".to_string(),
-                        serde_json::json!(usage.completion_tokens),
-                    );
-                }
-                if let Some(ref reason) = finish_reason {
-                    m.insert("finish_reason".to_string(), serde_json::json!(reason));
-                }
-                m
-            },
-            usage: None,
-            finish: finish_reason,
         }
     }
 
@@ -3397,671 +1844,6 @@ impl SessionPrompt {
 
         Ok(true)
     }
-
-    fn filter_compacted_messages(messages: &[SessionMessage]) -> Vec<SessionMessage> {
-        let start = messages
-            .iter()
-            .rposition(|m| {
-                m.parts
-                    .iter()
-                    .any(|p| matches!(p.part_type, PartType::Compaction { .. }))
-            })
-            .unwrap_or(0);
-        messages[start..].to_vec()
-    }
-
-    fn token_usage_from_messages(messages: &[SessionMessage]) -> TokenUsage {
-        let mut usage = TokenUsage {
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            total: 0,
-        };
-
-        for msg in messages {
-            usage.input += msg
-                .metadata
-                .get("tokens_input")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            usage.output += msg
-                .metadata
-                .get("tokens_output")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            usage.cache_read += msg
-                .metadata
-                .get("tokens_cache_read")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            usage.cache_write += msg
-                .metadata
-                .get("tokens_cache_write")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-        }
-        usage.total = usage.input + usage.output + usage.cache_read + usage.cache_write;
-        usage
-    }
-
-    fn should_compact(
-        messages: &[SessionMessage],
-        provider: &dyn Provider,
-        model_id: &str,
-        max_output_tokens: Option<u64>,
-    ) -> bool {
-        let usage = Self::token_usage_from_messages(messages);
-        let model = provider.get_model(model_id);
-        let limits = ModelLimits {
-            context: model
-                .map(|info| info.context_window)
-                .unwrap_or_else(|| get_model_context_limit(model_id)),
-            max_input: model.and_then(|info| info.max_input_tokens),
-            max_output: max_output_tokens
-                .or_else(|| model.map(|info| info.max_output_tokens))
-                .unwrap_or(8192),
-        };
-        let engine = CompactionEngine::new(CompactionConfig::default());
-        if engine.is_overflow(&usage, &limits) {
-            return true;
-        }
-
-        // Estimate total content size across ALL part types (not just text).
-        // This catches large tool results and tool call inputs that the
-        // token-based check misses (it relies on cached API response counts).
-        let total_chars: usize = messages
-            .iter()
-            .flat_map(|m| m.parts.iter())
-            .map(|p| match &p.part_type {
-                PartType::Text { text, .. } => text.len(),
-                PartType::ToolResult { content, title, .. } => {
-                    content.len() + title.as_ref().map_or(0, |t| t.len())
-                }
-                PartType::ToolCall { input, raw, .. } => {
-                    let input_len = serde_json::to_string(input).map_or(0, |s| s.len());
-                    input_len + raw.as_ref().map_or(0, |r| r.len())
-                }
-                PartType::Reasoning { text } => text.len(),
-                _ => 0,
-            })
-            .sum();
-
-        // Hard cap: 5MB of content to stay under typical 6MB API body limits
-        // (leaves ~1MB for JSON overhead, tool definitions, system prompt).
-        const MAX_BODY_CHARS: usize = 5_000_000;
-        if total_chars > MAX_BODY_CHARS {
-            return true;
-        }
-
-        // Softer cap based on estimated token count.
-        const MAX_CONTEXT_CHARS: usize = 200_000;
-        total_chars > MAX_CONTEXT_CHARS
-    }
-
-    async fn ensure_title(session: &mut Session, provider: Arc<dyn Provider>, model_id: &str) {
-        if !session.is_default_title() {
-            return;
-        }
-
-        let first_user_text = session
-            .messages
-            .iter()
-            .find(|m| matches!(m.role, MessageRole::User))
-            .map(|m| m.get_text())
-            .unwrap_or_default();
-
-        if first_user_text.trim().is_empty() {
-            return;
-        }
-
-        let title = generate_session_title_llm(&first_user_text, provider, model_id).await;
-        if !title.trim().is_empty() {
-            session.set_title(title);
-        }
-    }
-
-    fn to_message_with_parts(
-        messages: &[SessionMessage],
-        provider_id: &str,
-        model_id: &str,
-    ) -> Vec<MessageWithParts> {
-        let legacy_tool_results: HashMap<
-            String,
-            (
-                String,
-                bool,
-                Option<String>,
-                Option<HashMap<String, serde_json::Value>>,
-                Option<Vec<serde_json::Value>>,
-            ),
-        > = messages
-            .iter()
-            .flat_map(|m| m.parts.iter())
-            .filter_map(|part| match &part.part_type {
-                PartType::ToolResult {
-                    tool_call_id,
-                    content,
-                    is_error,
-                    title,
-                    metadata,
-                    attachments,
-                } => Some((
-                    tool_call_id.clone(),
-                    (
-                        content.clone(),
-                        *is_error,
-                        title.clone(),
-                        metadata.clone(),
-                        attachments.clone(),
-                    ),
-                )),
-                _ => None,
-            })
-            .collect();
-
-        let mut out = Vec::with_capacity(messages.len());
-        let mut last_user_id = String::new();
-
-        for msg in messages {
-            let created = msg.created_at.timestamp_millis();
-            let mut parts: Vec<V2Part> = msg
-                .parts
-                .iter()
-                .filter_map(|part| match &part.part_type {
-                    PartType::Text { text, .. } => Some(V2Part::Text {
-                        id: part.id.clone(),
-                        session_id: msg.session_id.clone(),
-                        message_id: msg.id.clone(),
-                        text: text.clone(),
-                        synthetic: None,
-                        ignored: None,
-                        time: None,
-                        metadata: None,
-                    }),
-                    PartType::File {
-                        url,
-                        filename,
-                        mime,
-                    } => Some(V2Part::File(crate::message_v2::FilePart {
-                        id: part.id.clone(),
-                        session_id: msg.session_id.clone(),
-                        message_id: msg.id.clone(),
-                        mime: mime.clone(),
-                        url: url.clone(),
-                        filename: Some(filename.clone()),
-                        source: None,
-                    })),
-                    PartType::Compaction { .. } => Some(V2Part::Compaction(V2CompactionPart {
-                        id: part.id.clone(),
-                        session_id: msg.session_id.clone(),
-                        message_id: msg.id.clone(),
-                        auto: true,
-                    })),
-                    PartType::ToolCall {
-                        id,
-                        name,
-                        input,
-                        status,
-                        raw,
-                        state,
-                    } => {
-                        let state = state.clone().unwrap_or_else(|| {
-                            Self::legacy_tool_state_to_v2(
-                                id,
-                                name,
-                                input,
-                                status,
-                                raw.as_deref().unwrap_or_default(),
-                                legacy_tool_results.get(id),
-                                &msg.session_id,
-                                &msg.id,
-                            )
-                        });
-                        Some(V2Part::Tool(crate::message_v2::ToolPart {
-                            id: part.id.clone(),
-                            session_id: msg.session_id.clone(),
-                            message_id: msg.id.clone(),
-                            call_id: id.clone(),
-                            tool: name.clone(),
-                            state,
-                            metadata: None,
-                        }))
-                    }
-                    _ => None,
-                })
-                .collect();
-
-            if let Some(snapshot) = msg
-                .metadata
-                .get("step_start_snapshot")
-                .or_else(|| msg.metadata.get("snapshot"))
-                .and_then(|v| v.as_str())
-            {
-                parts.push(V2Part::StepStart(StepStartPart {
-                    id: format!("prt_{}", uuid::Uuid::new_v4()),
-                    session_id: msg.session_id.clone(),
-                    message_id: msg.id.clone(),
-                    snapshot: Some(snapshot.to_string()),
-                }));
-            }
-            if let Some(snapshot) = msg
-                .metadata
-                .get("step_finish_snapshot")
-                .and_then(|v| v.as_str())
-            {
-                let input = msg
-                    .metadata
-                    .get("tokens_input")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    .clamp(0, i32::MAX as i64) as i32;
-                let output = msg
-                    .metadata
-                    .get("tokens_output")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    .clamp(0, i32::MAX as i64) as i32;
-                parts.push(V2Part::StepFinish(StepFinishPart {
-                    id: format!("prt_{}", uuid::Uuid::new_v4()),
-                    session_id: msg.session_id.clone(),
-                    message_id: msg.id.clone(),
-                    reason: msg
-                        .finish
-                        .as_deref()
-                        .or_else(|| {
-                            msg.metadata
-                                .get("finish_reason")
-                                .and_then(|v| v.as_str())
-                        })
-                        .unwrap_or("stop")
-                        .to_string(),
-                    snapshot: Some(snapshot.to_string()),
-                    cost: msg
-                        .metadata
-                        .get("cost")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0),
-                    tokens: StepTokens {
-                        total: Some(input.saturating_add(output)),
-                        input,
-                        output,
-                        reasoning: 0,
-                        cache: CacheTokens { read: 0, write: 0 },
-                    },
-                }));
-            }
-
-            let info = match msg.role {
-                MessageRole::User => {
-                    last_user_id = msg.id.clone();
-                    MessageInfo::User {
-                        id: msg.id.clone(),
-                        session_id: msg.session_id.clone(),
-                        time: UserTime { created },
-                        agent: msg
-                            .metadata
-                            .get("agent")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("general")
-                            .to_string(),
-                        model: V2ModelRef {
-                            provider_id: msg
-                                .metadata
-                                .get("model_provider")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(provider_id)
-                                .to_string(),
-                            model_id: msg
-                                .metadata
-                                .get("model_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(model_id)
-                                .to_string(),
-                        },
-                        format: None,
-                        summary: None,
-                        system: None,
-                        tools: None,
-                        variant: msg
-                            .metadata
-                            .get("variant")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                    }
-                }
-                _ => {
-                    let input = msg
-                        .metadata
-                        .get("tokens_input")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
-                        .clamp(0, i32::MAX as i64) as i32;
-                    let output = msg
-                        .metadata
-                        .get("tokens_output")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
-                        .clamp(0, i32::MAX as i64) as i32;
-                    MessageInfo::Assistant {
-                        id: msg.id.clone(),
-                        session_id: msg.session_id.clone(),
-                        time: AssistantTime {
-                            created,
-                            completed: Some(created),
-                        },
-                        parent_id: if last_user_id.is_empty() {
-                            msg.id.clone()
-                        } else {
-                            last_user_id.clone()
-                        },
-                        model_id: msg
-                            .metadata
-                            .get("model_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(model_id)
-                            .to_string(),
-                        provider_id: msg
-                            .metadata
-                            .get("model_provider")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(provider_id)
-                            .to_string(),
-                        mode: msg
-                            .metadata
-                            .get("mode")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("default")
-                            .to_string(),
-                        agent: msg
-                            .metadata
-                            .get("agent")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("general")
-                            .to_string(),
-                        path: MessagePath {
-                            cwd: ".".to_string(),
-                            root: ".".to_string(),
-                        },
-                        summary: None,
-                        cost: msg
-                            .metadata
-                            .get("cost")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0),
-                        tokens: AssistantTokens {
-                            total: Some(input.saturating_add(output)),
-                            input,
-                            output,
-                            reasoning: 0,
-                            cache: CacheTokens { read: 0, write: 0 },
-                        },
-                        error: None,
-                        structured: None,
-                        variant: msg
-                            .metadata
-                            .get("variant")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        finish: msg
-                            .finish
-                            .clone()
-                            .or_else(|| {
-                                msg.metadata
-                                    .get("finish_reason")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                    }
-                }
-            };
-
-            out.push(MessageWithParts { info, parts });
-        }
-
-        out
-    }
-
-    fn legacy_tool_state_to_v2(
-        tool_call_id: &str,
-        tool_name: &str,
-        input: &serde_json::Value,
-        status: &crate::ToolCallStatus,
-        raw: &str,
-        tool_result: Option<&(
-            String,
-            bool,
-            Option<String>,
-            Option<HashMap<String, serde_json::Value>>,
-            Option<Vec<serde_json::Value>>,
-        )>,
-        session_id: &str,
-        message_id: &str,
-    ) -> crate::ToolState {
-        let now = chrono::Utc::now().timestamp_millis();
-        match status {
-            crate::ToolCallStatus::Pending => crate::ToolState::Pending {
-                input: input.clone(),
-                raw: raw.to_string(),
-            },
-            crate::ToolCallStatus::Running => crate::ToolState::Running {
-                input: input.clone(),
-                title: None,
-                metadata: None,
-                time: crate::RunningTime { start: now },
-            },
-            crate::ToolCallStatus::Completed => {
-                let (output, title, mut metadata, part_attachments) = tool_result
-                    .map(|(content, _, title, metadata, attachments)| {
-                        (
-                            content.clone(),
-                            title.clone().unwrap_or_else(|| tool_name.to_string()),
-                            metadata.clone().unwrap_or_default(),
-                            attachments.clone(),
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        (String::new(), tool_name.to_string(), HashMap::new(), None)
-                    });
-
-                let mut merged_attachments = Vec::new();
-                if let Some(values) = part_attachments {
-                    merged_attachments.extend(values);
-                }
-                if let Some(values) = Self::take_attachment_values(&mut metadata) {
-                    merged_attachments.extend(values);
-                }
-                let (_, normalized_attachments) = Self::normalize_tool_attachments(
-                    (!merged_attachments.is_empty()).then_some(merged_attachments),
-                    session_id,
-                    message_id,
-                );
-
-                crate::ToolState::Completed {
-                    input: input.clone(),
-                    output,
-                    title,
-                    metadata,
-                    time: crate::CompletedTime {
-                        start: now,
-                        end: now,
-                        compacted: None,
-                    },
-                    attachments: normalized_attachments,
-                }
-            }
-            crate::ToolCallStatus::Error => {
-                let error = tool_result
-                    .map(|(content, _, _, _, _)| content.clone())
-                    .unwrap_or_else(|| format!("Tool execution failed: {}", tool_call_id));
-                crate::ToolState::Error {
-                    input: input.clone(),
-                    error,
-                    metadata: None,
-                    time: crate::ErrorTime {
-                        start: now,
-                        end: now,
-                    },
-                }
-            }
-        }
-    }
-
-    async fn summarize_session(
-        session: &mut Session,
-        session_id: &str,
-        provider_id: &str,
-        model_id: &str,
-        provider: &dyn Provider,
-    ) -> anyhow::Result<()> {
-        let directory = session.directory.clone();
-        let worktree = std::path::Path::new(&directory);
-        let last_user = session
-            .messages
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, MessageRole::User))
-            .map(|m| m.id.clone())
-            .unwrap_or_default();
-        let messages = Self::to_message_with_parts(&session.messages, provider_id, model_id);
-        summarize_into_session(
-            &SummarizeInput {
-                session_id: session_id.to_string(),
-                message_id: last_user,
-            },
-            session,
-            &messages,
-            worktree,
-            Some(provider),
-            Some(model_id),
-            None,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    fn prune_after_loop(session: &mut Session) {
-        let mut tool_name_by_call: HashMap<String, String> = HashMap::new();
-        for msg in &session.messages {
-            for part in &msg.parts {
-                if let PartType::ToolCall { id, name, .. } = &part.part_type {
-                    tool_name_by_call.insert(id.clone(), name.clone());
-                }
-            }
-        }
-
-        let mut prune_messages: Vec<MessageForPrune> = session
-            .messages
-            .iter()
-            .map(|m| {
-                let parts: Vec<PruneToolPart> = m
-                    .parts
-                    .iter()
-                    .filter_map(|p| match &p.part_type {
-                        PartType::ToolResult {
-                            tool_call_id,
-                            content,
-                            is_error,
-                            ..
-                        } => Some(PruneToolPart {
-                            id: p.id.clone(),
-                            tool: tool_name_by_call
-                                .get(tool_call_id)
-                                .cloned()
-                                .unwrap_or_default(),
-                            output: content.clone(),
-                            status: if *is_error {
-                                ToolPartStatus::Error
-                            } else {
-                                ToolPartStatus::Completed
-                            },
-                            compacted: None,
-                        }),
-                        _ => None,
-                    })
-                    .collect();
-                MessageForPrune {
-                    role: match m.role {
-                        MessageRole::User => "user".to_string(),
-                        _ => "assistant".to_string(),
-                    },
-                    parts,
-                    summary: false,
-                }
-            })
-            .collect();
-
-        let engine = CompactionEngine::new(CompactionConfig::default());
-        let pruned_ids = engine.prune(&mut prune_messages);
-        if pruned_ids.is_empty() {
-            return;
-        }
-        let pruned: HashSet<String> = pruned_ids.into_iter().collect();
-        for msg in &mut session.messages {
-            for part in &mut msg.parts {
-                if !pruned.contains(&part.id) {
-                    continue;
-                }
-                if let PartType::ToolResult { content, .. } = &mut part.part_type {
-                    let compacted = content.chars().take(200).collect::<String>();
-                    *content = format!("[tool result compacted]\n{}", compacted);
-                }
-            }
-        }
-
-        // Record the compacting timestamp so the session DB row reflects that pruning occurred.
-        session.time.compacting = Some(chrono::Utc::now().timestamp_millis());
-        session.touch();
-    }
-
-    fn trigger_compaction(session: &mut Session, messages: &[SessionMessage]) -> Option<String> {
-        let total_messages = messages.len();
-        if total_messages < 10 {
-            return None;
-        }
-
-        let keep_count = total_messages / 2;
-        let summary_parts: Vec<String> = messages
-            .iter()
-            .take(keep_count)
-            .flat_map(|m| m.parts.iter())
-            .filter_map(|p| match &p.part_type {
-                PartType::Text { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-
-        let summary = format!(
-            "Compacted {} messages. Summary: {}...",
-            total_messages - keep_count,
-            summary_parts
-                .join(" ")
-                .chars()
-                .take(500)
-                .collect::<String>()
-        );
-
-        // Persist the compaction summary as a Compaction part on a new assistant message.
-        // This mirrors the TS behavior where compaction creates an assistant message with
-        // summary=true and a compaction part, so that filter_compacted_messages can find it.
-        let mut compaction_msg = SessionMessage::assistant(session.id.clone());
-        compaction_msg.parts.push(crate::MessagePart {
-            id: format!("prt_{}", uuid::Uuid::new_v4()),
-            part_type: PartType::Compaction {
-                summary: summary.clone(),
-            },
-            created_at: chrono::Utc::now(),
-            message_id: None,
-        });
-        session.messages.push(compaction_msg);
-
-        // Set the compacting timestamp on the session.
-        session.time.compacting = Some(chrono::Utc::now().timestamp_millis());
-        session.touch();
-
-        Some(summary)
-    }
 }
 
 impl Default for SessionPrompt {
@@ -4169,8 +1951,8 @@ pub fn extract_file_references(template: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::message::MessagePart;
+    use async_trait::async_trait;
     use futures::stream;
     use rocode_provider::{
         ChatRequest, ChatResponse, ModelInfo, ProviderError, StreamEvent, StreamResult, StreamUsage,
@@ -4411,30 +2193,6 @@ mod tests {
             ))
         }
     }
-
-    #[test]
-    fn filter_compacted_messages_keeps_tail_after_last_compaction() {
-        let session_id = "ses_test".to_string();
-        let before = SessionMessage::user(session_id.clone(), "before");
-        let mut compact = SessionMessage::assistant(session_id.clone());
-        compact.parts.push(crate::MessagePart {
-            id: "prt_compact".to_string(),
-            part_type: PartType::Compaction {
-                summary: "summary".to_string(),
-            },
-            created_at: chrono::Utc::now(),
-            message_id: None,
-        });
-        let after = SessionMessage::user(session_id, "after");
-
-        let filtered = SessionPrompt::filter_compacted_messages(&[before, compact, after]);
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered[0]
-            .parts
-            .iter()
-            .any(|p| matches!(p.part_type, PartType::Compaction { .. })));
-    }
-
     #[test]
     fn insert_reminders_adds_plan_prompt_for_plan_agent() {
         let messages = vec![SessionMessage::user("ses_test", "plan this")];
@@ -4715,290 +2473,6 @@ mod tests {
             _ => false,
         }));
     }
-
-    #[tokio::test]
-    async fn create_user_message_decodes_text_data_url() {
-        let prompt = SessionPrompt::default();
-        let mut session = Session::new("proj", ".");
-        let input = PromptInput {
-            session_id: session.id.clone(),
-            message_id: None,
-            model: None,
-            agent: None,
-            no_reply: false,
-            system: None,
-            variant: None,
-            tools: None,
-            parts: vec![PartInput::File {
-                url: "data:text/plain;base64,SGVsbG8=".to_string(),
-                filename: Some("inline.txt".to_string()),
-                mime: Some("text/plain".to_string()),
-            }],
-        };
-
-        prompt
-            .create_user_message(&input, &mut session)
-            .await
-            .expect("create_user_message should succeed");
-
-        let message = session.messages.last().expect("message should exist");
-        let text = message
-            .parts
-            .iter()
-            .filter_map(|part| match &part.part_type {
-                PartType::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("Hello"));
-    }
-
-    #[tokio::test]
-    async fn create_user_message_file_url_with_range_reads_only_requested_lines() {
-        let prompt = SessionPrompt::default();
-        let mut session = Session::new("proj", ".");
-        let temp_dir = tempfile::tempdir().expect("tempdir should create");
-        let file_path = temp_dir.path().join("sample.rs");
-        let content = (1..=30)
-            .map(|n| format!("L{:02}", n))
-            .collect::<Vec<_>>()
-            .join("\n");
-        tokio::fs::write(&file_path, content)
-            .await
-            .expect("write should succeed");
-
-        let mut url = url::Url::from_file_path(&file_path).expect("file path should convert");
-        url.set_query(Some("start=10&end=20"));
-
-        let input = PromptInput {
-            session_id: session.id.clone(),
-            message_id: None,
-            model: None,
-            agent: None,
-            no_reply: false,
-            system: None,
-            variant: None,
-            tools: None,
-            parts: vec![PartInput::File {
-                url: url.to_string(),
-                filename: Some("sample.rs".to_string()),
-                mime: Some("text/plain".to_string()),
-            }],
-        };
-
-        prompt
-            .create_user_message(&input, &mut session)
-            .await
-            .expect("create_user_message should succeed");
-
-        let message = session.messages.last().expect("message should exist");
-        let text = message
-            .parts
-            .iter()
-            .filter_map(|part| match &part.part_type {
-                PartType::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("L10"));
-        assert!(text.contains("L20"));
-        assert!(!text.contains("L09"));
-        assert!(!text.contains("L21"));
-    }
-
-    #[tokio::test]
-    async fn create_user_message_file_url_injects_nearby_instructions() {
-        let prompt = SessionPrompt::default();
-        let temp_dir = tempfile::tempdir().expect("tempdir should create");
-        let project_root = temp_dir.path().to_path_buf();
-        let src_dir = project_root.join("src");
-        tokio::fs::create_dir_all(&src_dir)
-            .await
-            .expect("src directory should create");
-        tokio::fs::write(src_dir.join("AGENTS.md"), "Prefer immutable updates")
-            .await
-            .expect("instructions should write");
-
-        let file_path = src_dir.join("sample.rs");
-        tokio::fs::write(&file_path, "fn main() {}")
-            .await
-            .expect("file should write");
-
-        let mut session = Session::new("proj", project_root.to_string_lossy().to_string());
-        let file_url = url::Url::from_file_path(&file_path)
-            .expect("file path should convert")
-            .to_string();
-        let input = PromptInput {
-            session_id: session.id.clone(),
-            message_id: None,
-            model: None,
-            agent: None,
-            no_reply: false,
-            system: None,
-            variant: None,
-            tools: None,
-            parts: vec![PartInput::File {
-                url: file_url,
-                filename: Some("sample.rs".to_string()),
-                mime: Some("text/plain".to_string()),
-            }],
-        };
-
-        prompt
-            .create_user_message(&input, &mut session)
-            .await
-            .expect("create_user_message should succeed");
-
-        let message = session.messages.last().expect("message should exist");
-        let text = message
-            .parts
-            .iter()
-            .filter_map(|part| match &part.part_type {
-                PartType::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("<system-reminder>"));
-        assert!(text.contains("Instructions from:"));
-        assert!(text.contains("Prefer immutable updates"));
-    }
-
-    #[tokio::test]
-    async fn create_user_message_file_url_dedupes_instruction_injection_per_message() {
-        let prompt = SessionPrompt::default();
-        let temp_dir = tempfile::tempdir().expect("tempdir should create");
-        let project_root = temp_dir.path().to_path_buf();
-        let src_dir = project_root.join("src");
-        tokio::fs::create_dir_all(&src_dir)
-            .await
-            .expect("src directory should create");
-        tokio::fs::write(src_dir.join("AGENTS.md"), "Shared file rules")
-            .await
-            .expect("instructions should write");
-
-        let file_a = src_dir.join("a.rs");
-        let file_b = src_dir.join("b.rs");
-        tokio::fs::write(&file_a, "fn a() {}")
-            .await
-            .expect("file a should write");
-        tokio::fs::write(&file_b, "fn b() {}")
-            .await
-            .expect("file b should write");
-
-        let mut session = Session::new("proj", project_root.to_string_lossy().to_string());
-        let input = PromptInput {
-            session_id: session.id.clone(),
-            message_id: None,
-            model: None,
-            agent: None,
-            no_reply: false,
-            system: None,
-            variant: None,
-            tools: None,
-            parts: vec![
-                PartInput::File {
-                    url: url::Url::from_file_path(&file_a)
-                        .expect("file a path should convert")
-                        .to_string(),
-                    filename: Some("a.rs".to_string()),
-                    mime: Some("text/plain".to_string()),
-                },
-                PartInput::File {
-                    url: url::Url::from_file_path(&file_b)
-                        .expect("file b path should convert")
-                        .to_string(),
-                    filename: Some("b.rs".to_string()),
-                    mime: Some("text/plain".to_string()),
-                },
-            ],
-        };
-
-        prompt
-            .create_user_message(&input, &mut session)
-            .await
-            .expect("create_user_message should succeed");
-
-        let message = session.messages.last().expect("message should exist");
-        let text = message
-            .parts
-            .iter()
-            .filter_map(|part| match &part.part_type {
-                PartType::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert_eq!(text.matches("Instructions from:").count(), 1);
-    }
-
-    #[tokio::test]
-    async fn create_user_message_file_url_injects_agents_but_not_claude_for_file_scope() {
-        let prompt = SessionPrompt::default();
-        let temp_dir = tempfile::tempdir().expect("tempdir should create");
-        let project_root = temp_dir.path().to_path_buf();
-        let src_dir = project_root.join("src");
-        tokio::fs::create_dir_all(&src_dir)
-            .await
-            .expect("src directory should create");
-        tokio::fs::write(project_root.join("AGENTS.md"), "Root agents rule")
-            .await
-            .expect("root AGENTS should write");
-        tokio::fs::write(src_dir.join("CLAUDE.md"), "src claude rule")
-            .await
-            .expect("src CLAUDE should write");
-
-        let file_path = src_dir.join("sample.rs");
-        tokio::fs::write(&file_path, "fn main() {}")
-            .await
-            .expect("file should write");
-
-        let mut session = Session::new("proj", project_root.to_string_lossy().to_string());
-        let file_url = url::Url::from_file_path(&file_path)
-            .expect("file path should convert")
-            .to_string();
-        let input = PromptInput {
-            session_id: session.id.clone(),
-            message_id: None,
-            model: None,
-            agent: None,
-            no_reply: false,
-            system: None,
-            variant: None,
-            tools: None,
-            parts: vec![PartInput::File {
-                url: file_url,
-                filename: Some("sample.rs".to_string()),
-                mime: Some("text/plain".to_string()),
-            }],
-        };
-
-        prompt
-            .create_user_message(&input, &mut session)
-            .await
-            .expect("create_user_message should succeed");
-
-        let message = session.messages.last().expect("message should exist");
-        let text = message
-            .parts
-            .iter()
-            .filter_map(|part| match &part.part_type {
-                PartType::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("Root agents rule"));
-        assert!(!text.contains("src claude rule"));
-    }
-
     #[test]
     fn shell_exec_uses_zsh_login_invocation() {
         let invocation = resolve_shell_invocation(Some("/bin/zsh"), "echo hello");
@@ -5019,51 +2493,8 @@ mod tests {
         assert!(invocation.args[2].contains(".bashrc"));
     }
 
-    #[test]
-    fn persisted_subsessions_roundtrip_via_session_metadata() {
-        let mut session = Session::new("proj", ".");
-        let mut map = HashMap::new();
-        map.insert(
-            "task_explore_1".to_string(),
-            PersistedSubsession {
-                agent: "explore".to_string(),
-                model: Some("anthropic:claude".to_string()),
-                disabled_tools: vec!["task".to_string()],
-                history: vec![PersistedSubsessionTurn {
-                    prompt: "Inspect src".to_string(),
-                    output: "Done".to_string(),
-                }],
-            },
-        );
-
-        SessionPrompt::save_persisted_subsessions(&mut session, &map);
-        let loaded = SessionPrompt::load_persisted_subsessions(&session);
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded["task_explore_1"].agent, "explore");
-        assert_eq!(loaded["task_explore_1"].history.len(), 1);
-    }
-
-    #[test]
-    fn parse_model_string_supports_provider_prefix() {
-        let model = SessionPrompt::parse_model_string("openai:gpt-4o");
-        assert_eq!(model.provider_id, "openai");
-        assert_eq!(model.model_id, "gpt-4o");
-    }
-
-    #[test]
-    fn compose_subsession_prompt_includes_recent_history() {
-        let history = vec![PersistedSubsessionTurn {
-            prompt: "Find files".to_string(),
-            output: "Found 10 files".to_string(),
-        }];
-        let composed = SessionPrompt::compose_subsession_prompt(&history, "Continue");
-        assert!(composed.contains("Previous conversation"));
-        assert!(composed.contains("Find files"));
-        assert!(composed.contains("Continue"));
-    }
-
     #[tokio::test]
-    async fn resolve_tools_with_mcp_registry_merges_dynamic_tools() {
+    async fn resolve_tools_with_mcp_registry_includes_mcp_tools() {
         let tool_registry = rocode_tool::create_default_registry().await;
         let mcp_registry = rocode_mcp::McpToolRegistry::new();
         mcp_registry
@@ -5407,136 +2838,6 @@ mod tests {
         assert_eq!(second_turn_result_count, 1);
     }
 
-    #[test]
-    fn mcp_tools_from_session_reads_runtime_metadata() {
-        let mut session = Session::new("proj", ".");
-        session.metadata.insert(
-            "mcp_tools".to_string(),
-            serde_json::json!([{
-                "name": "repo_search",
-                "description": "Search repository",
-                "parameters": {"type":"object","properties":{"q":{"type":"string"}}}
-            }]),
-        );
-
-        let tools = SessionPrompt::mcp_tools_from_session(&session);
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "repo_search");
-    }
-
-    #[test]
-    fn prune_after_loop_compacts_large_old_tool_results() {
-        let mut session = Session::new("proj", ".");
-        let session_id = session.id.clone();
-
-        session
-            .messages
-            .push(SessionMessage::user(session_id.clone(), "old user message"));
-
-        let mut old_assistant = SessionMessage::assistant(session_id.clone());
-        old_assistant.add_tool_call("call_a", "bash", serde_json::json!({"command": "echo a"}));
-        old_assistant.add_tool_result("call_a", "A".repeat(140_000), false);
-        old_assistant.add_tool_call("call_b", "bash", serde_json::json!({"command": "echo b"}));
-        old_assistant.add_tool_result("call_b", "B".repeat(140_000), false);
-        session.messages.push(old_assistant);
-
-        session
-            .messages
-            .push(SessionMessage::user(session_id.clone(), "new user one"));
-        session
-            .messages
-            .push(SessionMessage::assistant(session_id.clone()));
-        session
-            .messages
-            .push(SessionMessage::user(session_id.clone(), "new user two"));
-        session.messages.push(SessionMessage::assistant(session_id));
-
-        SessionPrompt::prune_after_loop(&mut session);
-
-        let compacted_count = session
-            .messages
-            .iter()
-            .flat_map(|m| m.parts.iter())
-            .filter_map(|p| match &p.part_type {
-                PartType::ToolResult { content, .. } => Some(content),
-                _ => None,
-            })
-            .filter(|c| c.starts_with("[tool result compacted]"))
-            .count();
-
-        assert!(
-            compacted_count >= 1,
-            "expected at least one tool result to be compacted"
-        );
-    }
-
-    #[test]
-    fn should_compact_prefers_provider_model_limits() {
-        let provider = StaticModelProvider::with_model("tiny-model", 1000, 100);
-        let mut msg = SessionMessage::user("ses_test", "hello");
-        msg.metadata
-            .insert("tokens_input".to_string(), serde_json::json!(950_u64));
-
-        let compact = SessionPrompt::should_compact(&[msg], &provider, "tiny-model", None);
-        assert!(compact);
-    }
-
-    #[test]
-    fn should_compact_counts_tool_results() {
-        let provider = StaticModelProvider::with_model("big-model", 1_000_000, 65536);
-        // Create a message with a large tool result (>5MB)
-        let mut msg = SessionMessage::assistant("ses_test");
-        let large_content = "x".repeat(5_100_000);
-        msg.parts.push(crate::MessagePart {
-            id: "part_1".to_string(),
-            part_type: PartType::ToolResult {
-                tool_call_id: "tc_1".to_string(),
-                content: large_content,
-                is_error: false,
-                title: None,
-                metadata: None,
-                attachments: None,
-            },
-            created_at: chrono::Utc::now(),
-            message_id: None,
-        });
-
-        let compact = SessionPrompt::should_compact(&[msg], &provider, "big-model", None);
-        assert!(
-            compact,
-            "should trigger compaction for >5MB tool result content"
-        );
-    }
-
-    #[test]
-    fn should_compact_uses_max_input_tokens() {
-        // Provider with explicit max_input_tokens
-        let provider = StaticModelProvider {
-            model: Some(ModelInfo {
-                id: "limited-model".to_string(),
-                name: "Limited Model".to_string(),
-                provider: "mock".to_string(),
-                context_window: 1_000_000,
-                max_input_tokens: Some(50_000),
-                max_output_tokens: 8192,
-                supports_vision: false,
-                supports_tools: false,
-                cost_per_million_input: 0.0,
-                cost_per_million_output: 0.0,
-            }),
-        };
-        let mut msg = SessionMessage::user("ses_test", "hello");
-        // Set token usage just above the max_input limit
-        msg.metadata
-            .insert("tokens_input".to_string(), serde_json::json!(48_000_u64));
-
-        let compact = SessionPrompt::should_compact(&[msg], &provider, "limited-model", None);
-        assert!(
-            compact,
-            "should trigger compaction when input tokens approach max_input_tokens"
-        );
-    }
-
     // ── PartInput serde round-trip tests ──
 
     #[test]
@@ -5705,288 +3006,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn abort_pending_tool_calls_marks_unresolved_calls_as_error() {
-        let mut session = Session::new("proj", ".");
-        let sid = session.id.clone();
-
-        // Add a user message
-        session
-            .messages
-            .push(SessionMessage::user(sid.clone(), "do something"));
-
-        // Add an assistant message with two tool calls but only one result
-        let mut assistant = SessionMessage::assistant(sid.clone());
-        assistant.add_tool_call("call_1", "bash", serde_json::json!({"command": "echo a"}));
-        assistant.add_tool_call("call_2", "read_file", serde_json::json!({"path": "foo.rs"}));
-        session.messages.push(assistant);
-        let mut existing_tool_result = SessionMessage::tool(sid.clone());
-        existing_tool_result.add_tool_result("call_1", "output a", false);
-        session.messages.push(existing_tool_result);
-        // call_2 has no result — simulates abort mid-execution
-
-        SessionPrompt::abort_pending_tool_calls(&mut session);
-
-        // call_2 should now have an error result in the latest tool message
-        let last_tool_msg = session
-            .messages
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, MessageRole::Tool))
-            .unwrap();
-
-        let error_results: Vec<_> = last_tool_msg
-            .parts
-            .iter()
-            .filter(|p| matches!(
-                &p.part_type,
-                PartType::ToolResult { tool_call_id, is_error, content, .. }
-                    if tool_call_id == "call_2" && *is_error && content == "Tool execution aborted"
-            ))
-            .collect();
-
-        assert_eq!(error_results.len(), 1, "call_2 should have an error result");
-    }
-
-    #[test]
-    fn abort_pending_tool_calls_noop_when_all_resolved() {
-        let mut session = Session::new("proj", ".");
-        let sid = session.id.clone();
-
-        session
-            .messages
-            .push(SessionMessage::user(sid.clone(), "do something"));
-
-        let mut assistant = SessionMessage::assistant(sid.clone());
-        assistant.add_tool_call("call_1", "bash", serde_json::json!({"command": "echo a"}));
-        session.messages.push(assistant);
-        let mut tool_result = SessionMessage::tool(sid.clone());
-        tool_result.add_tool_result("call_1", "output a", false);
-        session.messages.push(tool_result);
-
-        let part_count_before = session.messages.last().map(|m| m.parts.len()).unwrap_or(0);
-
-        SessionPrompt::abort_pending_tool_calls(&mut session);
-
-        let part_count_after = session.messages.last().map(|m| m.parts.len()).unwrap_or(0);
-
-        assert_eq!(
-            part_count_before, part_count_after,
-            "No new parts should be added"
-        );
-    }
-
-    #[test]
-    fn abort_pending_tool_calls_handles_multiple_pending() {
-        let mut session = Session::new("proj", ".");
-        let sid = session.id.clone();
-
-        session
-            .messages
-            .push(SessionMessage::user(sid.clone(), "do something"));
-
-        let mut assistant = SessionMessage::assistant(sid.clone());
-        assistant.add_tool_call("call_1", "bash", serde_json::json!({}));
-        assistant.add_tool_call("call_2", "read_file", serde_json::json!({}));
-        assistant.add_tool_call("call_3", "write_file", serde_json::json!({}));
-        // No results at all — all three are pending
-        session.messages.push(assistant);
-
-        SessionPrompt::abort_pending_tool_calls(&mut session);
-
-        let last_tool_msg = session
-            .messages
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, MessageRole::Tool))
-            .unwrap();
-
-        let abort_results: Vec<_> = last_tool_msg
-            .parts
-            .iter()
-            .filter(|p| {
-                matches!(
-                    &p.part_type,
-                    PartType::ToolResult { is_error, content, .. }
-                        if *is_error && content == "Tool execution aborted"
-                )
-            })
-            .collect();
-
-        assert_eq!(
-            abort_results.len(),
-            3,
-            "All three pending calls should be aborted"
-        );
-    }
-
-    #[test]
-    fn build_chat_messages_splits_legacy_assistant_tool_results() {
-        let sid = "sid".to_string();
-        let mut assistant = SessionMessage::assistant(sid);
-        assistant.add_text("working");
-        assistant.add_tool_result("call_1", "ok", false);
-
-        let messages = SessionPrompt::build_chat_messages(&[assistant], None).unwrap();
-        assert_eq!(messages.len(), 2);
-        assert!(matches!(messages[0].role, Role::Assistant));
-        assert!(matches!(messages[1].role, Role::Tool));
-    }
-
-    #[test]
-    fn repair_tool_call_name_keeps_exact_match() {
-        let tools = HashSet::from([
-            "read".to_string(),
-            "glob".to_string(),
-            "invalid".to_string(),
-        ]);
-        assert_eq!(SessionPrompt::repair_tool_call_name("read", &tools), "read");
-    }
-
-    #[test]
-    fn tool_call_input_for_execution_skips_empty_pending() {
-        let input = serde_json::json!({});
-        let resolved = SessionPrompt::tool_call_input_for_execution(
-            &crate::ToolCallStatus::Pending,
-            &input,
-            None,
-            None,
-        );
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn tool_call_input_for_execution_pending_ignores_raw_input() {
-        let input = serde_json::json!({});
-        let resolved = SessionPrompt::tool_call_input_for_execution(
-            &crate::ToolCallStatus::Pending,
-            &input,
-            Some("[filePath=/tmp/a.html]"),
-            None,
-        );
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn tool_call_input_for_execution_running_keeps_object_input() {
-        let input = serde_json::json!({});
-        let resolved = SessionPrompt::tool_call_input_for_execution(
-            &crate::ToolCallStatus::Running,
-            &input,
-            None,
-            None,
-        );
-        assert_eq!(resolved, Some(serde_json::json!({})));
-    }
-
-    #[test]
-    fn invalid_tool_payload_is_ts_shape() {
-        let payload = SessionPrompt::invalid_tool_payload("read", "missing filePath");
-        assert_eq!(payload.get("tool").and_then(|v| v.as_str()), Some("read"));
-        assert_eq!(
-            payload.get("error").and_then(|v| v.as_str()),
-            Some("missing filePath")
-        );
-        assert!(payload.get("receivedArgs").is_none());
-    }
-
-    #[test]
-    fn repair_tool_call_name_repairs_case_mismatch() {
-        let tools = HashSet::from([
-            "read".to_string(),
-            "glob".to_string(),
-            "invalid".to_string(),
-        ]);
-        assert_eq!(SessionPrompt::repair_tool_call_name("Read", &tools), "read");
-    }
-
-    #[test]
-    fn repair_tool_call_name_routes_unknown_to_invalid() {
-        let tools = HashSet::from([
-            "read".to_string(),
-            "glob".to_string(),
-            "invalid".to_string(),
-        ]);
-        assert_eq!(
-            SessionPrompt::repair_tool_call_name("read_html_file", &tools),
-            "invalid"
-        );
-    }
-
-    #[test]
-    fn extract_tool_attachments_from_metadata_moves_attachment_payload_out() {
-        let mut metadata = HashMap::new();
-        metadata.insert("note".to_string(), serde_json::json!("ok"));
-        metadata.insert(
-            "attachments".to_string(),
-            serde_json::json!([{ "mime": "application/pdf", "url": "data:application/pdf;base64,AA==" }]),
-        );
-        metadata.insert(
-            "attachment".to_string(),
-            serde_json::json!({ "mime": "image/png", "url": "data:image/png;base64,BB==" }),
-        );
-
-        let (attachments, file_parts) =
-            SessionPrompt::extract_tool_attachments_from_metadata(&mut metadata, "ses_1", "msg_1");
-
-        assert_eq!(metadata.get("note").and_then(|v| v.as_str()), Some("ok"));
-        assert!(!metadata.contains_key("attachments"));
-        assert!(!metadata.contains_key("attachment"));
-        assert_eq!(attachments.as_ref().map(|v| v.len()), Some(2));
-        assert_eq!(file_parts.as_ref().map(|v| v.len()), Some(2));
-    }
-
-    #[test]
-    fn legacy_tool_state_to_v2_recovers_attachments_from_tool_result_metadata() {
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "attachment".to_string(),
-            serde_json::json!({ "mime": "application/pdf", "url": "data:application/pdf;base64,AA==" }),
-        );
-        metadata.insert(
-            "preview".to_string(),
-            serde_json::json!("PDF read successfully"),
-        );
-
-        let tool_result = (
-            "PDF read successfully".to_string(),
-            false,
-            Some("Read".to_string()),
-            Some(metadata),
-            None,
-        );
-
-        let state = SessionPrompt::legacy_tool_state_to_v2(
-            "tool-call-1",
-            "read",
-            &serde_json::json!({ "file_path": "report.pdf" }),
-            &crate::ToolCallStatus::Completed,
-            "",
-            Some(&tool_result),
-            "ses_1",
-            "msg_1",
-        );
-
-        match state {
-            crate::ToolState::Completed {
-                metadata,
-                attachments,
-                ..
-            } => {
-                assert!(!metadata.contains_key("attachment"));
-                assert_eq!(attachments.as_ref().map(|v| v.len()), Some(1));
-                assert_eq!(
-                    attachments
-                        .as_ref()
-                        .and_then(|v| v.first())
-                        .map(|f| f.mime.as_str()),
-                    Some("application/pdf")
-                );
-            }
-            _ => panic!("expected completed state"),
-        }
-    }
-
     /// Regression test for the prompt loop early-exit bug:
     /// When the assistant message has text + tool calls and finish="tool-calls",
     /// the loop must NOT break at the top-of-loop check.
@@ -6024,9 +3043,10 @@ mod tests {
         // The early-exit check from the prompt loop
         let should_break = if let Some(assistant_idx) = last_assistant_idx {
             let assistant = &messages[assistant_idx];
-            let is_terminal = assistant.finish.as_deref().is_some_and(|f| {
-                !matches!(f, "tool-calls" | "tool_calls" | "unknown")
-            });
+            let is_terminal = assistant
+                .finish
+                .as_deref()
+                .is_some_and(|f| !matches!(f, "tool-calls" | "tool_calls" | "unknown"));
             is_terminal && last_user_idx < assistant_idx
         } else {
             false
@@ -6068,18 +3088,16 @@ mod tests {
 
         let should_break = if let Some(assistant_idx) = last_assistant_idx {
             let assistant = &messages[assistant_idx];
-            let is_terminal = assistant.finish.as_deref().is_some_and(|f| {
-                !matches!(f, "tool-calls" | "tool_calls" | "unknown")
-            });
+            let is_terminal = assistant
+                .finish
+                .as_deref()
+                .is_some_and(|f| !matches!(f, "tool-calls" | "tool_calls" | "unknown"));
             is_terminal && last_user_idx < assistant_idx
         } else {
             false
         };
 
-        assert!(
-            should_break,
-            "early-exit MUST trigger when finish='stop'"
-        );
+        assert!(should_break, "early-exit MUST trigger when finish='stop'");
     }
 
     /// Verify that the early-exit check does NOT break when finish is None
@@ -6113,9 +3131,10 @@ mod tests {
 
         let should_break = if let Some(assistant_idx) = last_assistant_idx {
             let assistant = &messages[assistant_idx];
-            let is_terminal = assistant.finish.as_deref().is_some_and(|f| {
-                !matches!(f, "tool-calls" | "tool_calls" | "unknown")
-            });
+            let is_terminal = assistant
+                .finish
+                .as_deref()
+                .is_some_and(|f| !matches!(f, "tool-calls" | "tool_calls" | "unknown"));
             is_terminal && last_user_idx < assistant_idx
         } else {
             false

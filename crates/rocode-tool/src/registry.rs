@@ -8,6 +8,139 @@ use rocode_plugin::{HookContext, HookEvent};
 /// Tools that should not appear in suggestion lists when a tool is not found.
 const FILTERED_FROM_SUGGESTIONS: &[&str] = &["invalid", "patch", "batch"];
 
+fn looks_like_jsonish_payload(s: &str) -> bool {
+    let trimmed = s.trim_start();
+    trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with("\"{")
+        || trimmed.starts_with("\"[")
+        || s.contains("\":")
+        || s.contains("\\\":")
+        || s.contains("\"file_path\"")
+        || s.contains("\\\"file_path\\\"")
+        || s.contains("\"filePath\"")
+        || s.contains("\\\"filePath\\\"")
+        || s.contains("\"content\"")
+        || s.contains("\\\"content\\\"")
+}
+
+fn parse_jsonish_string_field(input: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{}\"", field);
+    let field_idx = input.find(&needle)?;
+    let after_field = &input[field_idx + needle.len()..];
+    let colon_idx = after_field.find(':')?;
+    let mut chars = after_field[colon_idx + 1..].chars().peekable();
+
+    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+        chars.next();
+    }
+    if !matches!(chars.next(), Some('"')) {
+        return None;
+    }
+
+    let mut out = String::new();
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            match ch {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' => out.push('\u{08}'),
+                'f' => out.push('\u{0c}'),
+                'u' => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        match chars.peek().copied() {
+                            Some(c) if c.is_ascii_hexdigit() => {
+                                hex.push(c);
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    if hex.len() == 4 {
+                        if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                            if let Some(decoded) = char::from_u32(code) {
+                                out.push(decoded);
+                            }
+                        }
+                    } else {
+                        out.push('u');
+                        out.push_str(&hex);
+                    }
+                }
+                other => out.push(other),
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(out),
+            other => out.push(other),
+        }
+    }
+
+    // Unterminated JSON string: return best-effort content.
+    Some(out)
+}
+
+fn recover_write_args_from_jsonish(input: &str) -> Option<serde_json::Value> {
+    fn normalize_single_escaped_quotes(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        let mut prev: Option<char> = None;
+
+        while let Some(ch) = chars.next() {
+            if ch == '\\' && matches!(chars.peek(), Some('"')) && prev != Some('\\') {
+                out.push('"');
+                chars.next();
+                prev = Some('"');
+                continue;
+            }
+            out.push(ch);
+            prev = Some(ch);
+        }
+        out
+    }
+
+    fn recover_once(input: &str) -> Option<serde_json::Value> {
+        let file_path = parse_jsonish_string_field(input, "file_path")
+            .or_else(|| parse_jsonish_string_field(input, "filePath"))?;
+        let content = parse_jsonish_string_field(input, "content").unwrap_or_default();
+        Some(serde_json::json!({
+            "file_path": file_path,
+            "content": content
+        }))
+    }
+
+    if let Some(recovered) = recover_once(input) {
+        return Some(recovered);
+    }
+
+    // If arguments were wrapped as a JSON string, unwrap one layer and retry.
+    if let Ok(inner) = serde_json::from_str::<String>(input) {
+        if let Some(recovered) = recover_once(&inner) {
+            return Some(recovered);
+        }
+    }
+
+    // Some malformed payloads preserve escaped quotes without a valid outer JSON
+    // wrapper (e.g. {\"file_path\":\"...\" ...). Best-effort normalize and retry.
+    if input.contains("\\\"") {
+        let de_escaped_quotes = normalize_single_escaped_quotes(input);
+        if let Some(recovered) = recover_once(&de_escaped_quotes) {
+            return Some(recovered);
+        }
+    }
+
+    None
+}
+
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
 }
@@ -123,34 +256,52 @@ impl ToolRegistry {
         // parse it into an actual object. This happens when the stream assembler
         // fails to parse tool call arguments during streaming and wraps the raw
         // text as Value::String.
-        if let Some(s) = args.as_str() {
-            if let Ok(parsed @ serde_json::Value::Object(_)) = serde_json::from_str(s) {
+        if let Some(s) = args.as_str().map(|s| s.to_owned()) {
+            if let Some(parsed @ serde_json::Value::Object(_)) =
+                rocode_util::json::try_parse_json_object_robust(&s)
+            {
+                tracing::info!(
+                    tool = %tool_id,
+                    "recovered tool arguments via robust JSON parser"
+                );
                 args = parsed;
             } else {
-                // Some models (e.g. Qwen via LiteLLM) may send arguments in
-                // non-JSON formats like "key=value" or "key: value". Try to
-                // construct a JSON object from simple key=value pairs.
-                let mut obj = serde_json::Map::new();
-                for line in s.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if let Some((key, value)) = line.split_once('=') {
-                        let key = key.trim().to_string();
-                        let value = value.trim();
-                        // Try to parse value as JSON, otherwise treat as string
-                        let json_value = serde_json::from_str(value)
-                            .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
-                        obj.insert(key, json_value);
+                if tool_id == "write" {
+                    if let Some(parsed) = recover_write_args_from_jsonish(&s) {
+                        tracing::info!(
+                            tool = %tool_id,
+                            "recovered write arguments from JSON-ish payload"
+                        );
+                        args = parsed;
                     }
                 }
-                if !obj.is_empty() {
-                    tracing::info!(
-                        tool = %tool_id,
-                        "normalized non-JSON tool arguments from key=value format"
-                    );
-                    args = serde_json::Value::Object(obj);
+                // If still a string, try key=value fallback.
+                if args.is_string() && !looks_like_jsonish_payload(&s) {
+                    // Some models (e.g. Qwen via LiteLLM) may send arguments in
+                    // non-JSON formats like "key=value" or "key: value". Try to
+                    // construct a JSON object from simple key=value pairs.
+                    let mut obj = serde_json::Map::new();
+                    for line in s.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Some((key, value)) = line.split_once('=') {
+                            let key = key.trim().to_string();
+                            let value = value.trim();
+                            // Try to parse value as JSON, otherwise treat as string
+                            let json_value = serde_json::from_str(value)
+                                .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+                            obj.insert(key, json_value);
+                        }
+                    }
+                    if !obj.is_empty() {
+                        tracing::info!(
+                            tool = %tool_id,
+                            "normalized non-JSON tool arguments from key=value format"
+                        );
+                        args = serde_json::Value::Object(obj);
+                    }
                 }
             }
         }
@@ -164,6 +315,10 @@ impl ToolRegistry {
         }
 
         // Plugin hook: tool.execute.before
+        tracing::debug!(
+            tool = %tool_id,
+            "[plugin-seq] tool.execute.before"
+        );
         let mut before_hook_ctx = HookContext::new(HookEvent::ToolExecuteBefore)
             .with_session(&ctx.session_id)
             .with_data("tool", serde_json::json!(tool_id))
@@ -203,6 +358,10 @@ impl ToolRegistry {
         }
 
         // Plugin hook: tool.execute.after
+        tracing::debug!(
+            tool = %tool_id,
+            "[plugin-seq] tool.execute.after"
+        );
         let mut hook_ctx = HookContext::new(HookEvent::ToolExecuteAfter)
             .with_session(&ctx.session_id)
             .with_data("tool", serde_json::json!(tool_id))
@@ -334,4 +493,198 @@ pub async fn create_default_registry() -> ToolRegistry {
     registry.register(crate::invalid::InvalidTool).await;
 
     registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    struct CaptureTool {
+        captured: Arc<Mutex<Option<serde_json::Value>>>,
+        id: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for CaptureTool {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn description(&self) -> &str {
+            "Captures args for testing"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            *self.captured.lock().expect("lock should succeed") = Some(args.clone());
+            let file_path = args
+                .get("file_path")
+                .or_else(|| args.get("filePath"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Ok(ToolResult::simple("ok", file_path))
+        }
+    }
+
+    async fn setup_capture_registry() -> (ToolRegistry, Arc<Mutex<Option<serde_json::Value>>>) {
+        let registry = ToolRegistry::new();
+        let captured = Arc::new(Mutex::new(None));
+        registry
+            .register(CaptureTool {
+                captured: captured.clone(),
+                id: "capture",
+            })
+            .await;
+        (registry, captured)
+    }
+
+    fn test_tool_context() -> ToolContext {
+        ToolContext::new(
+            "ses_test".to_string(),
+            "msg_test".to_string(),
+            ".".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_recovers_stringified_json_object_arguments() {
+        let (registry, captured) = setup_capture_registry().await;
+        let inner = r#"{"file_path":"/tmp/a.html","content":"hello"}"#;
+        let outer = serde_json::to_string(inner).expect("stringify should succeed");
+
+        let result = registry
+            .execute(
+                "capture",
+                serde_json::Value::String(outer),
+                test_tool_context(),
+            )
+            .await
+            .expect("tool should execute");
+
+        assert_eq!(result.output, "/tmp/a.html");
+        let captured_args = captured
+            .lock()
+            .expect("lock should succeed")
+            .clone()
+            .expect("args should be captured");
+        assert!(captured_args.is_object());
+        assert_eq!(captured_args["file_path"], "/tmp/a.html");
+    }
+
+    #[tokio::test]
+    async fn execute_recovers_literal_control_characters_in_json_string_arguments() {
+        let (registry, captured) = setup_capture_registry().await;
+        let args = serde_json::Value::String(
+            "{\"file_path\":\"/tmp/b.html\",\"content\":\"line1\nline2\"}".to_string(),
+        );
+
+        let result = registry
+            .execute("capture", args, test_tool_context())
+            .await
+            .expect("tool should execute");
+
+        assert_eq!(result.output, "/tmp/b.html");
+        let captured_args = captured
+            .lock()
+            .expect("lock should succeed")
+            .clone()
+            .expect("args should be captured");
+        assert_eq!(captured_args["file_path"], "/tmp/b.html");
+        assert_eq!(captured_args["content"], "line1\nline2");
+    }
+
+    #[tokio::test]
+    async fn execute_keeps_key_value_fallback_for_non_json_strings() {
+        let (registry, captured) = setup_capture_registry().await;
+        let args = serde_json::Value::String("file_path=/tmp/c.html\ncontent=hello".to_string());
+
+        let result = registry
+            .execute("capture", args, test_tool_context())
+            .await
+            .expect("tool should execute");
+
+        assert_eq!(result.output, "/tmp/c.html");
+        let captured_args = captured
+            .lock()
+            .expect("lock should succeed")
+            .clone()
+            .expect("args should be captured");
+        assert_eq!(captured_args["file_path"], "/tmp/c.html");
+        assert_eq!(captured_args["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn execute_recovers_write_args_from_unterminated_jsonish_payload() {
+        let registry = ToolRegistry::new();
+        let captured = Arc::new(Mutex::new(None));
+        registry
+            .register(CaptureTool {
+                captured: captured.clone(),
+                id: "write",
+            })
+            .await;
+
+        let malformed = serde_json::Value::String(
+            "{\"file_path\":\"/tmp/d.html\",\"content\":\"<div class=\\\"x\\\">hello\nworld"
+                .to_string(),
+        );
+
+        let result = registry
+            .execute("write", malformed, test_tool_context())
+            .await
+            .expect("tool should execute");
+
+        assert_eq!(result.output, "/tmp/d.html");
+        let captured_args = captured
+            .lock()
+            .expect("lock should succeed")
+            .clone()
+            .expect("args should be captured");
+        assert_eq!(captured_args["file_path"], "/tmp/d.html");
+        assert_eq!(captured_args["content"], "<div class=\"x\">hello\nworld");
+    }
+
+    #[tokio::test]
+    async fn execute_recovers_write_args_from_escaped_jsonish_payload() {
+        let registry = ToolRegistry::new();
+        let captured = Arc::new(Mutex::new(None));
+        registry
+            .register(CaptureTool {
+                captured: captured.clone(),
+                id: "write",
+            })
+            .await;
+
+        let malformed = serde_json::Value::String(
+            "{\\\"file_path\\\":\\\"/tmp/e.html\\\",\\\"content\\\":\\\"<div class=\\\\\\\"x\\\\\\\">hello\\nworld".to_string(),
+        );
+
+        let result = registry
+            .execute("write", malformed, test_tool_context())
+            .await
+            .expect("tool should execute");
+
+        assert_eq!(result.output, "/tmp/e.html");
+        let captured_args = captured
+            .lock()
+            .expect("lock should succeed")
+            .clone()
+            .expect("args should be captured");
+        assert_eq!(captured_args["file_path"], "/tmp/e.html");
+        let content = captured_args["content"]
+            .as_str()
+            .expect("content should be string");
+        assert!(content.contains("<div class="));
+        assert!(content.contains("hello"));
+    }
 }
