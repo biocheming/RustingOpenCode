@@ -332,7 +332,7 @@ impl PluginLoader {
                     let breakers = Arc::clone(&breakers);
                     async move {
                         // Check circuit breaker before invoking the hook.
-                        {
+                        if crate::feature_flags::is_enabled("plugin_circuit_breaker") {
                             let mut map = breakers.lock().await;
                             let cb = map
                                 .entry(hook_name_owned.clone())
@@ -356,20 +356,24 @@ impl PluginLoader {
 
                         match result {
                             Ok(value) => {
-                                let mut map = breakers.lock().await;
-                                if let Some(cb) = map.get_mut(&hook_name_owned) {
-                                    cb.record_success();
+                                if crate::feature_flags::is_enabled("plugin_circuit_breaker") {
+                                    let mut map = breakers.lock().await;
+                                    if let Some(cb) = map.get_mut(&hook_name_owned) {
+                                        cb.record_success();
+                                    }
                                 }
                                 Ok(HookOutput::with_payload(value))
                             }
                             Err(ref e) if matches!(e, PluginSubprocessError::Timeout) => {
-                                let mut map = breakers.lock().await;
-                                let cb = map
-                                    .entry(hook_name_owned.clone())
-                                    .or_insert_with(|| {
-                                        CircuitBreaker::new(3, Duration::from_secs(60))
-                                    });
-                                cb.record_failure();
+                                if crate::feature_flags::is_enabled("plugin_circuit_breaker") {
+                                    let mut map = breakers.lock().await;
+                                    let cb = map
+                                        .entry(hook_name_owned.clone())
+                                        .or_insert_with(|| {
+                                            CircuitBreaker::new(3, Duration::from_secs(60))
+                                        });
+                                    cb.record_failure();
+                                }
                                 Err(HookError::ExecutionError(format!(
                                     "TS plugin `{}` hook `{}` failed: {}",
                                     plugin_name, hook_name_owned, e

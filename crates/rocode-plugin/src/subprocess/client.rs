@@ -120,6 +120,9 @@ pub struct PluginContext {
 // Transport — inner mutable state that gets swapped on reconnect
 // ---------------------------------------------------------------------------
 
+/// Payloads larger than this are written to a temp file instead of stdin pipe.
+const LARGE_PAYLOAD_THRESHOLD: usize = 64 * 1024; // 64KB
+
 struct Transport {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -265,8 +268,48 @@ impl PluginSubprocess {
             "input": input,
             "output": output,
         });
-        let result: Value = self.call("hook.invoke", Some(params)).await?;
-        Ok(result.get("output").cloned().unwrap_or(Value::Null))
+
+        let serialized = serde_json::to_string(&params).unwrap_or_default();
+
+        if serialized.len() > LARGE_PAYLOAD_THRESHOLD
+            && crate::feature_flags::is_enabled("plugin_large_payload_file_ipc")
+        {
+            // Write to temp file for large payloads
+            let dir = std::env::temp_dir().join("rocode-plugin-ipc");
+            tokio::fs::create_dir_all(&dir).await.ok();
+            let token = format!(
+                "{}-{}-{}",
+                std::process::id(),
+                self.request_id.load(Ordering::Relaxed),
+                chrono::Utc::now().timestamp_millis()
+            );
+            let file_path = dir.join(format!("{}.json", token));
+            tokio::fs::write(&file_path, &serialized)
+                .await
+                .map_err(|e| PluginSubprocessError::Protocol(format!("ipc write: {}", e)))?;
+
+            // Set restrictive permissions (Unix only)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(&file_path, perms).ok();
+            }
+
+            let file_params = serde_json::json!({
+                "file": file_path.to_string_lossy(),
+                "token": token,
+            });
+            let result: Value = self.call("hook.invoke.file", Some(file_params)).await?;
+
+            // Cleanup temp file
+            tokio::fs::remove_file(&file_path).await.ok();
+
+            Ok(result.get("output").cloned().unwrap_or(Value::Null))
+        } else {
+            let result: Value = self.call("hook.invoke", Some(params)).await?;
+            Ok(result.get("output").cloned().unwrap_or(Value::Null))
+        }
     }
 
     /// Trigger OAuth authorization flow.
@@ -581,7 +624,9 @@ impl PluginSubprocess {
                 // Timeout — attempt reconnect so the *next* call works.
                 // We already hold rpc_lock, so reconnect() can safely use
                 // the transport without interference.
-                let _ = self.reconnect().await;
+                if crate::feature_flags::is_enabled("plugin_timeout_self_heal") {
+                    let _ = self.reconnect().await;
+                }
                 Err(PluginSubprocessError::Timeout)
             }
         }
@@ -669,6 +714,8 @@ impl PluginSubprocess {
 async fn log_plugin_stderr(plugin_path: String, stderr: ChildStderr) {
     let mut reader = BufReader::new(stderr);
     let mut line = String::new();
+    let mut count = 0u64;
+    let mut last_reset = tokio::time::Instant::now();
 
     loop {
         line.clear();
@@ -677,7 +724,18 @@ async fn log_plugin_stderr(plugin_path: String, stderr: ChildStderr) {
             Ok(_) => {
                 let msg = line.trim_end();
                 if !msg.is_empty() {
-                    tracing::debug!(plugin = %plugin_path, message = %msg, "plugin stderr");
+                    // Rate limit: max 20 lines per second
+                    if last_reset.elapsed() > Duration::from_secs(1) {
+                        count = 0;
+                        last_reset = tokio::time::Instant::now();
+                    }
+                    count += 1;
+                    if count <= 20 {
+                        tracing::warn!(
+                            plugin = %plugin_path,
+                            "[plugin-stderr] {}", msg
+                        );
+                    }
                 }
             }
             Err(error) => {

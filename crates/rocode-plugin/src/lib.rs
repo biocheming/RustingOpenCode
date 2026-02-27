@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub mod circuit_breaker;
+pub mod feature_flags;
 pub mod subprocess;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -242,21 +243,34 @@ impl PluginSystem {
         // Drop the read lock before awaiting.
         drop(hooks);
 
-        // Execute hooks sequentially (TS parity: for-loop, not join_all).
+        // Execute hooks sequentially (TS parity) or in parallel depending on flag.
         let mut results: Vec<HookResult> = Vec::with_capacity(enabled.len());
-        for hook in &enabled {
-            let start = std::time::Instant::now();
-            let result = (hook.handler)(context.clone()).await;
-            let elapsed = start.elapsed();
-            let status = if result.is_ok() { "ok" } else { "err" };
-            tracing::debug!(
-                event = ?context.event,
-                hook_id = %hook.name,
-                duration_ms = elapsed.as_millis() as u64,
-                status = status,
-                "[plugin-perf] hook executed"
-            );
-            results.push(result);
+        if feature_flags::is_enabled("plugin_seq_hooks") {
+            // Sequential execution with per-hook timing instrumentation.
+            for hook in &enabled {
+                let start = std::time::Instant::now();
+                let result = (hook.handler)(context.clone()).await;
+                let elapsed = start.elapsed();
+                let status = if result.is_ok() { "ok" } else { "err" };
+                tracing::debug!(
+                    event = ?context.event,
+                    hook_id = %hook.name,
+                    duration_ms = elapsed.as_millis() as u64,
+                    status = status,
+                    "[plugin-perf] hook executed"
+                );
+                results.push(result);
+            }
+        } else {
+            // Parallel fallback: spawn all hooks concurrently.
+            let mut handles = Vec::with_capacity(enabled.len());
+            for hook in &enabled {
+                let ctx = context.clone();
+                handles.push((hook.handler)(ctx));
+            }
+            for fut in handles {
+                results.push(fut.await);
+            }
         }
 
         // Cache results for deterministic events.
