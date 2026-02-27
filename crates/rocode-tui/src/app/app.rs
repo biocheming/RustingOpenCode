@@ -98,6 +98,7 @@ pub struct App {
     last_process_refresh: Instant,
     last_perf_log: Instant,
     perf: PerfCounters,
+    perf_log_info: bool,
     event_caused_change: bool,
 }
 
@@ -271,6 +272,7 @@ impl App {
             last_process_refresh: Instant::now(),
             last_perf_log: Instant::now(),
             perf: PerfCounters::default(),
+            perf_log_info: env_var_enabled("ROCODE_PERF_LOG"),
             event_caused_change: true,
         };
 
@@ -3657,33 +3659,39 @@ impl App {
             return Ok(());
         };
 
-        let session = client.get_session(session_id)?;
         let anchor_id = if matches!(mode, SessionSyncMode::Incremental) {
             self.incremental_sync_anchor_id(session_id)
         } else {
             None
         };
-        let effective_mode = if matches!(mode, SessionSyncMode::Incremental) && anchor_id.is_some() {
-            SessionSyncMode::Incremental
-        } else {
-            SessionSyncMode::Full
-        };
-        let messages = match effective_mode {
-            SessionSyncMode::Full => client.get_messages(session_id)?,
-            SessionSyncMode::Incremental => {
-                client.get_messages_after(session_id, anchor_id.as_deref(), Some(256))?
+        if matches!(mode, SessionSyncMode::Incremental) {
+            if let Some(anchor_id) = anchor_id {
+                let messages =
+                    client.get_messages_after(session_id, Some(anchor_id.as_str()), Some(256))?;
+                let mapped_messages = messages.iter().map(map_api_message).collect::<Vec<Message>>();
+
+                let mut session_ctx = self.context.session.write();
+                session_ctx.upsert_messages_incremental(session_id, mapped_messages);
+                if let Some(session) = session_ctx.sessions.get_mut(session_id) {
+                    session.updated_at = Utc::now();
+                }
+                drop(session_ctx);
+
+                self.last_session_sync = Instant::now();
+                self.perf.session_sync_incremental =
+                    self.perf.session_sync_incremental.saturating_add(1);
+                return Ok(());
             }
-        };
+        }
+
+        let session = client.get_session(session_id)?;
+        let messages = client.get_messages(session_id)?;
         let mapped_messages = messages.iter().map(map_api_message).collect::<Vec<Message>>();
         let revert = session.revert.as_ref().map(map_api_revert);
 
         let mut session_ctx = self.context.session.write();
         session_ctx.upsert_session(map_api_session(&session));
-        if matches!(effective_mode, SessionSyncMode::Incremental) {
-            session_ctx.upsert_messages_incremental(session_id, mapped_messages);
-        } else {
-            session_ctx.set_messages(session_id, mapped_messages);
-        }
+        session_ctx.set_messages(session_id, mapped_messages);
         if let Some(revert_info) = revert {
             session_ctx
                 .revert
@@ -3691,28 +3699,24 @@ impl App {
         } else {
             session_ctx.revert.remove(session_id);
         }
-        if matches!(effective_mode, SessionSyncMode::Full) {
-            if let Ok(status_map) = client.get_session_status() {
-                if let Some(status) = status_map.get(session_id) {
-                    session_ctx.set_status(session_id, map_api_run_status(status));
-                }
+        if let Ok(status_map) = client.get_session_status() {
+            if let Some(status) = status_map.get(session_id) {
+                session_ctx.set_status(session_id, map_api_run_status(status));
             }
         }
         drop(session_ctx);
 
         self.last_session_sync = Instant::now();
-        if matches!(effective_mode, SessionSyncMode::Full) {
-            self.last_full_session_sync = self.last_session_sync;
-            self.perf.session_sync_full = self.perf.session_sync_full.saturating_add(1);
-        } else {
-            self.perf.session_sync_incremental =
-                self.perf.session_sync_incremental.saturating_add(1);
-        }
+        self.last_full_session_sync = self.last_session_sync;
+        self.perf.session_sync_full = self.perf.session_sync_full.saturating_add(1);
         Ok(())
     }
 
     fn incremental_sync_anchor_id(&self, session_id: &str) -> Option<String> {
         let session_ctx = self.context.session.read();
+        if !session_ctx.sessions.contains_key(session_id) {
+            return None;
+        }
         let messages = session_ctx.messages.get(session_id)?;
         if messages.len() >= 2 {
             messages.get(messages.len().saturating_sub(2))
@@ -4046,15 +4050,27 @@ impl App {
             return;
         }
         self.last_perf_log = Instant::now();
-        tracing::debug!(
-            draws = self.perf.draws,
-            screen_snapshots = self.perf.screen_snapshots,
-            session_sync_full = self.perf.session_sync_full,
-            session_sync_incremental = self.perf.session_sync_incremental,
-            question_sync = self.perf.question_sync,
-            session_updated_events = self.perf.session_updated_events,
-            "tui perf snapshot"
-        );
+        if self.perf_log_info {
+            tracing::info!(
+                draws = self.perf.draws,
+                screen_snapshots = self.perf.screen_snapshots,
+                session_sync_full = self.perf.session_sync_full,
+                session_sync_incremental = self.perf.session_sync_incremental,
+                question_sync = self.perf.question_sync,
+                session_updated_events = self.perf.session_updated_events,
+                "tui perf snapshot"
+            );
+        } else {
+            tracing::debug!(
+                draws = self.perf.draws,
+                screen_snapshots = self.perf.screen_snapshots,
+                session_sync_full = self.perf.session_sync_full,
+                session_sync_incremental = self.perf.session_sync_incremental,
+                question_sync = self.perf.question_sync,
+                session_updated_events = self.perf.session_updated_events,
+                "tui perf snapshot"
+            );
+        }
     }
 }
 
@@ -4311,6 +4327,14 @@ fn provider_from_model(model: &str) -> Option<String> {
         return None;
     }
     Some(provider.to_string())
+}
+
+fn env_var_enabled(name: &str) -> bool {
+    let Ok(value) = std::env::var(name) else {
+        return false;
+    };
+    let normalized = value.trim().to_ascii_lowercase();
+    !normalized.is_empty() && !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
 }
 
 fn resolve_tui_base_url() -> String {
