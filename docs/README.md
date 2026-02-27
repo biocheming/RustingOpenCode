@@ -1,16 +1,16 @@
 # RustingOpenCode 文档索引
 
-文档基线：v2026.2.26（更新日期：2026-02-26）
+文档基线：v2026.2.27（更新日期：2026-02-27）
 
-本文档集合对应 `RustingOpenCode (ROCode)` 当前代码状态（版本标识：`v2026.2.26`）。
+本文档集合对应 `RustingOpenCode (ROCode)` 当前代码状态（版本标识：`v2026.2.27`）。
 
-## 本轮重点同步（2026-02-26）
+## 本轮重点同步（2026-02-27）
 
-- 会话回合结束语义对齐 TS 版本：新增 `finish` 字段，修复 tool-calls 后提前退出。
-- 服务端/存储改为“流式增量 + 收尾单会话 flush”，并引入事务化 `flush_with_messages`。
-- 工具输出体积治理：`read`/`batch` 改为附件透传，避免 provider 请求体超限。
-- TUI 与 API 显示链路统一读取 `message.finish`（并兼容 metadata 回退）。
-- 已同步更新 `docs/` 全部模块文档与插件示例说明。
+- 插件子系统完成性能与稳定性优化：顺序 Hook、性能打点、超时自愈、熔断保护、大 payload 文件通道。
+- Provider/Session/Tool 打通鲁棒参数处理链：JSON 容错解析、JSON-ish 恢复、不可恢复参数哨兵对象，降低历史污染。
+- `write` 参数新增执行前预校验，缺关键字段时直接转 `invalid`，并保留结构化诊断信息。
+- `question` 工具对齐交互回调：支持字符串化 `questions` 入参，优先走 `/question/{id}/reply` 链路。
+- TUI Question 弹窗补齐键盘交互：`Up/Down`、`Tab/Shift+Tab`、`Space`、`Enter`。
 
 ## 快速入口
 

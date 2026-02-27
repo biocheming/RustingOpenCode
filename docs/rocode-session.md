@@ -1,6 +1,6 @@
 # rocode-session
 
-文档基线：v2026.2.26（更新日期：2026-02-26）
+文档基线：v2026.2.27（更新日期：2026-02-27）
 
 `rocode-session` 是会话引擎核心，负责消息流、状态机、重试、压缩、摘要、回滚和系统提示构造。
 
@@ -22,7 +22,7 @@
 - `revert.rs` / `snapshot.rs`：回滚与快照
 - `status.rs` / `todo.rs`：状态与待办
 
-## 当前分支变化（v2026.2.26）
+## 当前分支变化（v2026.2.27）
 
 - `llm.rs` 已移除，MCP 相关能力改由 `mcp_bridge.rs` 统一桥接到工具执行链。
 - `compaction.rs` 与插件 `SessionCompacting` hook 对齐，可从 hook payload 注入自定义 compaction prompt/context。
@@ -31,6 +31,9 @@
 - prompt loop 的提前退出条件改为基于 `finish` 与消息 index 顺序判断，修复“模型先产出文本再调用工具”时提前 break 的问题。
 - `FinishStep` 事件会把 finish reason 写入 assistant message；`tool-calls/tool_calls/unknown` 会继续下一轮，终止理由才结束回合。
 - 已补充针对 early-exit 的回归测试：`finish=tool-calls` 不退出、`finish=stop` 退出、`finish=None` 不退出。
+- `prompt/` 逻辑拆分为 `file_parts`、`message_building`、`tool_calls`、`tool_execution` 四个子模块，降低主循环复杂度并便于定向测试。
+- 新增工具执行前预校验：`write` 缺少 `file_path` 或 `content` 时直接转 `invalid`，避免进入执行层后重复失败。
+- 工具参数历史写回统一走 `sanitize_tool_call_input_for_history`，不可恢复 payload 会写入可诊断对象，减少后续回放污染。
 
 ## 关键导出（节选）
 

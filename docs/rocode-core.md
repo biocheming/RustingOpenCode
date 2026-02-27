@@ -1,6 +1,6 @@
 # rocode-core
 
-文档基线：v2026.2.26（更新日期：2026-02-26）
+文档基线：v2026.2.27（更新日期：2026-02-27）
 
 `rocode-core` 是工作区最底层的通用基础库，提供全局事件总线、ID 生成与进程注册能力。
 
@@ -18,7 +18,7 @@
 - `process_registry.rs`：跨模块进程注册、资源采样与终止
 - `lib.rs`：统一导出
 
-## 当前分支变化（v2026.2.26）
+## 当前分支变化（v2026.2.27）
 
 - 新增 `process_registry` 导出，统一跟踪 Plugin/Bash/Agent 子进程。
 - 进程信息包含 `pid/name/kind/started_at/cpu_percent/memory_kb`，供 TUI 侧栏实时展示。

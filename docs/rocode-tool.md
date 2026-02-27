@@ -1,6 +1,6 @@
 # rocode-tool
 
-文档基线：v2026.2.26（更新日期：2026-02-26）
+文档基线：v2026.2.27（更新日期：2026-02-27）
 
 `rocode-tool` 提供工具调用体系，包括工具定义、注册中心、执行上下文和内置工具实现。
 
@@ -24,7 +24,7 @@
 
 - `lsp` feature：启用 `rocode-lsp` 与 `lsp-types` 集成
 
-## 当前分支变化（v2026.2.26）
+## 当前分支变化（v2026.2.27）
 
 - `read` 工具描述改为外置 `read.txt`，并增强入参兼容（`file_path/filePath/filepath/path`）；对目录、图片、PDF 提供结构化读取输出（含 data URL）。
 - `registry` 增加工具参数规范化与错误重写：字符串参数会尝试解析为 JSON/`key=value`，`InvalidArguments` 统一附带“请重写为合法 schema”提示。
@@ -34,6 +34,9 @@
 - `read` 在二进制读取场景不再把 base64 直接塞进文本输出，改为通过 `metadata.attachments`/`attachment` 透传，降低 provider 请求体体积。
 - `batch` 会聚合子工具附件并剔除重复的大附件 metadata，默认输出从“全量 JSON 回显”改为摘要文案，降低上下文噪音与 body 大小。
 - `question` 工具新增 `display.summary` 与 `display.fields` 元数据，供 TUI 以结构化问答方式渲染。
+- `question` 工具执行链改为优先使用 `ctx.question(...)` 回调；仅在回调未配置时回退到 stdin 询问。
+- `question` 入参兼容增强：`questions` 可接受数组、单对象、或字符串化 JSON（数组/对象）。
+- `path_guard` 引入根路径单段纠正策略，降低模型误写 `/xxx` 到错误目录的概率。
 
 ## 开发建议
 

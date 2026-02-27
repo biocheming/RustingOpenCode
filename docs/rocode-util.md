@@ -1,12 +1,13 @@
 # rocode-util
 
-文档基线：v2026.2.26（更新日期：2026-02-26）
+文档基线：v2026.2.27（更新日期：2026-02-27）
 
 `rocode-util` 提供跨模块复用的工具函数与基础能力实现。
 
-## 本轮状态（v2026.2.26）
+## 本轮状态（v2026.2.27）
 
-- 本轮未新增公共工具 API，仍建议由 CLI 统一初始化日志并由业务模块复用 util 能力。
+- 新增并统一复用鲁棒 JSON 参数处理能力：`try_parse_json_object_robust`、`recover_tool_arguments_from_jsonish`。
+- 该能力已被 provider/tool/session/storage 多模块复用，用于处理模型流式工具参数中的截断、转义与 JSON-ish 形态。
 
 ## 主要职责
 

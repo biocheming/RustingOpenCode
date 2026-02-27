@@ -1,6 +1,6 @@
 # rocode-plugin
 
-文档基线：v2026.2.26（更新日期：2026-02-26）
+文档基线：v2026.2.27（更新日期：2026-02-27）
 
 `rocode-plugin` 提供全局 Hook 系统，以及 TS 插件子进程桥接能力。
 
@@ -34,13 +34,15 @@
 - 目录：`crates/rocode-plugin/src/subprocess`
 - 职责：插件发现、子进程生命周期、hook 转发、auth bridge
 
-## 当前分支变化（v2026.2.26）
+## 当前分支变化（v2026.2.27）
 
 - Hook 系统区分可缓存事件（如 `ConfigLoaded`、`ShellEnv`）与 fire-and-forget 事件（如 `SessionCompacting`、`Error`），并内建缓存失效能力。
 - 子进程 RPC 写入/读取统一纳入超时控制（默认 30 秒），降低插件 host 卡住时主流程阻塞风险。
 - JS Runtime 检测支持 `ROCODE_PLUGIN_RUNTIME` / `OPENCODE_PLUGIN_RUNTIME` 覆盖，默认优先 `bun > deno > node(>=22.6)`。
 - 插件子进程启动后会注册到 `rocode_core::process_registry`，用于 TUI 进程面板可视化与手动终止。
-- 本轮插件接口未新增破坏性字段，重点是与会话 `finish` 语义对齐后的显示链路兼容。
+- 触发机制对齐 TS 行为：默认顺序触发 Hook，并补充 `[plugin-perf]` 观测日志（耗时/载荷字节数）。
+- 大 payload 通道支持临时文件传递（超阈值走文件而非管道直传），降低 `chat.messages.transform` 场景序列化与 IPC 压力。
+- 子进程稳定性增强：超时自愈重启、熔断保护、stderr 限速采集、启动清理陈旧 IPC 临时文件。
 
 ## 开发建议
 

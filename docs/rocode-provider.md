@@ -1,6 +1,6 @@
 # rocode-provider
 
-文档基线：v2026.2.26（更新日期：2026-02-26）
+文档基线：v2026.2.27（更新日期：2026-02-27）
 
 `rocode-provider` 是多模型供应商适配层，负责请求构建、流式响应解析、重试和模型能力查询。
 
@@ -21,13 +21,16 @@
 - `transform.rs`：消息去重、cache hint、interleaved thinking 规范化
 - `<vendor>.rs`：各厂商适配实现
 
-## 当前分支变化（v2026.2.26）
+## 当前分支变化（v2026.2.27）
 
 - `transform.rs` 强化了 Provider 兼容层：包含 `dedup_messages`、`normalize_messages`、`normalize_messages_for_caching`、`apply_interleaved_thinking` 等路径。
 - 新增统一 `OUTPUT_TOKEN_MAX = 32000` 默认值，与 TS 侧行为对齐。
 - OpenAI 适配对 `/chat/completions` 响应采用宽松解析（nullish 字段、`tool_calls.function.arguments` 容错），减少第三方兼容 API 失败率。
 - Anthropic 适配支持 reasoning/thinking 内容映射，并附带 `interleaved-thinking`、`fine-grained-tool-streaming` 相关 beta header。
 - `ModelInfo` 新增 `max_input_tokens` 字段；各 provider 内置模型已补齐该字段（暂无明确上限时为 `None`），为 compaction/token 预算提供更准确输入上限。
+- OpenAI 工具参数处理链路统一复用 `rocode_util::json::try_parse_json_object_robust` 与 `recover_tool_arguments_from_jsonish`。
+- 历史回放中的不可恢复工具参数改为标准哨兵对象（保留 `tool_call_id/raw_len/preview`），避免“跳过 tool_call 导致 orphan tool_result”反复污染。
+- 继续保留 malformed arguments 的恢复日志（`recovered malformed tool call arguments`），便于线上定位模型输出质量问题。
 
 ## 关键导出
 

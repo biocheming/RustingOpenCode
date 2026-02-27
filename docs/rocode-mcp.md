@@ -1,6 +1,6 @@
 # rocode-mcp
 
-文档基线：v2026.2.26（更新日期：2026-02-26）
+文档基线：v2026.2.27（更新日期：2026-02-27）
 
 `rocode-mcp` 实现 MCP（Model Context Protocol）客户端体系，支持多传输协议和 OAuth。
 
@@ -19,7 +19,7 @@
 - `transport.rs`：传输层（HTTP/SSE/Stdio）
 - `protocol.rs`：JSON-RPC 协议结构
 
-## 当前分支变化（v2026.2.26）
+## 当前分支变化（v2026.2.27）
 
 - `transport.rs` 的 `StdioTransport` 使用 Content-Length 帧进行 JSON-RPC 读写，行为与 MCP stdio 规范一致。
 - `HttpTransport` 同时支持普通 JSON 响应与 `text/event-stream` 响应体（POST 返回 SSE 分片），会把事件缓冲到统一接收队列。
