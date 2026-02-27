@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 use super::protocol::{RpcError, RpcRequest, RpcResponse};
 use super::runtime::JsRuntime;
@@ -117,16 +117,26 @@ pub struct PluginContext {
 }
 
 // ---------------------------------------------------------------------------
+// Transport — inner mutable state that gets swapped on reconnect
+// ---------------------------------------------------------------------------
+
+struct Transport {
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    process: Child,
+}
+
+// ---------------------------------------------------------------------------
 // PluginSubprocess
 // ---------------------------------------------------------------------------
 
 pub struct PluginSubprocess {
     /// Human-readable plugin name (from initialize response).
     name: String,
-    stdin: Arc<Mutex<ChildStdin>>,
-    stdout: Arc<Mutex<BufReader<ChildStdout>>>,
+    /// Inner transport swapped atomically on reconnect.
+    transport: Arc<RwLock<Transport>>,
+    /// Serializes RPC call sequences (separate from transport lock).
     rpc_lock: Arc<Mutex<()>>,
-    process: Mutex<Child>,
     request_id: AtomicU64,
     /// Hook names this plugin registered.
     hooks: Vec<String>,
@@ -134,6 +144,12 @@ pub struct PluginSubprocess {
     auth_meta: Option<AuthMeta>,
     /// RPC call timeout.
     timeout: Duration,
+    // -- Saved for reconnect --------------------------------------------------
+    runtime: JsRuntime,
+    host_script: String,
+    plugin_path: String,
+    init_context: serde_json::Value,
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl PluginSubprocess {
@@ -177,16 +193,26 @@ impl PluginSubprocess {
             .take()
             .ok_or_else(|| PluginSubprocessError::Protocol("no stdout".into()))?;
 
+        let init_context = serde_json::to_value(&context)
+            .map_err(|e| PluginSubprocessError::Protocol(format!("serialize context: {e}")))?;
+
         let mut this = Self {
             name: String::new(),
-            stdin: Arc::new(Mutex::new(stdin)),
-            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            transport: Arc::new(RwLock::new(Transport {
+                stdin,
+                stdout: BufReader::new(stdout),
+                process: child,
+            })),
             rpc_lock: Arc::new(Mutex::new(())),
-            process: Mutex::new(child),
             request_id: AtomicU64::new(1),
             hooks: Vec::new(),
             auth_meta: None,
             timeout: Duration::from_secs(30),
+            runtime,
+            host_script: host_script.to_string(),
+            plugin_path: plugin_path.to_string(),
+            init_context,
+            cwd: cwd.map(|p| p.to_path_buf()),
         };
 
         // Send initialize
@@ -201,8 +227,11 @@ impl PluginSubprocess {
         this.auth_meta = result.auth;
 
         // Register in global process registry for TUI visibility
-        if let Some(pid) = this.process.lock().await.id() {
-            global_registry().register(pid, this.name.clone(), ProcessKind::Plugin);
+        {
+            let transport = this.transport.read().await;
+            if let Some(pid) = transport.process.id() {
+                global_registry().register(pid, this.name.clone(), ProcessKind::Plugin);
+            }
         }
 
         Ok(this)
@@ -306,15 +335,16 @@ impl PluginSubprocess {
             Result<(u16, std::collections::HashMap<String, String>), PluginSubprocessError>,
         >();
         let (chunk_tx, chunk_rx) = mpsc::channel(128);
-        let stdout = Arc::clone(&self.stdout);
+        let transport = Arc::clone(&self.transport);
 
         tokio::spawn(async move {
             let _rpc_guard = rpc_guard;
             let mut start_tx = Some(start_tx);
-            let mut reader = stdout.lock().await;
+            let mut transport_guard = transport.write().await;
+            let reader = &mut transport_guard.stdout;
 
             loop {
-                let raw = match Self::read_raw_message(&mut reader).await {
+                let raw = match Self::read_raw_message(reader).await {
                     Ok(raw) => raw,
                     Err(err) => {
                         if let Some(tx) = start_tx.take() {
@@ -419,14 +449,101 @@ impl PluginSubprocess {
     /// Gracefully shut down the plugin subprocess.
     pub async fn shutdown(&self) -> Result<(), PluginSubprocessError> {
         // Unregister from process registry before shutdown
-        if let Some(pid) = self.process.lock().await.id() {
-            global_registry().unregister(pid);
+        {
+            let transport = self.transport.read().await;
+            if let Some(pid) = transport.process.id() {
+                global_registry().unregister(pid);
+            }
         }
         let _: Value = self.call("shutdown", None).await?;
         // Give the process a moment to exit, then kill if needed
-        let mut proc = self.process.lock().await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), proc.wait()).await;
-        let _ = proc.kill().await;
+        let mut transport = self.transport.write().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), transport.process.wait()).await;
+        let _ = transport.process.kill().await;
+        Ok(())
+    }
+
+    // -- Self-heal (in-place reconnect) --------------------------------------
+
+    /// Kill the current subprocess and spawn a fresh one, swapping the inner
+    /// transport without replacing the outer `Arc<PluginSubprocess>`.
+    ///
+    /// SAFETY: Must only be called while `rpc_lock` is held (i.e. from within
+    /// `call()`), so no concurrent RPC can observe a half-swapped transport.
+    async fn reconnect(&self) -> Result<(), PluginSubprocessError> {
+        tracing::warn!(plugin = %self.name, "[plugin-heal] reconnecting after timeout");
+
+        // 1. Kill old process
+        {
+            let mut transport = self.transport.write().await;
+            let _ = transport.process.kill().await;
+        }
+
+        // 2. Spawn new process
+        let args = self.runtime.run_args(&self.host_script);
+        let mut cmd = Command::new(self.runtime.command());
+        cmd.args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(dir) = &self.cwd {
+            cmd.current_dir(dir);
+        }
+
+        let mut child = cmd.spawn()?;
+
+        // Drain stderr in background
+        if let Some(stderr) = child.stderr.take() {
+            let label = self.plugin_path.clone();
+            tokio::spawn(async move {
+                log_plugin_stderr(label, stderr).await;
+            });
+        }
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| PluginSubprocessError::Protocol("no stdin on reconnect".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| PluginSubprocessError::Protocol("no stdout on reconnect".into()))?;
+
+        // 3. Swap transport
+        {
+            let mut transport = self.transport.write().await;
+            *transport = Transport {
+                stdin,
+                stdout: BufReader::new(stdout),
+                process: child,
+            };
+        }
+
+        // 4. Re-initialize — write/read directly (rpc_lock already held by caller)
+        let params = serde_json::json!({
+            "pluginPath": &self.plugin_path,
+            "context": &self.init_context,
+        });
+        let id = self.next_id();
+        self.write_request(id, "initialize", Some(params)).await?;
+        let response = tokio::time::timeout(self.timeout, self.read_response_for_id(id))
+            .await
+            .map_err(|_| PluginSubprocessError::Timeout)??;
+
+        if let Some(err) = response.error {
+            return Err(err.into());
+        }
+
+        // 5. Register new PID
+        {
+            let transport = self.transport.read().await;
+            if let Some(pid) = transport.process.id() {
+                global_registry().register(pid, self.name.clone(), ProcessKind::Plugin);
+            }
+        }
+
+        tracing::info!(plugin = %self.name, "[plugin-heal] reconnected successfully");
         Ok(())
     }
 
@@ -437,6 +554,8 @@ impl PluginSubprocess {
     }
 
     /// Send a JSON-RPC request and wait for the response.
+    ///
+    /// On timeout, triggers an in-place reconnect so subsequent calls work.
     async fn call<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -447,16 +566,25 @@ impl PluginSubprocess {
         self.write_request_with_timeout(id, method, params).await?;
 
         // Read response with timeout
-        let response = tokio::time::timeout(self.timeout, self.read_response_for_id(id))
-            .await
-            .map_err(|_| PluginSubprocessError::Timeout)??;
+        let response = tokio::time::timeout(self.timeout, self.read_response_for_id(id)).await;
 
-        if let Some(err) = response.error {
-            return Err(err.into());
+        match response {
+            Ok(Ok(resp)) => {
+                if let Some(err) = resp.error {
+                    return Err(err.into());
+                }
+                let result = resp.result.unwrap_or(Value::Null);
+                serde_json::from_value(result).map_err(Into::into)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                // Timeout — attempt reconnect so the *next* call works.
+                // We already hold rpc_lock, so reconnect() can safely use
+                // the transport without interference.
+                let _ = self.reconnect().await;
+                Err(PluginSubprocessError::Timeout)
+            }
         }
-
-        let result = response.result.unwrap_or(Value::Null);
-        serde_json::from_value(result).map_err(Into::into)
     }
 
     async fn write_request(
@@ -469,9 +597,9 @@ impl PluginSubprocess {
         let content = serde_json::to_string(&request)?;
         let frame = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
 
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(frame.as_bytes()).await?;
-        stdin.flush().await?;
+        let mut transport = self.transport.write().await;
+        transport.stdin.write_all(frame.as_bytes()).await?;
+        transport.stdin.flush().await?;
         Ok(())
     }
 
@@ -490,9 +618,10 @@ impl PluginSubprocess {
         &self,
         expected_id: u64,
     ) -> Result<RpcResponse, PluginSubprocessError> {
-        let mut reader = self.stdout.lock().await;
+        let mut transport = self.transport.write().await;
+        let reader = &mut transport.stdout;
         loop {
-            let raw = Self::read_raw_message(&mut reader).await?;
+            let raw = Self::read_raw_message(reader).await?;
             if raw.get("id").and_then(Value::as_u64) != Some(expected_id) {
                 continue;
             }
