@@ -460,38 +460,6 @@ impl SessionPrompt {
         self.create_user_message(&input, session).await?;
         Self::annotate_latest_user_message(session, &input, system_prompt.as_deref());
 
-        // TS parity: trigger `chat.message` when the user message is created.
-        if let Some(user_message) = session
-            .messages
-            .iter()
-            .rfind(|m| matches!(m.role, MessageRole::User))
-            .cloned()
-        {
-            let mut hook_ctx = HookContext::new(HookEvent::ChatMessage)
-                .with_session(&input.session_id)
-                .with_data("model_id", serde_json::json!(&model_id))
-                .with_data("provider_id", serde_json::json!(&provider_id))
-                .with_data("message_id", serde_json::json!(&user_message.id))
-                .with_data("message", session_message_hook_payload(&user_message))
-                .with_data("parts", serde_json::json!(&user_message.parts));
-
-            if let Some(agent) = input.agent.as_deref() {
-                hook_ctx = hook_ctx.with_data("agent", serde_json::json!(agent));
-            }
-            if let Some(variant) = input.variant.as_deref() {
-                hook_ctx = hook_ctx.with_data("variant", serde_json::json!(variant));
-            }
-
-            let hook_outputs = rocode_plugin::trigger_collect(hook_ctx).await;
-            if let Some(current_user_message) = session
-                .messages
-                .iter_mut()
-                .rfind(|m| matches!(m.role, MessageRole::User))
-            {
-                apply_chat_message_hook_outputs(current_user_message, hook_outputs);
-            }
-        }
-
         session.touch();
         Self::emit_session_update(update_hook.as_ref(), session);
 
@@ -1560,6 +1528,36 @@ impl SessionPrompt {
 
             session.touch();
             Self::emit_session_update(update_hook.as_ref(), session);
+
+            // Plugin hook: chat.message — triggered after assistant message is finalized.
+            // TS parity: fires on assistant message, not user message.
+            if let Some(assistant_msg) = session.messages.get(assistant_index).cloned() {
+                let mut hook_ctx = HookContext::new(HookEvent::ChatMessage)
+                    .with_session(&session_id)
+                    .with_data("message_id", serde_json::json!(&assistant_msg.id))
+                    .with_data("message", session_message_hook_payload(&assistant_msg))
+                    .with_data("parts", serde_json::json!(&assistant_msg.parts))
+                    .with_data("has_tool_calls", serde_json::json!(has_tool_calls));
+
+                if let Some(model) = provider.get_model(&model_id) {
+                    hook_ctx = hook_ctx.with_data("model", serde_json::json!({
+                        "id": model.id,
+                        "name": model.name,
+                        "provider": model.provider,
+                    }));
+                } else {
+                    hook_ctx = hook_ctx.with_data("model_id", serde_json::json!(&model_id));
+                }
+                hook_ctx = hook_ctx.with_data("sessionID", serde_json::json!(&session_id));
+                if let Some(agent) = agent_name {
+                    hook_ctx = hook_ctx.with_data("agent", serde_json::json!(agent));
+                }
+
+                let hook_outputs = rocode_plugin::trigger_collect(hook_ctx).await;
+                if let Some(current_assistant) = session.messages.get_mut(assistant_index) {
+                    apply_chat_message_hook_outputs(current_assistant, hook_outputs);
+                }
+            }
 
             if has_tool_calls {
                 tracing::info!("Processing tool calls for session {}", session_id);
@@ -3143,6 +3141,22 @@ mod tests {
         assert!(
             !should_break,
             "early-exit must NOT trigger when finish is None"
+        );
+    }
+
+    #[test]
+    fn chat_message_hook_not_triggered_on_user_message_creation() {
+        let source = include_str!("mod.rs");
+        let create_user_fn = source
+            .find("async fn create_user_message")
+            .expect("create_user_message should exist");
+        let loop_inner_fn = source
+            .find("async fn loop_inner")
+            .expect("loop_inner should exist");
+        let create_user_section = &source[create_user_fn..loop_inner_fn];
+        assert!(
+            !create_user_section.contains("HookEvent::ChatMessage"),
+            "ChatMessage hook should not be in create_user_message"
         );
     }
 }
