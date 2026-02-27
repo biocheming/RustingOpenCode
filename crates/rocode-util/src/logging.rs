@@ -363,7 +363,7 @@ pub fn init_tracing(
     print: bool,
 ) -> Option<PathBuf> {
     if print {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer())
@@ -388,7 +388,7 @@ pub fn init_tracing(
 
     if let Some(file) = file {
         let (non_blocking, _guard) = tracing_appender::non_blocking(file);
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().with_writer(non_blocking))

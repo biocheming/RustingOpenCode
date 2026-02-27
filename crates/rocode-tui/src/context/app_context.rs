@@ -157,7 +157,7 @@ impl AppContext {
             message_density: RwLock::new(MessageDensity::from_str_lossy(
                 &ui_kv.get_string("message_density", "compact"),
             )),
-            semantic_highlight: RwLock::new(ui_kv.get_bool("semantic_highlight", true)),
+            semantic_highlight: RwLock::new(ui_kv.get_bool("semantic_highlight", false)),
             has_connected_provider: RwLock::new(false),
             processes: RwLock::new(Vec::new()),
             ui_kv: RwLock::new(ui_kv),

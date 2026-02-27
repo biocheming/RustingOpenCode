@@ -64,6 +64,14 @@ pub enum StateChange {
     TodoUpdated,
     DiffUpdated,
     ProcessesUpdated,
+    QuestionCreated {
+        session_id: String,
+        request_id: String,
+    },
+    QuestionResolved {
+        session_id: String,
+        request_id: String,
+    },
 }
 
 pub struct EventBus {

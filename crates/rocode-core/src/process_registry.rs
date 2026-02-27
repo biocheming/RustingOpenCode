@@ -4,7 +4,7 @@
 //! use to register/unregister their OS processes. The TUI reads this registry
 //! to display a live process panel in the sidebar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -219,34 +219,40 @@ fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     #[cfg(target_os = "linux")]
     {
         let mut result = Vec::new();
-        let mut queue = vec![root_pid];
-        while let Some(parent) = queue.pop() {
-            let Ok(entries) = std::fs::read_dir("/proc") else {
-                break;
+        let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return result;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid_str) = name.to_str() else {
+                continue;
             };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(pid_str) = name.to_str() else {
-                    continue;
-                };
-                let Ok(pid) = pid_str.parse::<u32>() else {
-                    continue;
-                };
-                if pid == root_pid || result.contains(&pid) {
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
+            if pid == root_pid {
+                continue;
+            }
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
+                if let Some(ppid) = parse_parent_pid_from_stat(&stat) {
+                    children_by_parent.entry(ppid).or_default().push(pid);
+                }
+            }
+        }
+
+        let mut queue = vec![root_pid];
+        let mut seen: HashSet<u32> = HashSet::new();
+        while let Some(parent) = queue.pop() {
+            let Some(children) = children_by_parent.get(&parent) else {
+                continue;
+            };
+            for &child in children {
+                if child == root_pid || !seen.insert(child) {
                     continue;
                 }
-                // Read ppid (field index 1 after comm, i.e. field 3 in /proc/pid/stat)
-                if let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
-                    if let Some(after_comm) = stat.rfind(')') {
-                        let fields: Vec<&str> = stat[after_comm + 2..].split_whitespace().collect();
-                        if let Some(ppid) = fields.get(1).and_then(|s| s.parse::<u32>().ok()) {
-                            if ppid == parent {
-                                result.push(pid);
-                                queue.push(pid);
-                            }
-                        }
-                    }
-                }
+                result.push(child);
+                queue.push(child);
             }
         }
         result
@@ -256,4 +262,11 @@ fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
         let _ = root_pid;
         Vec::new()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_parent_pid_from_stat(stat: &str) -> Option<u32> {
+    let after_comm = stat.rfind(')')? + 2;
+    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    fields.get(1)?.parse::<u32>().ok()
 }

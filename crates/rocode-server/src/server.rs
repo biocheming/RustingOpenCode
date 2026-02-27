@@ -5,6 +5,7 @@ use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -208,8 +209,25 @@ pub struct ServerState {
     pub tool_registry: Arc<rocode_tool::ToolRegistry>,
     pub auth_manager: Arc<AuthManager>,
     pub event_bus: broadcast::Sender<String>,
+    pub api_perf: Arc<ApiPerfCounters>,
     pub(crate) session_repo: Option<SessionRepository>,
     pub(crate) message_repo: Option<MessageRepository>,
+}
+
+pub struct ApiPerfCounters {
+    pub list_messages_calls: AtomicU64,
+    pub list_messages_incremental_calls: AtomicU64,
+    pub list_messages_full_calls: AtomicU64,
+}
+
+impl ApiPerfCounters {
+    pub fn new() -> Self {
+        Self {
+            list_messages_calls: AtomicU64::new(0),
+            list_messages_incremental_calls: AtomicU64::new(0),
+            list_messages_full_calls: AtomicU64::new(0),
+        }
+    }
 }
 
 impl ServerState {
@@ -222,6 +240,7 @@ impl ServerState {
             tool_registry: Arc::new(rocode_tool::ToolRegistry::new()),
             auth_manager: Arc::new(AuthManager::new()),
             event_bus: tx,
+            api_perf: Arc::new(ApiPerfCounters::new()),
             session_repo: None,
             message_repo: None,
         }

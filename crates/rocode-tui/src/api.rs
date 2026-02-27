@@ -722,9 +722,30 @@ impl ApiClient {
     }
 
     pub fn get_messages(&self, session_id: &str) -> anyhow::Result<Vec<MessageInfo>> {
-        let url = format!("{}/session/{}/message", self.base_url, session_id);
+        self.get_messages_after(session_id, None, None)
+    }
 
-        let response = self.client.get(&url).send()?;
+    pub fn get_messages_after(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<MessageInfo>> {
+        let url = format!("{}/session/{}/message", self.base_url, session_id);
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(after) = after.map(str::trim).filter(|value| !value.is_empty()) {
+            params.push(("after", after.to_string()));
+        }
+        if let Some(limit) = limit.filter(|value| *value > 0) {
+            params.push(("limit", limit.to_string()));
+        }
+        let request = if params.is_empty() {
+            self.client.get(&url)
+        } else {
+            self.client.get(&url).query(&params)
+        };
+
+        let response = request.send()?;
 
         if !response.status().is_success() {
             let status = response.status();

@@ -41,6 +41,7 @@ use crate::message_v2::ModelRef as V2ModelRef;
 use crate::{MessageRole, PartType, Session, SessionMessage, SessionStateManager};
 
 const MAX_STEPS: u32 = 100;
+const STREAM_UPDATE_INTERVAL_MS: u64 = 120;
 
 #[derive(Debug, Clone)]
 pub struct PromptInput {
@@ -860,7 +861,7 @@ impl SessionPrompt {
             let mut cache_read_tokens: u64 = 0;
             let mut cache_write_tokens: u64 = 0;
             let mut executed_local_tools_this_step = false;
-            let mut last_emit = Instant::now() - Duration::from_millis(50);
+            let mut last_emit = Instant::now() - Duration::from_millis(STREAM_UPDATE_INTERVAL_MS);
 
             while let Some(event_result) = stream.next().await {
                 if token.is_cancelled() {
@@ -896,7 +897,7 @@ impl SessionPrompt {
                     }
                     Ok(StreamEvent::ReasoningEnd { .. }) => {}
                     Ok(StreamEvent::ToolCallStart { id, name }) => {
-                        tracing::info!(
+                        tracing::debug!(
                             tool_call_id = %id,
                             tool_name = %name,
                             "[DIAG] ToolCallStart received"
@@ -941,7 +942,7 @@ impl SessionPrompt {
                         }
                     }
                     Ok(StreamEvent::ToolCallDelta { id, input }) => {
-                        tracing::info!(
+                        tracing::debug!(
                             tool_call_id = %id,
                             delta_len = input.len(),
                             delta_preview = %input.chars().take(200).collect::<String>(),
@@ -1002,7 +1003,7 @@ impl SessionPrompt {
                                 other.clone(),
                             ),
                         };
-                        tracing::info!(
+                        tracing::debug!(
                             tool_call_id = %id,
                             tool_name = %name,
                             input_type = %if parsed_input.is_object() { "object" } else if parsed_input.is_string() { "string" } else { "other" },
@@ -1242,7 +1243,7 @@ impl SessionPrompt {
                         usage,
                         ..
                     }) => {
-                        tracing::info!(
+                        tracing::debug!(
                             finish_reason = %fr.as_deref().unwrap_or("None"),
                             tool_calls_count = tool_calls.len(),
                             tool_calls_keys = %tool_calls.keys().cloned().collect::<Vec<_>>().join(","),
@@ -1492,7 +1493,7 @@ impl SessionPrompt {
                             // HashMap, which may have data from ToolInputDelta events
                             // that wasn't written to the PartType.
                             if let Some(entry) = tool_calls.get(id.as_str()) {
-                                tracing::info!(
+                                tracing::debug!(
                                     tool_call_id = %id,
                                     tool_name = %name,
                                     entry_raw_input_len = entry.raw_input.len(),
@@ -1513,7 +1514,7 @@ impl SessionPrompt {
                                     *input = entry.input.clone();
                                 }
                             } else {
-                                tracing::info!(
+                                tracing::debug!(
                                     tool_call_id = %id,
                                     tool_name = %name,
                                     hashmap_keys = %tool_calls.keys().cloned().collect::<Vec<_>>().join(","),
@@ -1529,7 +1530,7 @@ impl SessionPrompt {
                                     start: chrono::Utc::now().timestamp_millis(),
                                 },
                             });
-                            tracing::info!(
+                            tracing::debug!(
                                 tool_call_id = %id,
                                 tool_name = %name,
                                 input_keys = %if input.is_object() {
@@ -1551,7 +1552,7 @@ impl SessionPrompt {
                 .map(Self::has_unresolved_tool_calls)
                 .unwrap_or(false);
 
-            tracing::info!(
+            tracing::debug!(
                 has_tool_calls = has_tool_calls,
                 finish_reason = %finish_reason.as_deref().unwrap_or("None"),
                 "[DIAG] post-stream: before tool execution check"
@@ -1625,7 +1626,7 @@ impl SessionPrompt {
             }
 
             if executed_local_tools_this_step {
-                tracing::info!(
+                tracing::debug!(
                     "[DIAG] local tool execution completed in-stream, continuing prompt loop"
                 );
                 continue;
@@ -1655,7 +1656,7 @@ impl SessionPrompt {
                 );
                 break;
             }
-            tracing::info!("[DIAG] finish_reason=tool-calls, continuing prompt loop");
+            tracing::debug!("[DIAG] finish_reason=tool-calls, continuing prompt loop");
         }
 
         // Abort handling: mark any pending tool calls as error when cancelled.
@@ -1685,7 +1686,7 @@ impl SessionPrompt {
         force: bool,
     ) {
         let elapsed = last_emit.elapsed();
-        if force || elapsed >= Duration::from_millis(50) {
+        if force || elapsed >= Duration::from_millis(STREAM_UPDATE_INTERVAL_MS) {
             Self::emit_session_update(update_hook, session);
             *last_emit = Instant::now();
         }

@@ -44,14 +44,19 @@ async fn main() -> anyhow::Result<()> {
     let log_file = std::fs::File::create(log_dir.join("rocode.log")).ok();
     if let Some(file) = log_file {
         use tracing_subscriber::EnvFilter;
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
             .init();
     } else {
-        tracing_subscriber::fmt::init();
+        use tracing_subscriber::EnvFilter;
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+            )
+            .init();
     }
 
     let cli = Cli::parse();

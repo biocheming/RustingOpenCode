@@ -15,6 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, OnceCell, RwLock};
 use tokio_stream::{
@@ -1162,18 +1163,64 @@ async fn send_message(
 async fn list_messages(
     State(state): State<Arc<ServerState>>,
     Path(session_id): Path<String>,
+    Query(query): Query<ListMessagesQuery>,
 ) -> Result<Json<Vec<MessageInfo>>> {
+    state.api_perf.list_messages_calls.fetch_add(1, Ordering::Relaxed);
+    if query.after.is_some() {
+        state
+            .api_perf
+            .list_messages_incremental_calls
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        state
+            .api_perf
+            .list_messages_full_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&session_id)
         .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
-    Ok(Json(
-        session
-            .messages
-            .iter()
-            .map(|m| message_to_info(&session_id, m))
-            .collect(),
-    ))
+    let limit = query.limit.filter(|value| *value > 0);
+    let mut started = query.after.is_none();
+    let mut messages = Vec::new();
+
+    for message in &session.messages {
+        if !started {
+            if query.after.as_deref() == Some(message.id.as_str()) {
+                started = true;
+            }
+            continue;
+        }
+        messages.push(message_to_info(&session_id, message));
+        if let Some(limit) = limit {
+            if messages.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    // If the anchor message is unknown, fall back to a full list so clients can recover.
+    if query.after.is_some() && !started {
+        messages.clear();
+        for message in &session.messages {
+            messages.push(message_to_info(&session_id, message));
+            if let Some(limit) = limit {
+                if messages.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(Json(messages))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListMessagesQuery {
+    pub after: Option<String>,
+    pub limit: Option<usize>,
 }
 
 async fn delete_message(
@@ -4536,6 +4583,7 @@ fn global_routes() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/health", get(global_health))
         .route("/event", get(global_event_stream))
+        .route("/perf", get(global_perf))
         .route("/config", get(get_global_config))
         .route("/dispose", post(dispose_all))
 }
@@ -4553,6 +4601,13 @@ async fn global_health() -> Json<GlobalHealthResponse> {
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct GlobalPerfResponse {
+    pub list_messages_calls: u64,
+    pub list_messages_incremental_calls: u64,
+    pub list_messages_full_calls: u64,
+}
+
 async fn global_event_stream(
     State(state): State<Arc<ServerState>>,
 ) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
@@ -4565,6 +4620,17 @@ async fn global_event_stream(
 
 async fn get_global_config(State(_state): State<Arc<ServerState>>) -> Result<Json<AppConfig>> {
     Ok(Json(AppConfig::default()))
+}
+
+async fn global_perf(State(state): State<Arc<ServerState>>) -> Json<GlobalPerfResponse> {
+    Json(GlobalPerfResponse {
+        list_messages_calls: state.api_perf.list_messages_calls.load(Ordering::Relaxed),
+        list_messages_incremental_calls: state
+            .api_perf
+            .list_messages_incremental_calls
+            .load(Ordering::Relaxed),
+        list_messages_full_calls: state.api_perf.list_messages_full_calls.load(Ordering::Relaxed),
+    })
 }
 
 async fn dispose_all() -> Json<bool> {

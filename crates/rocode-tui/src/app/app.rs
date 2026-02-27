@@ -38,6 +38,10 @@ use crate::ui::{line_from_cells, strip_session_gutter, truncate, Clipboard, Sele
 // TS parity: renderer targetFps is 60, ~16ms frame budget.
 const TICK_RATE_MS: u64 = 16;
 const MAX_EVENTS_PER_FRAME: usize = 256;
+const SESSION_SYNC_DEBOUNCE_MS: u64 = 180;
+const SESSION_FULL_SYNC_INTERVAL_SECS: u64 = 10;
+const QUESTION_SYNC_FALLBACK_SECS: u64 = 5;
+const PERF_LOG_INTERVAL_SECS: u64 = 10;
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_DIM: &str = "\x1b[90m";
 const ANSI_BOLD: &str = "\x1b[1m";
@@ -86,10 +90,14 @@ pub struct App {
     pending_questions: HashMap<String, QuestionInfo>,
     pending_initial_submit: bool,
     pending_session_sync: Option<String>,
+    pending_session_sync_due_at: Option<Instant>,
     last_session_sync: Instant,
+    last_full_session_sync: Instant,
     last_question_sync: Instant,
     last_aux_sync: Instant,
     last_process_refresh: Instant,
+    last_perf_log: Instant,
+    perf: PerfCounters,
     event_caused_change: bool,
 }
 
@@ -99,6 +107,22 @@ struct QueuedPrompt {
     agent: Option<String>,
     model: Option<String>,
     variant: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PerfCounters {
+    draws: u64,
+    screen_snapshots: u64,
+    session_sync_full: u64,
+    session_sync_incremental: u64,
+    question_sync: u64,
+    session_updated_events: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionSyncMode {
+    Full,
+    Incremental,
 }
 
 impl App {
@@ -239,10 +263,14 @@ impl App {
             pending_questions: HashMap::new(),
             pending_initial_submit,
             pending_session_sync: None,
+            pending_session_sync_due_at: None,
             last_session_sync: Instant::now(),
+            last_full_session_sync: Instant::now(),
             last_question_sync: Instant::now(),
             last_aux_sync: Instant::now(),
             last_process_refresh: Instant::now(),
+            last_perf_log: Instant::now(),
+            perf: PerfCounters::default(),
             event_caused_change: true,
         };
 
@@ -851,14 +879,14 @@ impl App {
                     self.event_caused_change = true;
                 }
                 CustomEvent::StateChanged(StateChange::SessionUpdated(session_id)) => {
+                    self.perf.session_updated_events =
+                        self.perf.session_updated_events.saturating_add(1);
                     if let Route::Session { session_id: active } = self.context.current_route() {
                         if active == *session_id {
-                            if self.last_session_sync.elapsed() >= Duration::from_millis(50) {
-                                let _ = self.sync_session_from_server(session_id);
-                                self.pending_session_sync = None;
-                            } else {
-                                self.pending_session_sync = Some(session_id.to_string());
-                            }
+                            self.pending_session_sync = Some(session_id.to_string());
+                            self.pending_session_sync_due_at = Some(
+                                Instant::now() + Duration::from_millis(SESSION_SYNC_DEBOUNCE_MS),
+                            );
                         }
                     }
                     self.sync_prompt_spinner_state();
@@ -888,6 +916,19 @@ impl App {
                     );
                     self.sync_prompt_spinner_state();
                 }
+                CustomEvent::StateChanged(StateChange::QuestionCreated { session_id, .. })
+                | CustomEvent::StateChanged(StateChange::QuestionResolved { session_id, .. }) => {
+                    let should_sync = match self.context.current_route() {
+                        Route::Session {
+                            session_id: active_session_id,
+                        } => active_session_id == *session_id,
+                        _ => true,
+                    };
+                    if should_sync {
+                        self.event_caused_change = self.sync_question_requests();
+                        self.last_question_sync = Instant::now();
+                    }
+                }
                 _ => {}
             },
             Event::Tick => {
@@ -903,22 +944,44 @@ impl App {
                 }
 
                 let route = self.context.current_route();
-                if let Route::Session { session_id } = route {
-                    if self.pending_session_sync.as_deref() == Some(session_id.as_str())
-                        && self.last_session_sync.elapsed() >= Duration::from_millis(50)
-                    {
-                        if self.sync_session_from_server(&session_id).is_ok() {
+                if let Route::Session { session_id } = &route {
+                    let should_sync_pending =
+                        self.pending_session_sync.as_deref() == Some(session_id.as_str())
+                            && self
+                                .pending_session_sync_due_at
+                                .map(|due| Instant::now() >= due)
+                                .unwrap_or(false);
+                    if should_sync_pending {
+                        let sync_result = self
+                            .sync_session_from_server_with_mode(
+                                session_id,
+                                SessionSyncMode::Incremental,
+                            )
+                            .or_else(|_| {
+                                self.sync_session_from_server_with_mode(
+                                    session_id,
+                                    SessionSyncMode::Full,
+                                )
+                            });
+                        if sync_result.is_ok() {
                             tick_changed = true;
-                            self.pending_session_sync = None;
                         }
+                        self.pending_session_sync = None;
+                        self.pending_session_sync_due_at = None;
                     }
-                    if self.last_session_sync.elapsed() >= Duration::from_secs(2) {
-                        if self.sync_session_from_server(&session_id).is_ok() {
+                    if self.last_full_session_sync.elapsed()
+                        >= Duration::from_secs(SESSION_FULL_SYNC_INTERVAL_SECS)
+                    {
+                        if self
+                            .sync_session_from_server_with_mode(session_id, SessionSyncMode::Full)
+                            .is_ok()
+                        {
                             tick_changed = true;
                         }
                     }
                 }
-                if self.last_question_sync.elapsed() >= Duration::from_millis(400) {
+                if self.last_question_sync.elapsed() >= Duration::from_secs(QUESTION_SYNC_FALLBACK_SECS)
+                {
                     tick_changed |= self.sync_question_requests();
                     self.last_question_sync = Instant::now();
                 }
@@ -931,12 +994,17 @@ impl App {
                     tick_changed = true;
                 }
                 if self.last_process_refresh.elapsed() >= Duration::from_secs(2) {
-                    rocode_core::process_registry::global_registry().refresh_stats();
-                    *self.context.processes.write() =
-                        rocode_core::process_registry::global_registry().list();
+                    let should_refresh_processes =
+                        matches!(route, Route::Session { .. }) && *self.context.show_sidebar.read();
+                    if should_refresh_processes {
+                        rocode_core::process_registry::global_registry().refresh_stats();
+                        *self.context.processes.write() =
+                            rocode_core::process_registry::global_registry().list();
+                        tick_changed = true;
+                    }
                     self.last_process_refresh = Instant::now();
-                    tick_changed = true;
                 }
+                self.maybe_log_perf_snapshot();
                 self.event_caused_change = tick_changed;
             }
             _ => {}
@@ -3174,6 +3242,7 @@ impl App {
     }
 
     fn sync_question_requests(&mut self) -> bool {
+        self.perf.question_sync = self.perf.question_sync.saturating_add(1);
         let Some(client) = self.context.get_api_client() else {
             return false;
         };
@@ -3560,29 +3629,61 @@ impl App {
 
     fn remove_optimistic_message(&mut self, session_id: &str, msg_id: &str) {
         let mut session_ctx = self.context.session.write();
-        if let Some(msgs) = session_ctx.messages.get_mut(session_id) {
+        let rebuilt_index = if let Some(msgs) = session_ctx.messages.get_mut(session_id) {
             msgs.retain(|m| m.id != msg_id);
+            let mut index = HashMap::with_capacity(msgs.len());
+            for (pos, message) in msgs.iter().enumerate() {
+                index.insert(message.id.clone(), pos);
+            }
+            Some(index)
+        } else {
+            None
+        };
+        if let Some(index) = rebuilt_index {
+            session_ctx.message_index.insert(session_id.to_string(), index);
         }
     }
 
     fn sync_session_from_server(&mut self, session_id: &str) -> anyhow::Result<()> {
+        self.sync_session_from_server_with_mode(session_id, SessionSyncMode::Full)
+    }
+
+    fn sync_session_from_server_with_mode(
+        &mut self,
+        session_id: &str,
+        mode: SessionSyncMode,
+    ) -> anyhow::Result<()> {
         let Some(client) = self.context.get_api_client() else {
             return Ok(());
         };
 
         let session = client.get_session(session_id)?;
-        let messages = client.get_messages(session_id)?;
+        let anchor_id = if matches!(mode, SessionSyncMode::Incremental) {
+            self.incremental_sync_anchor_id(session_id)
+        } else {
+            None
+        };
+        let effective_mode = if matches!(mode, SessionSyncMode::Incremental) && anchor_id.is_some() {
+            SessionSyncMode::Incremental
+        } else {
+            SessionSyncMode::Full
+        };
+        let messages = match effective_mode {
+            SessionSyncMode::Full => client.get_messages(session_id)?,
+            SessionSyncMode::Incremental => {
+                client.get_messages_after(session_id, anchor_id.as_deref(), Some(256))?
+            }
+        };
+        let mapped_messages = messages.iter().map(map_api_message).collect::<Vec<Message>>();
         let revert = session.revert.as_ref().map(map_api_revert);
 
         let mut session_ctx = self.context.session.write();
         session_ctx.upsert_session(map_api_session(&session));
-        session_ctx.set_messages(
-            session_id,
-            messages
-                .iter()
-                .map(map_api_message)
-                .collect::<Vec<Message>>(),
-        );
+        if matches!(effective_mode, SessionSyncMode::Incremental) {
+            session_ctx.upsert_messages_incremental(session_id, mapped_messages);
+        } else {
+            session_ctx.set_messages(session_id, mapped_messages);
+        }
         if let Some(revert_info) = revert {
             session_ctx
                 .revert
@@ -3590,15 +3691,35 @@ impl App {
         } else {
             session_ctx.revert.remove(session_id);
         }
-        if let Ok(status_map) = client.get_session_status() {
-            if let Some(status) = status_map.get(session_id) {
-                session_ctx.set_status(session_id, map_api_run_status(status));
+        if matches!(effective_mode, SessionSyncMode::Full) {
+            if let Ok(status_map) = client.get_session_status() {
+                if let Some(status) = status_map.get(session_id) {
+                    session_ctx.set_status(session_id, map_api_run_status(status));
+                }
             }
         }
         drop(session_ctx);
 
         self.last_session_sync = Instant::now();
+        if matches!(effective_mode, SessionSyncMode::Full) {
+            self.last_full_session_sync = self.last_session_sync;
+            self.perf.session_sync_full = self.perf.session_sync_full.saturating_add(1);
+        } else {
+            self.perf.session_sync_incremental =
+                self.perf.session_sync_incremental.saturating_add(1);
+        }
         Ok(())
+    }
+
+    fn incremental_sync_anchor_id(&self, session_id: &str) -> Option<String> {
+        let session_ctx = self.context.session.read();
+        let messages = session_ctx.messages.get(session_id)?;
+        if messages.len() >= 2 {
+            messages.get(messages.len().saturating_sub(2))
+        } else {
+            messages.last()
+        }
+        .map(|message| message.id.clone())
     }
 
     fn set_session_status(&mut self, session_id: &str, status: SessionStatus) {
@@ -3748,6 +3869,7 @@ impl App {
     }
 
     fn draw(&mut self) -> anyhow::Result<()> {
+        self.perf.draws = self.perf.draws.saturating_add(1);
         self.context
             .set_pending_permissions(self.permission_prompt.pending_count());
 
@@ -3790,6 +3912,7 @@ impl App {
         let slash_popup = &self.slash_popup;
         let toast = &self.toast;
         let selection = &self.selection;
+        let capture_screen_lines = selection.is_active() || selection.is_selecting();
 
         let mut captured_lines: Vec<String> = Vec::new();
 
@@ -3862,14 +3985,17 @@ impl App {
                 toast.render(frame, toast_area, &theme);
             }
 
-            // Snapshot the rendered buffer for text selection (before highlight overlay)
             let buf = frame.buffer_mut();
-            captured_lines.clear();
-            for y in area.y..area.y + area.height {
-                let line =
-                    line_from_cells((area.x..area.x + area.width).map(|x| buf.get(x, y).symbol()));
-                let trimmed = line.trim_end().to_string();
-                captured_lines.push(trimmed);
+            if capture_screen_lines {
+                // Snapshot the rendered buffer for text selection (before highlight overlay)
+                captured_lines.clear();
+                for y in area.y..area.y + area.height {
+                    let line = line_from_cells(
+                        (area.x..area.x + area.width).map(|x| buf.get(x, y).symbol()),
+                    );
+                    let trimmed = line.trim_end().to_string();
+                    captured_lines.push(trimmed);
+                }
             }
 
             // Render selection highlight — invert colors on non-empty cells,
@@ -3908,8 +4034,27 @@ impl App {
             }
         })?;
 
-        self.screen_lines = captured_lines;
+        if capture_screen_lines {
+            self.screen_lines = captured_lines;
+            self.perf.screen_snapshots = self.perf.screen_snapshots.saturating_add(1);
+        }
         Ok(())
+    }
+
+    fn maybe_log_perf_snapshot(&mut self) {
+        if self.last_perf_log.elapsed() < Duration::from_secs(PERF_LOG_INTERVAL_SECS) {
+            return;
+        }
+        self.last_perf_log = Instant::now();
+        tracing::debug!(
+            draws = self.perf.draws,
+            screen_snapshots = self.perf.screen_snapshots,
+            session_sync_full = self.perf.session_sync_full,
+            session_sync_incremental = self.perf.session_sync_incremental,
+            question_sync = self.perf.question_sync,
+            session_updated_events = self.perf.session_updated_events,
+            "tui perf snapshot"
+        );
     }
 }
 
@@ -4353,6 +4498,42 @@ fn forward_server_event(data_lines: &[String], event_tx: &Sender<Event>) {
                 }
                 _ => {}
             }
+        }
+        Some("question.created") => {
+            let Some(session_id) = session_id else {
+                return;
+            };
+            let Some(request_id) = value
+                .get("requestID")
+                .and_then(|item| item.as_str())
+                .or_else(|| value.get("requestId").and_then(|item| item.as_str()))
+            else {
+                return;
+            };
+            let _ = event_tx.send(Event::Custom(CustomEvent::StateChanged(
+                StateChange::QuestionCreated {
+                    session_id: session_id.to_string(),
+                    request_id: request_id.to_string(),
+                },
+            )));
+        }
+        Some("question.replied") | Some("question.rejected") => {
+            let Some(session_id) = session_id else {
+                return;
+            };
+            let Some(request_id) = value
+                .get("requestID")
+                .and_then(|item| item.as_str())
+                .or_else(|| value.get("requestId").and_then(|item| item.as_str()))
+            else {
+                return;
+            };
+            let _ = event_tx.send(Event::Custom(CustomEvent::StateChanged(
+                StateChange::QuestionResolved {
+                    session_id: session_id.to_string(),
+                    request_id: request_id.to_string(),
+                },
+            )));
         }
         _ => {}
     }

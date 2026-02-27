@@ -26,6 +26,7 @@ const MOUSE_SCROLL_LINES: usize = 3;
 const MESSAGE_BLOCK_RIGHT_PADDING: usize = 1;
 const SIDEBAR_CLOSE_BUTTON_WIDTH: u16 = 3;
 const SIDEBAR_OPEN_BUTTON_WIDTH: u16 = 3;
+const SEMANTIC_HIGHLIGHT_MAX_CHARS: usize = 8_000;
 
 struct ThinkingToggleHit {
     line_index: usize,
@@ -276,8 +277,8 @@ impl SessionView {
         let messages = session_ctx
             .messages
             .get(&self.session_id)
-            .cloned()
-            .unwrap_or_default();
+            .map(|list| list.as_slice())
+            .unwrap_or(&[]);
 
         // Find the last assistant message with output tokens > 0 for token display
         let last_assistant = messages
@@ -533,8 +534,8 @@ impl SessionView {
         let messages = session_ctx
             .messages
             .get(&self.session_id)
-            .cloned()
-            .unwrap_or_default();
+            .map(|list| list.as_slice())
+            .unwrap_or(&[]);
         let revert_info = session_ctx.revert.get(&self.session_id).cloned();
         let last_assistant_idx = messages
             .iter()
@@ -614,7 +615,7 @@ impl SessionView {
                     let message_border = assistant_border;
                     let message_thinking_bg = thinking_bg;
                     let message_thinking_border = thinking_border;
-                    let tool_results = collect_assistant_tool_results(&messages, idx);
+                    let tool_results = collect_assistant_tool_results(messages, idx);
                     let is_active_assistant = last_assistant_idx == Some(idx)
                         && msg.finish.is_none()
                         && msg.error.is_none();
@@ -641,7 +642,7 @@ impl SessionView {
                             &theme,
                             assistant_marker,
                         );
-                        if semantic_hl {
+                        if semantic_hl && msg.content.len() <= SEMANTIC_HIGHLIGHT_MAX_CHARS {
                             text_lines =
                                 super::semantic_highlight::highlight_lines(text_lines, &theme);
                         }
@@ -681,7 +682,7 @@ impl SessionView {
                                         &theme,
                                         assistant_marker,
                                     );
-                                    if semantic_hl {
+                                    if semantic_hl && text.len() <= SEMANTIC_HIGHLIGHT_MAX_CHARS {
                                         text_lines = super::semantic_highlight::highlight_lines(
                                             text_lines, &theme,
                                         );
@@ -867,7 +868,7 @@ impl SessionView {
                     }
 
                     if let Some(footer) = assistant_footer(
-                        &messages,
+                        messages,
                         idx,
                         last_assistant_idx,
                         msg,
