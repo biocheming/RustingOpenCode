@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 use super::auth::PluginAuthBridge;
 use super::client::{PluginContext, PluginSubprocess, PluginSubprocessError};
 use super::runtime::{detect_runtime, JsRuntime};
+use crate::circuit_breaker::CircuitBreaker;
 use crate::{Hook, HookContext, HookError, HookEvent, HookOutput, PluginSystem};
 
 // ---------------------------------------------------------------------------
@@ -301,6 +302,10 @@ impl PluginLoader {
     // -- Private helpers ----------------------------------------------------
 
     async fn register_client_hooks(&self, client: Arc<PluginSubprocess>) {
+        // One breaker map per plugin, shared across all hooks for that plugin.
+        let breakers: Arc<Mutex<HashMap<String, CircuitBreaker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         for hook_name in client.hooks() {
             let Some(event) = super::hook_name_to_event(hook_name) else {
                 tracing::debug!(
@@ -315,6 +320,7 @@ impl PluginLoader {
             let plugin_name = client.name().to_string();
             let hook_name_owned = hook_name.clone();
             let hook_client = Arc::clone(&client);
+            let breakers = Arc::clone(&breakers);
 
             // Avoid duplicate registrations when load_all() is called more than once.
             let _ = self.hook_system.remove(&event, &hook_id).await;
@@ -323,18 +329,57 @@ impl PluginLoader {
                     let hook_client = Arc::clone(&hook_client);
                     let hook_name_owned = hook_name_owned.clone();
                     let plugin_name = plugin_name.clone();
+                    let breakers = Arc::clone(&breakers);
                     async move {
+                        // Check circuit breaker before invoking the hook.
+                        {
+                            let mut map = breakers.lock().await;
+                            let cb = map
+                                .entry(hook_name_owned.clone())
+                                .or_insert_with(|| {
+                                    CircuitBreaker::new(3, Duration::from_secs(60))
+                                });
+                            if cb.is_tripped() {
+                                tracing::debug!(
+                                    plugin = plugin_name.as_str(),
+                                    hook = hook_name_owned.as_str(),
+                                    "[plugin-breaker] circuit open, returning empty"
+                                );
+                                return Ok(HookOutput::empty());
+                            }
+                        }
+
                         let (input, output) = hook_io_from_context(&context);
-                        let value = hook_client
+                        let result = hook_client
                             .invoke_hook(&hook_name_owned, input, output)
-                            .await
-                            .map_err(|err| {
-                                HookError::ExecutionError(format!(
+                            .await;
+
+                        match result {
+                            Ok(value) => {
+                                let mut map = breakers.lock().await;
+                                if let Some(cb) = map.get_mut(&hook_name_owned) {
+                                    cb.record_success();
+                                }
+                                Ok(HookOutput::with_payload(value))
+                            }
+                            Err(ref e) if matches!(e, PluginSubprocessError::Timeout) => {
+                                let mut map = breakers.lock().await;
+                                let cb = map
+                                    .entry(hook_name_owned.clone())
+                                    .or_insert_with(|| {
+                                        CircuitBreaker::new(3, Duration::from_secs(60))
+                                    });
+                                cb.record_failure();
+                                Err(HookError::ExecutionError(format!(
                                     "TS plugin `{}` hook `{}` failed: {}",
-                                    plugin_name, hook_name_owned, err
-                                ))
-                            })?;
-                        Ok(HookOutput::with_payload(value))
+                                    plugin_name, hook_name_owned, e
+                                )))
+                            }
+                            Err(e) => Err(HookError::ExecutionError(format!(
+                                "TS plugin `{}` hook `{}` failed: {}",
+                                plugin_name, hook_name_owned, e
+                            ))),
+                        }
                     }
                 }))
                 .await;

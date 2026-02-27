@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+pub mod circuit_breaker;
 pub mod subprocess;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
