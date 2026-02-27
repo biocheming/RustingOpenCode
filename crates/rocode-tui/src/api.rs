@@ -51,6 +51,16 @@ pub struct SessionStatusInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionInfo {
+    pub id: String,
+    #[serde(alias = "sessionID", alias = "sessionId")]
+    pub session_id: String,
+    pub questions: Vec<String>,
+    #[serde(default)]
+    pub options: Option<Vec<Vec<String>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagePart {
     pub id: String,
     #[serde(rename = "type")]
@@ -127,6 +137,8 @@ pub struct MessageInfo {
     pub tokens: MessageTokensInfo,
     #[serde(default)]
     pub parts: Vec<MessagePart>,
+    #[serde(default)]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -378,6 +390,54 @@ impl ApiClient {
             anyhow::bail!("Failed to get session status: {} - {}", status, text);
         }
         Ok(response.json::<HashMap<String, SessionStatusInfo>>()?)
+    }
+
+    pub fn list_questions(&self) -> anyhow::Result<Vec<QuestionInfo>> {
+        let url = format!("{}/question", self.base_url);
+        let response = self.client.get(&url).send()?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            anyhow::bail!("Failed to list questions: {} - {}", status, text);
+        }
+        Ok(response.json::<Vec<QuestionInfo>>()?)
+    }
+
+    pub fn reply_question(
+        &self,
+        question_id: &str,
+        answers: Vec<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let url = format!("{}/question/{}/reply", self.base_url, question_id);
+        let body = serde_json::json!({ "answers": answers });
+        let response = self.client.post(&url).json(&body).send()?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            anyhow::bail!(
+                "Failed to reply question `{}`: {} - {}",
+                question_id,
+                status,
+                text
+            );
+        }
+        Ok(())
+    }
+
+    pub fn reject_question(&self, question_id: &str) -> anyhow::Result<()> {
+        let url = format!("{}/question/{}/reject", self.base_url, question_id);
+        let response = self.client.post(&url).send()?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            anyhow::bail!(
+                "Failed to reject question `{}`: {} - {}",
+                question_id,
+                status,
+                text
+            );
+        }
+        Ok(())
     }
 
     pub fn update_session_title(

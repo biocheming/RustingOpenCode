@@ -262,14 +262,21 @@ impl PluginSystem {
                 results.push(result);
             }
         } else {
-            // Parallel fallback: spawn all hooks concurrently.
+            // Parallel fallback: spawn all hooks concurrently, collect in order.
             let mut handles = Vec::with_capacity(enabled.len());
             for hook in &enabled {
                 let ctx = context.clone();
-                handles.push((hook.handler)(ctx));
+                let fut = (hook.handler)(ctx);
+                handles.push(tokio::spawn(fut));
             }
-            for fut in handles {
-                results.push(fut.await);
+            for handle in handles {
+                match handle.await {
+                    Ok(r) => results.push(r),
+                    Err(e) => results.push(Err(HookError::ExecutionError(format!(
+                        "hook join error: {}",
+                        e
+                    )))),
+                }
             }
         }
 

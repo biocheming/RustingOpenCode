@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::replacers::CompositeReplacer;
+use crate::path_guard::{resolve_user_path, RootPathFallbackPolicy};
 use crate::{with_file_lock, Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 #[cfg(feature = "lsp")]
@@ -42,7 +43,7 @@ impl Tool for EditTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to edit"
+                    "description": "Absolute path or project-relative path to the file to edit"
                 },
                 "old_string": {
                     "type": "string",
@@ -73,6 +74,7 @@ impl Tool for EditTool {
             .ok_or_else(|| {
                 ToolError::InvalidArguments("file_path (or filePath) is required".into())
             })?
+            .trim()
             .to_string();
 
         let old_string: String = args
@@ -105,11 +107,20 @@ impl Tool for EditTool {
             Path::new(&ctx.directory)
         };
 
-        let path = if Path::new(&file_path).is_absolute() {
-            PathBuf::from(&file_path)
-        } else {
-            base_dir.join(&file_path)
-        };
+        let resolved = resolve_user_path(
+            &file_path,
+            base_dir,
+            RootPathFallbackPolicy::ExistingFallbackOnly,
+        );
+        let path = resolved.resolved;
+        if let Some(original) = resolved.corrected_from {
+            tracing::warn!(
+                from = %original.display(),
+                to = %path.display(),
+                session_dir = %base_dir.display(),
+                "corrected suspicious root-level edit path into session directory"
+            );
+        }
 
         let path_str = path.to_string_lossy().to_string();
 

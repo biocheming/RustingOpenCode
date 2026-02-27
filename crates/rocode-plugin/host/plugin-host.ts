@@ -531,6 +531,41 @@ async function handleHookInvoke(
   }
 }
 
+async function handleHookInvokeFile(
+  id: number,
+  params: { file: string; token: string },
+): Promise<void> {
+  try {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const os = await import("node:os");
+
+    // Validate: file must be in controlled directory and filename must contain token
+    const expectedDir = path.join(os.tmpdir(), "rocode-plugin-ipc");
+    const resolvedPath = path.resolve(params.file);
+    if (
+      !resolvedPath.startsWith(expectedDir + path.sep) ||
+      !path.basename(resolvedPath).includes(params.token)
+    ) {
+      sendError(id, -32602, "Invalid file path or token mismatch");
+      return;
+    }
+
+    const content = fs.readFileSync(resolvedPath, "utf-8");
+    const hookParams = JSON.parse(content) as {
+      hook: string;
+      input: unknown;
+      output: unknown;
+    };
+
+    // Delegate to existing hook invoke logic
+    await handleHookInvoke(id, hookParams);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    sendError(id, -32603, `hook.invoke.file failed: ${msg}`);
+  }
+}
+
 async function handleAuthAuthorize(
   id: number,
   params: { methodIndex: number; inputs?: Record<string, string> },
@@ -732,6 +767,9 @@ async function main(): Promise<void> {
         break;
       case "hook.invoke":
         await handleHookInvoke(id, params as Parameters<typeof handleHookInvoke>[1]);
+        break;
+      case "hook.invoke.file":
+        await handleHookInvokeFile(id, params as { file: string; token: string });
         break;
       case "auth.authorize":
         await handleAuthAuthorize(id, params as Parameters<typeof handleAuthAuthorize>[1]);

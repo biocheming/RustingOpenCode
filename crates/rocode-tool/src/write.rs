@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+use crate::path_guard::{resolve_user_path, RootPathFallbackPolicy};
 use crate::{Metadata, Tool, ToolContext, ToolError, ToolResult};
 
 #[cfg(feature = "lsp")]
@@ -43,7 +44,7 @@ impl Tool for WriteTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to write"
+                    "description": "Absolute path or project-relative path to the file to write"
                 },
                 "content": {
                     "type": "string",
@@ -66,6 +67,7 @@ impl Tool for WriteTool {
             .ok_or_else(|| {
                 ToolError::InvalidArguments("file_path (or filePath) is required".into())
             })?
+            .trim()
             .to_string();
 
         let content: String = args["content"]
@@ -79,11 +81,20 @@ impl Tool for WriteTool {
             Path::new(&ctx.directory)
         };
 
-        let path = if Path::new(&file_path).is_absolute() {
-            PathBuf::from(&file_path)
-        } else {
-            base_dir.join(&file_path)
-        };
+        let resolved = resolve_user_path(
+            &file_path,
+            base_dir,
+            RootPathFallbackPolicy::PreferSessionDirWhenMissing,
+        );
+        let path = resolved.resolved;
+        if let Some(original) = resolved.corrected_from {
+            tracing::warn!(
+                from = %original.display(),
+                to = %path.display(),
+                session_dir = %base_dir.display(),
+                "corrected suspicious root-level write path into session directory"
+            );
+        }
 
         let path_str = path.to_string_lossy().to_string();
 

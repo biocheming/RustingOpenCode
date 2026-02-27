@@ -123,6 +123,13 @@ pub struct PluginContext {
 /// Payloads larger than this are written to a temp file instead of stdin pipe.
 const LARGE_PAYLOAD_THRESHOLD: usize = 64 * 1024; // 64KB
 
+/// IPC temp directory namespaced by PID to avoid conflicts between concurrent instances.
+pub(crate) fn ipc_temp_dir() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("rocode-plugin-ipc")
+        .join(std::process::id().to_string())
+}
+
 struct Transport {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -270,12 +277,20 @@ impl PluginSubprocess {
         });
 
         let serialized = serde_json::to_string(&params).unwrap_or_default();
+        let payload_bytes = serialized.len();
 
-        if serialized.len() > LARGE_PAYLOAD_THRESHOLD
+        tracing::debug!(
+            hook = hook,
+            plugin = %self.name,
+            payload_bytes = payload_bytes,
+            "[plugin-perf] invoke_hook payload"
+        );
+
+        if payload_bytes > LARGE_PAYLOAD_THRESHOLD
             && crate::feature_flags::is_enabled("plugin_large_payload_file_ipc")
         {
-            // Write to temp file for large payloads
-            let dir = std::env::temp_dir().join("rocode-plugin-ipc");
+            // Write to temp file for large payloads, namespaced by PID
+            let dir = ipc_temp_dir();
             tokio::fs::create_dir_all(&dir).await.ok();
             let token = format!(
                 "{}-{}-{}",
@@ -300,11 +315,14 @@ impl PluginSubprocess {
                 "file": file_path.to_string_lossy(),
                 "token": token,
             });
-            let result: Value = self.call("hook.invoke.file", Some(file_params)).await?;
+            let result = self
+                .call::<Value>("hook.invoke.file", Some(file_params))
+                .await;
 
-            // Cleanup temp file
+            // Always cleanup temp file, even on error
             tokio::fs::remove_file(&file_path).await.ok();
 
+            let result = result?;
             Ok(result.get("output").cloned().unwrap_or(Value::Null))
         } else {
             let result: Value = self.call("hook.invoke", Some(params)).await?;
@@ -516,9 +534,12 @@ impl PluginSubprocess {
     async fn reconnect(&self) -> Result<(), PluginSubprocessError> {
         tracing::warn!(plugin = %self.name, "[plugin-heal] reconnecting after timeout");
 
-        // 1. Kill old process
+        // 1. Unregister old PID and kill old process
         {
             let mut transport = self.transport.write().await;
+            if let Some(pid) = transport.process.id() {
+                global_registry().unregister(pid);
+            }
             let _ = transport.process.kill().await;
         }
 
@@ -743,5 +764,25 @@ async fn log_plugin_stderr(plugin_path: String, stderr: ChildStderr) {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipc_temp_dir_is_pid_scoped() {
+        let dir = ipc_temp_dir();
+        let pid = std::process::id().to_string();
+        assert!(
+            dir.ends_with(&pid),
+            "ipc_temp_dir should end with current PID, got {:?}",
+            dir
+        );
+        assert!(
+            dir.to_string_lossy().contains("rocode-plugin-ipc"),
+            "ipc_temp_dir should contain rocode-plugin-ipc"
+        );
     }
 }

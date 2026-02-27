@@ -111,6 +111,7 @@ pub struct AppContext {
     pub sidebar_mode: RwLock<SidebarMode>,
     pub animations_enabled: RwLock<bool>,
     pub pending_permissions: RwLock<usize>,
+    pub queued_prompts: RwLock<HashMap<String, usize>>,
     pub show_timestamps: RwLock<bool>,
     pub show_thinking: RwLock<bool>,
     pub show_tool_details: RwLock<bool>,
@@ -149,6 +150,7 @@ impl AppContext {
             sidebar_mode: RwLock::new(SidebarMode::Auto),
             animations_enabled: RwLock::new(true),
             pending_permissions: RwLock::new(0),
+            queued_prompts: RwLock::new(HashMap::new()),
             show_timestamps: RwLock::new(ui_kv.get_timestamps()),
             show_thinking: RwLock::new(ui_kv.get_bool("thinking_visibility", true)),
             show_tool_details: RwLock::new(ui_kv.get_bool("tool_details_visibility", true)),
@@ -222,6 +224,23 @@ impl AppContext {
 
     pub fn set_pending_permissions(&self, count: usize) {
         *self.pending_permissions.write() = count;
+    }
+
+    pub fn set_queued_prompts(&self, session_id: &str, count: usize) {
+        let mut queued = self.queued_prompts.write();
+        if count == 0 {
+            queued.remove(session_id);
+        } else {
+            queued.insert(session_id.to_string(), count);
+        }
+    }
+
+    pub fn queued_prompts_for_session(&self, session_id: &str) -> usize {
+        self.queued_prompts
+            .read()
+            .get(session_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn set_has_connected_provider(&self, connected: bool) {

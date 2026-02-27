@@ -21,6 +21,57 @@ pub fn render_user_message(
     let mut lines = Vec::new();
     let border_char = "┃ ";
     let border_style = Style::default().fg(user_border_color_for_agent(agent, theme));
+    let mut rendered_resolution_meta = false;
+
+    if let Some(resolved_agent) = metadata_text(msg, "resolved_agent") {
+        lines.push(Line::from(vec![
+            Span::styled(border_char, border_style),
+            Span::styled(
+                "[Agent] ",
+                Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(resolved_agent.to_string(), Style::default().fg(theme.text)),
+        ]));
+        rendered_resolution_meta = true;
+    }
+    if let Some(system_prompt) = metadata_text(msg, "resolved_system_prompt") {
+        lines.push(Line::from(vec![
+            Span::styled(border_char, border_style),
+            Span::styled(
+                "[System Prompt] ",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                compact_preview(system_prompt, 360),
+                Style::default().fg(theme.text),
+            ),
+        ]));
+        rendered_resolution_meta = true;
+    }
+    if let Some(user_prompt) = metadata_text(msg, "resolved_user_prompt") {
+        lines.push(Line::from(vec![
+            Span::styled(border_char, border_style),
+            Span::styled(
+                "[Input Prompt] ",
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                compact_preview(user_prompt, 360),
+                Style::default().fg(theme.text),
+            ),
+        ]));
+        rendered_resolution_meta = true;
+    }
+    if rendered_resolution_meta {
+        lines.push(Line::from(vec![
+            Span::styled(border_char, border_style),
+            Span::raw(""),
+        ]));
+    }
 
     if msg.parts.is_empty() {
         for line_text in msg.content.lines() {
@@ -101,4 +152,26 @@ fn user_border_color_for_agent(agent: Option<&str>, theme: &Theme) -> Color {
     agent.hash(&mut hasher);
     let idx = (hasher.finish() as usize) % theme.agent_colors.len();
     theme.agent_colors[idx]
+}
+
+fn metadata_text<'a>(msg: &'a Message, key: &str) -> Option<&'a str> {
+    msg.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(|value| value.as_str())
+}
+
+fn compact_preview(value: &str, max_chars: usize) -> String {
+    let normalized = value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ⏎ ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut out = normalized.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
 }

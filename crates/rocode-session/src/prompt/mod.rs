@@ -24,6 +24,8 @@ pub use tools_and_output::{
 };
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -132,6 +134,10 @@ pub(super) struct PersistedSubsession {
     agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_steps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directory: Option<String>,
     #[serde(default)]
     disabled_tools: Vec<String>,
     #[serde(default)]
@@ -153,6 +159,16 @@ pub struct AgentParams {
 }
 
 pub type SessionUpdateHook = Arc<dyn Fn(&Session) + Send + Sync + 'static>;
+pub type AskQuestionHook = Arc<
+    dyn Fn(
+            String,
+            Vec<rocode_tool::QuestionDef>,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Vec<Vec<String>>, rocode_tool::ToolError>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 pub struct SessionPrompt {
     state: Arc<Mutex<HashMap<String, PromptState>>>,
@@ -422,6 +438,7 @@ impl SessionPrompt {
             agent_params,
             None,
             None,
+            None,
         )
         .await
     }
@@ -436,6 +453,7 @@ impl SessionPrompt {
         agent_params: AgentParams,
         update_hook: Option<SessionUpdateHook>,
         agent_lookup: Option<Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>>,
+        ask_question_hook: Option<AskQuestionHook>,
     ) -> anyhow::Result<()> {
         self.assert_not_busy(&input.session_id).await?;
 
@@ -488,6 +506,7 @@ impl SessionPrompt {
             &agent_params,
             update_hook,
             agent_lookup,
+            ask_question_hook,
         )
         .await;
 
@@ -569,6 +588,7 @@ impl SessionPrompt {
             &agent_params,
             None,
             None,
+            None,
         )
         .await;
 
@@ -595,6 +615,7 @@ impl SessionPrompt {
         agent_params: &AgentParams,
         update_hook: Option<SessionUpdateHook>,
         agent_lookup: Option<Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>>,
+        ask_question_hook: Option<AskQuestionHook>,
     ) -> anyhow::Result<()> {
         let mut step = 0u32;
         let provider_type = ProviderType::from_provider_id(&provider_id);
@@ -621,8 +642,15 @@ impl SessionPrompt {
                 None => return Err(anyhow::anyhow!("No user message found")),
             };
 
-            if Self::process_pending_subtasks(session, provider.clone(), &model_id, &provider_id)
-                .await?
+            if Self::process_pending_subtasks(
+                session,
+                provider.clone(),
+                &model_id,
+                &provider_id,
+                agent_lookup.clone(),
+                ask_question_hook.clone(),
+            )
+            .await?
             {
                 tracing::info!("Processed pending subtask parts for session {}", session_id);
                 continue;
@@ -980,8 +1008,9 @@ impl SessionPrompt {
                             input_type = %if parsed_input.is_object() { "object" } else if parsed_input.is_string() { "string" } else { "other" },
                             raw_input_len = raw_input.len(),
                             raw_input_preview = %raw_input.chars().take(200).collect::<String>(),
-                            "[DIAG] ToolCallEnd received"
+                                "[DIAG] ToolCallEnd received"
                         );
+                        let parsed_input_for_part = parsed_input.clone();
                         let entry =
                             tool_calls
                                 .entry(id.clone())
@@ -1014,7 +1043,7 @@ impl SessionPrompt {
                                 assistant,
                                 &id,
                                 Some(&name),
-                                Some(input),
+                                Some(parsed_input_for_part),
                                 Some(raw_input),
                                 Some(crate::ToolCallStatus::Running),
                                 Some(entry.state.clone()),
@@ -1036,6 +1065,7 @@ impl SessionPrompt {
                             &model_id,
                             update_hook.as_ref(),
                             agent_lookup.clone(),
+                            ask_question_hook.clone(),
                         )
                         .await
                         {
@@ -1181,6 +1211,7 @@ impl SessionPrompt {
                                 &model_id,
                                 update_hook.as_ref(),
                                 agent_lookup.clone(),
+                                ask_question_hook.clone(),
                             )
                             .await
                             {
@@ -1540,11 +1571,14 @@ impl SessionPrompt {
                     .with_data("has_tool_calls", serde_json::json!(has_tool_calls));
 
                 if let Some(model) = provider.get_model(&model_id) {
-                    hook_ctx = hook_ctx.with_data("model", serde_json::json!({
-                        "id": model.id,
-                        "name": model.name,
-                        "provider": model.provider,
-                    }));
+                    hook_ctx = hook_ctx.with_data(
+                        "model",
+                        serde_json::json!({
+                            "id": model.id,
+                            "name": model.name,
+                            "provider": model.provider,
+                        }),
+                    );
                 } else {
                     hook_ctx = hook_ctx.with_data("model_id", serde_json::json!(&model_id));
                 }
@@ -1579,6 +1613,7 @@ impl SessionPrompt {
                     &model_id,
                     update_hook.as_ref(),
                     agent_lookup.clone(),
+                    ask_question_hook.clone(),
                 )
                 .await
                 {
@@ -1729,6 +1764,8 @@ impl SessionPrompt {
         provider: Arc<dyn Provider>,
         model_id: &str,
         provider_id: &str,
+        agent_lookup: Option<Arc<dyn Fn(&str) -> Option<rocode_tool::TaskAgentInfo> + Send + Sync>>,
+        ask_question_hook: Option<AskQuestionHook>,
     ) -> anyhow::Result<bool> {
         let last_user_idx = session
             .messages
@@ -1750,6 +1787,10 @@ impl SessionPrompt {
         let user_text = session.messages[last_user_idx].get_text();
 
         for subtask in &pending {
+            let subtask_max_steps = agent_lookup
+                .as_ref()
+                .and_then(|lookup| lookup(&subtask.agent))
+                .and_then(|info| info.steps);
             let combined_prompt = if user_text.trim().is_empty() {
                 subtask.prompt.clone()
             } else {
@@ -1761,6 +1802,8 @@ impl SessionPrompt {
                 .or_insert_with(|| PersistedSubsession {
                     agent: subtask.agent.clone(),
                     model: Some(default_model.clone()),
+                    max_steps: subtask_max_steps,
+                    directory: Some(session.directory.clone()),
                     disabled_tools: Vec::new(),
                     history: Vec::new(),
                 });
@@ -1771,6 +1814,8 @@ impl SessionPrompt {
                     .unwrap_or(PersistedSubsession {
                         agent: subtask.agent.clone(),
                         model: Some(default_model.clone()),
+                        max_steps: subtask_max_steps,
+                        directory: Some(session.directory.clone()),
                         disabled_tools: Vec::new(),
                         history: Vec::new(),
                     });
@@ -1781,6 +1826,9 @@ impl SessionPrompt {
                 provider.clone(),
                 tool_registry.clone(),
                 &default_model,
+                Some(session.directory.as_str()),
+                ask_question_hook.clone(),
+                Some(session.id.clone()),
             )
             .await
             {
@@ -2297,6 +2345,7 @@ mod tests {
                 AgentParams::default(),
                 Some(hook),
                 None,
+                None,
             )
             .await
             .expect("prompt_with_update_hook should succeed");
@@ -2405,6 +2454,7 @@ mod tests {
                 None,
                 Vec::new(),
                 AgentParams::default(),
+                None,
                 None,
                 None,
             )

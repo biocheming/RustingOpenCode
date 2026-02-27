@@ -20,12 +20,20 @@ impl Default for TaskTool {
     }
 }
 
+const TASK_STATUS_COMPLETED: &str = "completed";
+const TASK_NO_TEXT_OUTPUT_MESSAGE: &str =
+    "Task completed successfully. No textual output was returned by subagent.";
+
 #[derive(Debug, Serialize, Deserialize)]
 struct TaskInput {
-    description: String,
-    prompt: String,
-    #[serde(alias = "subagentType")]
-    subagent_type: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(alias = "subagentType", default)]
+    subagent_type: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
     #[serde(alias = "taskId")]
     task_id: Option<String>,
     command: Option<String>,
@@ -33,6 +41,113 @@ struct TaskInput {
     load_skills: Option<Vec<String>>,
     #[serde(default, alias = "runInBackground")]
     run_in_background: bool,
+}
+
+#[derive(Debug)]
+struct NormalizedTaskInput {
+    description: String,
+    prompt: String,
+    subagent_type: String,
+    task_id: Option<String>,
+    #[allow(dead_code)]
+    command: Option<String>,
+    load_skills: Option<Vec<String>>,
+    #[allow(dead_code)]
+    run_in_background: bool,
+}
+
+impl TaskInput {
+    fn normalize(self) -> Result<NormalizedTaskInput, ToolError> {
+        let prompt = self
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+            .ok_or_else(|| ToolError::InvalidArguments("missing field `prompt`".to_string()))?;
+
+        let description = self
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| derive_description_from_prompt(&prompt));
+
+        let subagent_type = self
+            .subagent_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string);
+        let category = self
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string);
+        let subagent_type = match (subagent_type, category) {
+            (Some(primary), Some(category)) if primary != category => {
+                tracing::warn!(
+                    primary_subagent_type = %primary,
+                    category = %category,
+                    "task arguments had conflicting subagent_type/category; preferring category"
+                );
+                category
+            }
+            (Some(primary), _) => primary,
+            (None, Some(category)) => category,
+            (None, None) => {
+                return Err(ToolError::InvalidArguments(
+                    "missing field `subagent_type` (or alias `subagentType` / `category`)"
+                        .to_string(),
+                ));
+            }
+        };
+
+        Ok(NormalizedTaskInput {
+            description,
+            prompt,
+            subagent_type,
+            task_id: self.task_id,
+            command: self.command,
+            load_skills: self.load_skills,
+            run_in_background: self.run_in_background,
+        })
+    }
+}
+
+fn derive_description_from_prompt(prompt: &str) -> String {
+    let chosen = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("- ["))
+        .or_else(|| prompt.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or("Delegated task");
+
+    let truncated = chosen.chars().take(40).collect::<String>();
+    if truncated.is_empty() {
+        "Delegated task".to_string()
+    } else {
+        truncated
+    }
+}
+
+fn format_task_output(session_id: &str, result_text: &str) -> (String, bool) {
+    let has_text_output = !result_text.trim().is_empty();
+    let task_body = if has_text_output {
+        result_text.to_string()
+    } else {
+        TASK_NO_TEXT_OUTPUT_MESSAGE.to_string()
+    };
+
+    (
+        format!(
+            "task_id: {} (for resuming to continue this task if needed)\ntask_status: {}\n\n<task_result>\n{}\n</task_result>",
+            session_id, TASK_STATUS_COMPLETED, task_body
+        ),
+        has_text_output,
+    )
 }
 
 #[async_trait]
@@ -88,8 +203,9 @@ impl Tool for TaskTool {
         args: serde_json::Value,
         ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let input: TaskInput =
+        let raw_input: TaskInput =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        let input = raw_input.normalize()?;
 
         let bypass_check = ctx
             .extra
@@ -138,14 +254,15 @@ impl Tool for TaskTool {
             .await?;
         let model = parse_model_ref(preferred_model.as_deref());
 
-        let output = format!(
-            "task_id: {} (for resuming to continue this task if needed)\n\n<task_result>\n{}\n</task_result>",
-            session_id,
-            result_text
-        );
+        let (output, has_text_output) = format_task_output(&session_id, &result_text);
 
         let mut metadata = Metadata::new();
         metadata.insert("sessionId".into(), serde_json::json!(session_id));
+        metadata.insert(
+            "taskStatus".into(),
+            serde_json::json!(TASK_STATUS_COMPLETED),
+        );
+        metadata.insert("hasTextOutput".into(), serde_json::json!(has_text_output));
         metadata.insert(
             "model".into(),
             serde_json::json!({
@@ -222,6 +339,7 @@ mod tests {
                         name: "build".to_string(),
                         model: None,
                         can_use_task: true,
+                        steps: None,
                     }))
                 } else {
                     Ok(None)
@@ -307,6 +425,7 @@ mod tests {
                         name: "build".to_string(),
                         model: None,
                         can_use_task: true,
+                        steps: None,
                     }))
                 } else {
                     Ok(None)
@@ -372,6 +491,7 @@ mod tests {
                             model_id: "gpt-4o".to_string(),
                         }),
                         can_use_task: true,
+                        steps: None,
                     }))
                 } else {
                     Ok(None)
@@ -516,5 +636,183 @@ mod tests {
         let create_calls = create_calls.lock().await.clone();
         // Without callback, agent=None → task disabled (backward compat)
         assert!(create_calls[0].3.contains(&"task".to_string()));
+    }
+
+    #[tokio::test]
+    async fn task_accepts_category_alias_and_derives_description_from_prompt() {
+        let create_calls = Arc::new(Mutex::new(Vec::<(
+            String,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+        )>::new()));
+
+        let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_get_agent_info(|_name| async move { Ok(None) })
+            .with_get_last_model(|_session_id| async move { Ok(Some("provider-x:model-y".into())) })
+            .with_create_subsession({
+                let create_calls = create_calls.clone();
+                move |agent, title, model, disabled_tools| {
+                    let create_calls = create_calls.clone();
+                    async move {
+                        create_calls
+                            .lock()
+                            .await
+                            .push((agent, title, model, disabled_tools));
+                        Ok("task_alias_1".to_string())
+                    }
+                }
+            })
+            .with_prompt_subsession(|_session_id, _prompt| async move { Ok("ok".to_string()) });
+
+        let args = serde_json::json!({
+            "prompt": "Inspect HTML structure and report key sections",
+            "category": "explore"
+        });
+
+        let result = TaskTool::new().execute(args, ctx).await.unwrap();
+        assert_eq!(result.title, "Inspect HTML structure and report key se");
+
+        let create_calls = create_calls.lock().await.clone();
+        assert_eq!(create_calls.len(), 1);
+        assert_eq!(create_calls[0].0, "explore");
+        assert_eq!(
+            create_calls[0].1,
+            Some("Inspect HTML structure and report key se".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn task_accepts_both_category_and_subagent_type_when_equal() {
+        let create_calls = Arc::new(Mutex::new(Vec::<(
+            String,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+        )>::new()));
+
+        let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_get_agent_info(|_name| async move { Ok(None) })
+            .with_get_last_model(|_session_id| async move { Ok(Some("provider-x:model-y".into())) })
+            .with_create_subsession({
+                let create_calls = create_calls.clone();
+                move |agent, title, model, disabled_tools| {
+                    let create_calls = create_calls.clone();
+                    async move {
+                        create_calls
+                            .lock()
+                            .await
+                            .push((agent, title, model, disabled_tools));
+                        Ok("task_both_1".to_string())
+                    }
+                }
+            })
+            .with_prompt_subsession(|_session_id, _prompt| async move { Ok("ok".to_string()) });
+
+        let args = serde_json::json!({
+            "prompt": "Inspect HTML structure and report key sections",
+            "category": "explore",
+            "subagent_type": "explore"
+        });
+
+        let _ = TaskTool::new().execute(args, ctx).await.unwrap();
+        let create_calls = create_calls.lock().await.clone();
+        assert_eq!(create_calls.len(), 1);
+        assert_eq!(create_calls[0].0, "explore");
+    }
+
+    #[tokio::test]
+    async fn task_conflicting_category_and_subagent_type_prefers_category() {
+        let create_calls = Arc::new(Mutex::new(Vec::<(
+            String,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+        )>::new()));
+
+        let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_get_agent_info(|_name| async move { Ok(None) })
+            .with_get_last_model(|_session_id| async move { Ok(Some("provider-x:model-y".into())) })
+            .with_create_subsession({
+                let create_calls = create_calls.clone();
+                move |agent, title, model, disabled_tools| {
+                    let create_calls = create_calls.clone();
+                    async move {
+                        create_calls
+                            .lock()
+                            .await
+                            .push((agent, title, model, disabled_tools));
+                        Ok("task_conflict_pref_1".to_string())
+                    }
+                }
+            })
+            .with_prompt_subsession(|_session_id, _prompt| async move { Ok("ok".to_string()) });
+
+        let args = serde_json::json!({
+            "prompt": "Inspect HTML structure and report key sections",
+            "category": "explore",
+            "subagent_type": "build"
+        });
+
+        let _ = TaskTool::new().execute(args, ctx).await.unwrap();
+        let create_calls = create_calls.lock().await.clone();
+        assert_eq!(create_calls.len(), 1);
+        assert_eq!(create_calls[0].0, "explore");
+    }
+
+    #[tokio::test]
+    async fn task_missing_prompt_still_returns_clear_error() {
+        let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into());
+        let args = serde_json::json!({
+            "description": "something",
+            "subagent_type": "explore"
+        });
+
+        let err = TaskTool::new().execute(args, ctx).await.unwrap_err();
+        match err {
+            ToolError::InvalidArguments(msg) => assert!(msg.contains("missing field `prompt`")),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_empty_subagent_output_is_reported_as_completed_without_polling_hint() {
+        let ctx = ToolContext::new("session-1".into(), "message-1".into(), ".".into())
+            .with_get_agent_info(|name| async move {
+                if name == "build" {
+                    Ok(Some(TaskAgentInfo {
+                        name: "build".to_string(),
+                        model: None,
+                        can_use_task: true,
+                        steps: None,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })
+            .with_get_last_model(|_session_id| async move { Ok(Some("provider-x:model-y".into())) })
+            .with_create_subsession(|_agent, _title, _model, _disabled_tools| async move {
+                Ok("task_build_empty".to_string())
+            })
+            .with_prompt_subsession(|_session_id, _prompt| async move { Ok("   \n".to_string()) });
+
+        let args = serde_json::json!({
+            "description": "Investigate issue",
+            "prompt": "Please inspect runtime behavior",
+            "subagent_type": "build"
+        });
+
+        let result = TaskTool::new().execute(args, ctx).await.unwrap();
+
+        assert!(result.output.contains("task_status: completed"));
+        assert!(result.output.contains(TASK_NO_TEXT_OUTPUT_MESSAGE));
+        assert_eq!(
+            result.metadata.get("taskStatus"),
+            Some(&serde_json::json!(TASK_STATUS_COMPLETED))
+        );
+        assert_eq!(
+            result.metadata.get("hasTextOutput"),
+            Some(&serde_json::json!(false))
+        );
     }
 }

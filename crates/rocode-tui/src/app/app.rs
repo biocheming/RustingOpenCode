@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -11,18 +11,20 @@ use std::time::{Duration, Instant};
 use chrono::{TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::api::{ApiClient, McpStatusInfo, MessageInfo, SessionInfo, SessionRevertInfo};
+use crate::api::{
+    ApiClient, McpStatusInfo, MessageInfo, QuestionInfo, SessionInfo, SessionRevertInfo,
+};
 use crate::app::state::AppState;
 use crate::app::terminal;
 use crate::command::CommandAction;
 use crate::components::{
     exit_logo_lines, Agent, AgentSelectDialog, AlertDialog, CommandPalette, ForkDialog, ForkEntry,
     HelpDialog, HomeView, McpDialog, McpItem, Model, ModelSelectDialog, PermissionAction,
-    PermissionPrompt, Prompt, PromptStashDialog, ProviderDialog, QuestionPrompt,
-    SessionDeleteState, SessionExportDialog, SessionItem, SessionListDialog, SessionRenameDialog,
-    SessionView, SkillListDialog, SlashCommandPopup, StashItem, StatusDialog, StatusLine,
-    SubagentDialog, TagDialog, TaskKind, ThemeListDialog, ThemeOption, TimelineDialog,
-    TimelineEntry, Toast, ToastVariant,
+    PermissionPrompt, Prompt, PromptStashDialog, ProviderDialog, QuestionOption, QuestionPrompt,
+    QuestionRequest, QuestionType, SessionDeleteState, SessionExportDialog, SessionItem,
+    SessionListDialog, SessionRenameDialog, SessionView, SkillListDialog, SlashCommandPopup,
+    StashItem, StatusDialog, StatusLine, SubagentDialog, TagDialog, TaskKind, ThemeListDialog,
+    ThemeOption, TimelineDialog, TimelineEntry, Toast, ToastVariant,
 };
 use crate::context::keybind::LeaderKeyState;
 use crate::context::{
@@ -78,12 +80,25 @@ pub struct App {
     available_models: HashSet<String>,
     model_variants: HashMap<String, Vec<String>>,
     model_variant_selection: HashMap<String, Option<String>>,
+    pending_prompt_queue: HashMap<String, VecDeque<QueuedPrompt>>,
+    pending_question_ids: HashSet<String>,
+    pending_question_queue: VecDeque<String>,
+    pending_questions: HashMap<String, QuestionInfo>,
     pending_initial_submit: bool,
     pending_session_sync: Option<String>,
     last_session_sync: Instant,
+    last_question_sync: Instant,
     last_aux_sync: Instant,
     last_process_refresh: Instant,
     event_caused_change: bool,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedPrompt {
+    input: String,
+    agent: Option<String>,
+    model: Option<String>,
+    variant: Option<String>,
 }
 
 impl App {
@@ -218,9 +233,14 @@ impl App {
             available_models: HashSet::new(),
             model_variants: HashMap::new(),
             model_variant_selection: HashMap::new(),
+            pending_prompt_queue: HashMap::new(),
+            pending_question_ids: HashSet::new(),
+            pending_question_queue: VecDeque::new(),
+            pending_questions: HashMap::new(),
             pending_initial_submit,
             pending_session_sync: None,
             last_session_sync: Instant::now(),
+            last_question_sync: Instant::now(),
             last_aux_sync: Instant::now(),
             last_process_refresh: Instant::now(),
             event_caused_change: true,
@@ -233,6 +253,7 @@ impl App {
         app.refresh_theme_list_dialog();
         let _ = app.refresh_lsp_status();
         let _ = app.refresh_mcp_dialog();
+        let _ = app.sync_question_requests();
 
         if let Some(session_id) = initial_session_id {
             let _ = app.sync_session_from_server(&session_id);
@@ -369,15 +390,18 @@ impl App {
                 // Handle inline question prompt before dialogs
                 if self.question_prompt.is_open {
                     match key.code {
-                        KeyCode::Up => self.question_prompt.move_up(),
-                        KeyCode::Down => self.question_prompt.move_down(),
+                        KeyCode::Up | KeyCode::BackTab => self.question_prompt.move_up(),
+                        KeyCode::Down | KeyCode::Tab => self.question_prompt.move_down(),
                         KeyCode::Char(' ') => self.question_prompt.toggle_selected(),
                         KeyCode::Enter => {
-                            if let Some((_question, _answer)) = self.question_prompt.confirm() {
-                                // TODO: Call API when available
+                            if let Some((question, answer)) = self.question_prompt.confirm() {
+                                self.submit_question_reply(&question.id, answer);
                             }
                         }
                         KeyCode::Esc => {
+                            if let Some(question) = self.question_prompt.current().cloned() {
+                                self.reject_question(&question.id);
+                            }
                             self.question_prompt.close();
                         }
                         KeyCode::Char(c) => self.question_prompt.type_char(c),
@@ -818,6 +842,7 @@ impl App {
                     if let Some(err) = error {
                         self.remove_optimistic_message(session_id, optimistic_message_id);
                         self.set_session_status(session_id, SessionStatus::Idle);
+                        let _ = self.dispatch_next_queued_prompt(session_id);
                         self.sync_prompt_spinner_state();
                         self.alert_dialog
                             .set_message(&format!("Failed to send prompt:\n{}", err));
@@ -844,6 +869,7 @@ impl App {
                 }
                 CustomEvent::StateChanged(StateChange::SessionStatusIdle(session_id)) => {
                     self.set_session_status(session_id, SessionStatus::Idle);
+                    let _ = self.dispatch_next_queued_prompt(session_id);
                     self.sync_prompt_spinner_state();
                 }
                 CustomEvent::StateChanged(StateChange::SessionStatusRetrying {
@@ -891,6 +917,10 @@ impl App {
                             tick_changed = true;
                         }
                     }
+                }
+                if self.last_question_sync.elapsed() >= Duration::from_millis(400) {
+                    tick_changed |= self.sync_question_requests();
+                    self.last_question_sync = Instant::now();
                 }
                 if self.last_aux_sync.elapsed() >= Duration::from_secs(5) {
                     self.refresh_session_list_dialog();
@@ -2468,38 +2498,124 @@ impl App {
                 });
             }
             Route::Session { session_id } => {
-                // Optimistic: show user message immediately before network call
-                let opt_id = self.append_optimistic_user_message(
-                    &session_id,
-                    &input,
-                    agent.clone(),
-                    model.clone(),
-                    variant.clone(),
-                );
-                self.set_session_status(&session_id, SessionStatus::Running);
-                self.prompt.set_spinner_task_kind(TaskKind::LlmRequest);
-                self.prompt.set_spinner_active(true);
-                self.ensure_session_view(&session_id);
-                // Render immediately so the user sees their message before network I/O.
-                let _ = self.draw();
-                let event_tx = self.event_tx.clone();
-                thread::spawn(move || {
-                    let error = client
-                        .send_prompt(&session_id, input, agent, model, variant)
-                        .err()
-                        .map(|e| e.to_string());
-                    let _ =
-                        event_tx.send(Event::Custom(CustomEvent::PromptDispatchSessionFinished {
-                            session_id,
-                            optimistic_message_id: opt_id,
-                            error,
-                        }));
-                });
+                if self.is_session_busy(&session_id) {
+                    self.enqueue_prompt(
+                        &session_id,
+                        QueuedPrompt {
+                            input,
+                            agent,
+                            model,
+                            variant,
+                        },
+                    );
+                    self.event_caused_change = true;
+                    return Ok(());
+                }
+                self.dispatch_prompt_to_session(&session_id, input, agent, model, variant);
             }
             _ => {}
         }
 
         Ok(())
+    }
+
+    fn is_session_busy(&self, session_id: &str) -> bool {
+        let session_ctx = self.context.session.read();
+        !matches!(session_ctx.status(session_id), SessionStatus::Idle)
+    }
+
+    fn enqueue_prompt(&mut self, session_id: &str, queued: QueuedPrompt) {
+        let count = {
+            let queue = self
+                .pending_prompt_queue
+                .entry(session_id.to_string())
+                .or_default();
+            queue.push_back(queued);
+            queue.len()
+        };
+        self.context.set_queued_prompts(session_id, count);
+        self.toast.show(
+            ToastVariant::Info,
+            &format!("Session busy, queued prompt ({})", count),
+            2000,
+        );
+    }
+
+    fn dispatch_prompt_to_session(
+        &mut self,
+        session_id: &str,
+        input: String,
+        agent: Option<String>,
+        model: Option<String>,
+        variant: Option<String>,
+    ) {
+        let Some(client) = self.context.get_api_client() else {
+            eprintln!("API client not initialized");
+            return;
+        };
+
+        // Optimistic: show user message immediately before network call.
+        let opt_id = self.append_optimistic_user_message(
+            session_id,
+            &input,
+            agent.clone(),
+            model.clone(),
+            variant.clone(),
+        );
+        self.set_session_status(session_id, SessionStatus::Running);
+        self.prompt.set_spinner_task_kind(TaskKind::LlmRequest);
+        self.prompt.set_spinner_active(true);
+        self.ensure_session_view(session_id);
+        // Render immediately so the user sees their message before network I/O.
+        let _ = self.draw();
+
+        let event_tx = self.event_tx.clone();
+        let session_id = session_id.to_string();
+        thread::spawn(move || {
+            let error = client
+                .send_prompt(&session_id, input, agent, model, variant)
+                .err()
+                .map(|e| e.to_string());
+            let _ = event_tx.send(Event::Custom(CustomEvent::PromptDispatchSessionFinished {
+                session_id,
+                optimistic_message_id: opt_id,
+                error,
+            }));
+        });
+    }
+
+    fn dispatch_next_queued_prompt(&mut self, session_id: &str) -> bool {
+        if self.is_session_busy(session_id) {
+            return false;
+        }
+
+        let queued = {
+            let Some(queue) = self.pending_prompt_queue.get_mut(session_id) else {
+                self.context.set_queued_prompts(session_id, 0);
+                return false;
+            };
+            let queued = queue.pop_front();
+            let remaining = queue.len();
+            self.context.set_queued_prompts(session_id, remaining);
+            (queued, remaining == 0)
+        };
+
+        if queued.1 {
+            self.pending_prompt_queue.remove(session_id);
+        }
+
+        if let Some(queued) = queued.0 {
+            self.dispatch_prompt_to_session(
+                session_id,
+                queued.input,
+                queued.agent,
+                queued.model,
+                queued.variant,
+            );
+            return true;
+        }
+
+        false
     }
 
     fn submit_shell_command(&mut self, command: String) -> anyhow::Result<()> {
@@ -2683,7 +2799,23 @@ impl App {
 
         let model_missing = self.context.current_model.read().is_none();
         if model_missing {
-            if let Some((provider, model_id)) = providers.default_model.iter().next() {
+            // Try to restore the most recently used model that is still
+            // available, mirroring TS local.tsx:175-179.
+            let restored = self
+                .model_select
+                .recent()
+                .iter()
+                .find_map(|(provider, model_id)| {
+                    let key = format!("{}/{}", provider, model_id);
+                    if self.available_models.contains(&key) {
+                        Some((key, provider.clone()))
+                    } else {
+                        None
+                    }
+                });
+            if let Some((model_ref, provider)) = restored {
+                self.set_active_model_selection(model_ref, Some(provider));
+            } else if let Some((provider, model_id)) = providers.default_model.iter().next() {
                 self.set_active_model_selection(
                     format!("{}/{}", provider, model_id),
                     Some(provider.clone()),
@@ -2974,6 +3106,199 @@ impl App {
         Ok(())
     }
 
+    fn question_info_to_prompt(question: &QuestionInfo) -> Option<QuestionRequest> {
+        let prompt_text = question.questions.first()?.clone();
+        let option_labels = question
+            .options
+            .as_ref()
+            .and_then(|all| all.first().cloned())
+            .unwrap_or_default();
+        let options = option_labels
+            .into_iter()
+            .map(|label| QuestionOption {
+                id: label.clone(),
+                label,
+            })
+            .collect::<Vec<_>>();
+        let question_type = if options.is_empty() {
+            QuestionType::Text
+        } else {
+            QuestionType::SingleChoice
+        };
+        Some(QuestionRequest {
+            id: question.id.clone(),
+            question: prompt_text,
+            question_type,
+            options,
+        })
+    }
+
+    fn parse_question_answer(answer: &str) -> Vec<String> {
+        let trimmed = answer.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        if !trimmed.contains(',') {
+            return vec![trimmed.to_string()];
+        }
+        trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn clear_question_tracking(&mut self, question_id: &str) {
+        self.pending_question_ids.remove(question_id);
+        self.pending_questions.remove(question_id);
+        self.pending_question_queue.retain(|id| id != question_id);
+    }
+
+    fn open_next_question_prompt(&mut self) -> bool {
+        if self.question_prompt.is_open {
+            return false;
+        }
+
+        while let Some(question_id) = self.pending_question_queue.pop_front() {
+            let Some(question) = self.pending_questions.get(&question_id).cloned() else {
+                continue;
+            };
+            if let Some(prompt) = Self::question_info_to_prompt(&question) {
+                self.question_prompt.ask(prompt);
+                return true;
+            }
+            self.clear_question_tracking(&question_id);
+        }
+        false
+    }
+
+    fn sync_question_requests(&mut self) -> bool {
+        let Some(client) = self.context.get_api_client() else {
+            return false;
+        };
+
+        let active_session = match self.context.current_route() {
+            Route::Session { session_id } => Some(session_id),
+            _ => None,
+        };
+
+        let mut questions = match client.list_questions() {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::debug!(%err, "failed to list pending questions");
+                return false;
+            }
+        };
+
+        if let Some(session_id) = active_session.as_deref() {
+            questions.retain(|q| q.session_id == session_id);
+        }
+        questions.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let latest_ids = questions
+            .iter()
+            .map(|q| q.id.clone())
+            .collect::<HashSet<_>>();
+        let mut changed = latest_ids != self.pending_question_ids;
+
+        for question in questions {
+            let question_id = question.id.clone();
+            self.pending_questions.insert(question_id.clone(), question);
+            if self.pending_question_ids.insert(question_id.clone()) {
+                self.pending_question_queue.push_back(question_id);
+                changed = true;
+            }
+        }
+
+        self.pending_question_ids
+            .retain(|id| latest_ids.contains(id));
+        self.pending_questions
+            .retain(|id, _| latest_ids.contains(id));
+        self.pending_question_queue
+            .retain(|id| latest_ids.contains(id));
+
+        if let Some(current_id) = self.question_prompt.current().map(|q| q.id.clone()) {
+            if !latest_ids.contains(&current_id) {
+                self.question_prompt.close();
+                changed = true;
+            }
+        }
+
+        if self.open_next_question_prompt() {
+            changed = true;
+        }
+        changed
+    }
+
+    fn submit_question_reply(&mut self, question_id: &str, answer: String) {
+        let Some(client) = self.context.get_api_client() else {
+            self.alert_dialog
+                .set_message("Cannot answer question: no API client");
+            self.alert_dialog.open();
+            return;
+        };
+
+        let question = self.pending_questions.get(question_id).cloned();
+        let parsed = Self::parse_question_answer(&answer);
+        let mut first_answer = parsed;
+        if first_answer.is_empty() {
+            if let Some(default_option) = question
+                .as_ref()
+                .and_then(|q| q.options.as_ref())
+                .and_then(|all| all.first())
+                .and_then(|opts| opts.first())
+                .cloned()
+            {
+                first_answer.push(default_option);
+            }
+        }
+
+        let question_count = question.as_ref().map(|q| q.questions.len()).unwrap_or(1);
+        let mut answers = vec![Vec::<String>::new(); question_count.max(1)];
+        answers[0] = first_answer;
+
+        match client.reply_question(question_id, answers) {
+            Ok(()) => {
+                self.clear_question_tracking(question_id);
+                self.toast
+                    .show(ToastVariant::Success, "Question answered", 2000);
+                let _ = self.open_next_question_prompt();
+            }
+            Err(err) => {
+                self.alert_dialog
+                    .set_message(&format!("Failed to submit question response:\n{}", err));
+                self.alert_dialog.open();
+                if let Some(question) = question.and_then(|q| Self::question_info_to_prompt(&q)) {
+                    self.question_prompt.ask(question);
+                }
+            }
+        }
+    }
+
+    fn reject_question(&mut self, question_id: &str) {
+        let Some(client) = self.context.get_api_client() else {
+            self.alert_dialog
+                .set_message("Cannot reject question: no API client");
+            self.alert_dialog.open();
+            return;
+        };
+
+        match client.reject_question(question_id) {
+            Ok(()) => {
+                self.clear_question_tracking(question_id);
+                self.toast
+                    .show(ToastVariant::Info, "Question rejected", 1500);
+                let _ = self.open_next_question_prompt();
+            }
+            Err(err) => {
+                self.alert_dialog
+                    .set_message(&format!("Failed to reject question:\n{}", err));
+                self.alert_dialog.open();
+            }
+        }
+    }
+
     fn set_active_model_selection(&mut self, model_ref: String, provider: Option<String>) {
         let (model_key, explicit_variant) =
             parse_model_ref_selection(&model_ref, &self.available_models, &self.model_variants);
@@ -3142,6 +3467,8 @@ impl App {
         if session_ctx.current_session_id.as_deref() == Some(session_id) {
             session_ctx.current_session_id = None;
         }
+        self.pending_prompt_queue.remove(session_id);
+        self.context.set_queued_prompts(session_id, 0);
     }
 
     fn promote_optimistic_session(&mut self, optimistic_session_id: &str, session: &SessionInfo) {
@@ -3179,6 +3506,15 @@ impl App {
         if let Some(revert) = optimistic_revert {
             session_ctx.revert.insert(real_session_id, revert);
         }
+
+        if let Some(queued) = self.pending_prompt_queue.remove(optimistic_session_id) {
+            let count = queued.len();
+            self.pending_prompt_queue.insert(session.id.clone(), queued);
+            self.context.set_queued_prompts(optimistic_session_id, 0);
+            self.context.set_queued_prompts(&session.id, count);
+        } else {
+            self.context.set_queued_prompts(optimistic_session_id, 0);
+        }
     }
 
     fn append_optimistic_user_message(
@@ -3204,6 +3540,7 @@ impl App {
             completed_at: None,
             cost: 0.0,
             tokens: TokenUsage::default(),
+            metadata: None,
             parts: vec![ContextMessagePart::Text {
                 text: content.to_string(),
             }],
@@ -3600,10 +3937,11 @@ fn map_api_session(session: &SessionInfo) -> Session {
 }
 
 fn map_api_message(message: &MessageInfo) -> Message {
+    let keep_synthetic_text = message.mode.as_deref() == Some("compaction");
     let parts: Vec<ContextMessagePart> = message
         .parts
         .iter()
-        .filter_map(map_api_message_part)
+        .filter_map(|part| map_api_message_part(part, keep_synthetic_text))
         .collect();
 
     Message {
@@ -3640,6 +3978,7 @@ fn map_api_message(message: &MessageInfo) -> Message {
             cache_read: message.tokens.cache_read,
             cache_write: message.tokens.cache_write,
         },
+        metadata: message.metadata.clone(),
         parts,
     }
 }
@@ -3653,7 +3992,10 @@ fn map_api_revert(revert: &SessionRevertInfo) -> RevertInfo {
     }
 }
 
-fn map_api_message_part(part: &crate::api::MessagePart) -> Option<ContextMessagePart> {
+fn map_api_message_part(
+    part: &crate::api::MessagePart,
+    keep_synthetic_text: bool,
+) -> Option<ContextMessagePart> {
     if let Some(text) = &part.text {
         if part.ignored == Some(true) {
             return None;
@@ -3662,7 +4004,7 @@ fn map_api_message_part(part: &crate::api::MessagePart) -> Option<ContextMessage
             return Some(ContextMessagePart::Reasoning { text: text.clone() });
         }
         // Skip synthetic text parts (auto-continue prompts, etc.)
-        if part.synthetic == Some(true) {
+        if part.synthetic == Some(true) && !keep_synthetic_text {
             return None;
         }
         return Some(ContextMessagePart::Text { text: text.clone() });

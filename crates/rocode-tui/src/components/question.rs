@@ -229,7 +229,7 @@ impl QuestionPrompt {
             }
             content.push(Line::from(""));
             content.push(Line::from(Span::styled(
-                "Up/Down to navigate, Space to toggle, Enter to confirm",
+                "Up/Down or Tab/Shift+Tab to navigate, Space to toggle, Enter to confirm",
                 Style::default().fg(theme.text_muted),
             )));
         } else {

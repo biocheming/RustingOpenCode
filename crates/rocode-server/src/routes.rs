@@ -16,7 +16,7 @@ use std::convert::Infallible;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, Mutex, Notify, OnceCell, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, OnceCell, RwLock};
 use tokio_stream::{
     wrappers::{BroadcastStream, ReceiverStream},
     StreamExt,
@@ -394,18 +394,42 @@ async fn create_session(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<SessionInfo>> {
-    let session = if let Some(parent_id) = &req.parent_id {
-        state
-            .sessions
-            .lock()
-            .await
+    let mut sessions = state.sessions.lock().await;
+    let mut session = if let Some(parent_id) = &req.parent_id {
+        sessions
             .create_child(parent_id)
             .ok_or_else(|| ApiError::SessionNotFound(parent_id.clone()))?
     } else {
-        state.sessions.lock().await.create("default", ".")
+        sessions.create("default", resolved_session_directory("."))
     };
+    let normalized_directory = resolved_session_directory(&session.directory);
+    if session.directory != normalized_directory {
+        session.directory = normalized_directory;
+        sessions.update(session.clone());
+    }
+    drop(sessions);
     persist_sessions_if_enabled(&state).await;
     Ok(Json(session_to_info(&session)))
+}
+
+fn resolved_session_directory(raw: &str) -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let trimmed = raw.trim();
+    let candidate = if trimmed.is_empty() || trimmed == "." {
+        cwd
+    } else {
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    };
+    candidate
+        .canonicalize()
+        .unwrap_or(candidate)
+        .to_string_lossy()
+        .to_string()
 }
 
 async fn get_session(
@@ -723,6 +747,8 @@ pub struct MessageInfo {
     pub error: Option<String>,
     pub cost: f64,
     pub tokens: MessageTokensInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -822,6 +848,7 @@ fn part_to_info(part: &rocode_session::MessagePart) -> PartInfo {
         text: match &part.part_type {
             rocode_session::PartType::Text { text, .. } => Some(text.clone()),
             rocode_session::PartType::Reasoning { text } => Some(text.clone()),
+            rocode_session::PartType::Compaction { summary } => Some(summary.clone()),
             _ => None,
         },
         file: if let rocode_session::PartType::File {
@@ -940,16 +967,13 @@ fn message_to_info(session_id: &str, message: &rocode_session::SessionMessage) -
             .get("mode")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        finish: message
-            .finish
-            .clone()
-            .or_else(|| {
-                message
-                    .metadata
-                    .get("finish_reason")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            }),
+        finish: message.finish.clone().or_else(|| {
+            message
+                .metadata
+                .get("finish_reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        }),
         error: message
             .metadata
             .get("error")
@@ -962,6 +986,11 @@ fn message_to_info(session_id: &str, message: &rocode_session::SessionMessage) -
             reasoning: usage.reasoning_tokens,
             cache_read: usage.cache_read_tokens,
             cache_write: usage.cache_write_tokens,
+        },
+        metadata: if message.metadata.is_empty() {
+            None
+        } else {
+            Some(message.metadata.clone())
         },
     }
 }
@@ -1767,7 +1796,16 @@ async fn stream_message(
                     stream_msg_id.clone(),
                     session_directory.clone(),
                 )
-                .with_registry(stream_state.tool_registry.clone());
+                .with_registry(stream_state.tool_registry.clone())
+                .with_ask_question({
+                    let state = stream_state.clone();
+                    let session_id = stream_session_id.clone();
+                    move |questions| {
+                        let state = state.clone();
+                        let session_id = session_id.clone();
+                        async move { request_question_answers(state, session_id, questions).await }
+                    }
+                });
 
                 let mut execution = stream_state
                     .tool_registry
@@ -1868,7 +1906,10 @@ async fn stream_message(
             .await;
         }
 
-        if let Err(err) = stream_state.flush_session_to_storage(&stream_session_id).await {
+        if let Err(err) = stream_state
+            .flush_session_to_storage(&stream_session_id)
+            .await
+        {
             tracing::error!(session_id = %stream_session_id, %err, "failed to flush session to storage after stream");
         }
     });
@@ -1912,19 +1953,59 @@ async fn session_prompt(
     }
     let _ = ensure_plugin_loader_active(&state).await?;
 
-    let config = CONFIG_STATE.read().await;
-    let (provider, provider_id, model_id) =
-        resolve_provider_and_model(&state, req.model.as_deref(), config.model.as_deref(), None)
-            .await?;
+    let mut config = CONFIG_STATE.read().await.clone();
+    if let Some(loader) = get_plugin_loader() {
+        apply_plugin_config_hooks(loader, &mut config).await;
+    }
+
     let agent_registry = AgentRegistry::from_config(&config);
-    drop(config);
+    let resolved_agent = req
+        .agent
+        .as_deref()
+        .and_then(|name| agent_registry.get(name).cloned());
+    if req.agent.is_some() && resolved_agent.is_none() {
+        tracing::warn!(
+            requested_agent = ?req.agent,
+            "requested agent not found in registry; proceeding without agent-specific overrides"
+        );
+    }
+    let agent_model = resolved_agent
+        .as_ref()
+        .and_then(|agent| agent.model.as_ref())
+        .map(|model| format!("{}/{}", model.provider_id, model.model_id));
+
+    let (provider, provider_id, model_id) = resolve_provider_and_model(
+        &state,
+        req.model.as_deref(),
+        agent_model.as_deref().or(config.model.as_deref()),
+        None,
+    )
+    .await?;
+
+    let agent_system_prompt = resolved_agent
+        .as_ref()
+        .and_then(|agent| agent.system_prompt.clone());
+    let agent_params = rocode_session::AgentParams {
+        max_tokens: resolved_agent.as_ref().and_then(|agent| agent.max_tokens),
+        temperature: resolved_agent.as_ref().and_then(|agent| agent.temperature),
+        top_p: resolved_agent.as_ref().and_then(|agent| agent.top_p),
+    };
+    tracing::info!(
+        requested_agent = ?req.agent,
+        resolved_agent = ?resolved_agent.as_ref().map(|agent| agent.name.as_str()),
+        agent_model = ?agent_model,
+        system_prompt_applied = agent_system_prompt.is_some(),
+        "resolved session prompt agent configuration"
+    );
 
     let task_state = state.clone();
     let session_id = id.clone();
     let task_variant = req.variant.clone();
-    let task_agent = req.agent.clone();
+    let task_agent = resolved_agent.as_ref().map(|agent| agent.name.clone());
     let task_model = model_id.clone();
     let task_provider = provider_id.clone();
+    let task_system_prompt = agent_system_prompt.clone();
+    let task_agent_params = agent_params.clone();
     tokio::spawn(async move {
         let mut session = {
             let sessions = task_state.sessions.lock().await;
@@ -1933,6 +2014,10 @@ async fn session_prompt(
             };
             session
         };
+        let normalized_directory = resolved_session_directory(&session.directory);
+        if session.directory != normalized_directory {
+            session.directory = normalized_directory;
+        }
         set_session_run_status(&task_state, &session_id, SessionRunStatus::Busy).await;
 
         // Safety guard: ensure status is always set to idle when this block
@@ -2074,7 +2159,18 @@ async fn session_prompt(
                             model_id: m.model_id.clone(),
                         }),
                         can_use_task: info.is_tool_allowed("task"),
+                        steps: info.max_steps,
                     })
+            }))
+        };
+
+        let ask_question_hook: Option<rocode_session::prompt::AskQuestionHook> = {
+            let state = task_state.clone();
+            Some(Arc::new(move |session_id, questions| {
+                let state = state.clone();
+                Box::pin(
+                    async move { request_question_answers(state, session_id, questions).await },
+                )
             }))
         };
 
@@ -2083,11 +2179,12 @@ async fn session_prompt(
                 input,
                 &mut session,
                 provider,
-                None,
+                task_system_prompt.clone(),
                 tool_defs,
-                rocode_session::AgentParams::default(),
+                task_agent_params.clone(),
                 Some(update_hook),
                 agent_lookup,
+                ask_question_hook,
             )
             .await
         {
@@ -4006,6 +4103,90 @@ pub struct QuestionInfo {
 
 static QUESTION_REQUESTS: Lazy<RwLock<HashMap<String, QuestionInfo>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+static QUESTION_WAITERS: Lazy<Mutex<HashMap<String, oneshot::Sender<QuestionReply>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug)]
+enum QuestionReply {
+    Answers(Vec<Vec<String>>),
+    Rejected,
+}
+
+fn normalize_question_options(questions: &[rocode_tool::QuestionDef]) -> Option<Vec<Vec<String>>> {
+    let options: Vec<Vec<String>> = questions
+        .iter()
+        .map(|q| {
+            q.options
+                .iter()
+                .map(|o| o.label.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if options.iter().all(|entry| entry.is_empty()) {
+        None
+    } else {
+        Some(options)
+    }
+}
+
+async fn request_question_answers(
+    state: Arc<ServerState>,
+    session_id: String,
+    questions: Vec<rocode_tool::QuestionDef>,
+) -> std::result::Result<Vec<Vec<String>>, rocode_tool::ToolError> {
+    if questions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let request_id = format!("question_{}", uuid::Uuid::new_v4().simple());
+    let question_texts = questions
+        .iter()
+        .map(|q| q.question.clone())
+        .collect::<Vec<_>>();
+    let question_options = normalize_question_options(&questions);
+    let question_info = QuestionInfo {
+        id: request_id.clone(),
+        session_id: session_id.clone(),
+        questions: question_texts,
+        options: question_options,
+    };
+
+    let (tx, rx) = oneshot::channel::<QuestionReply>();
+    QUESTION_REQUESTS
+        .write()
+        .await
+        .insert(request_id.clone(), question_info.clone());
+    QUESTION_WAITERS.lock().await.insert(request_id.clone(), tx);
+
+    state.broadcast(
+        &serde_json::json!({
+            "type": "question.created",
+            "requestID": request_id,
+            "sessionID": session_id,
+            "questions": questions,
+        })
+        .to_string(),
+    );
+
+    let wait_result = tokio::time::timeout(Duration::from_secs(300), rx).await;
+
+    // Best-effort cleanup; if a reply already consumed these entries this is a no-op.
+    QUESTION_REQUESTS.write().await.remove(&question_info.id);
+    QUESTION_WAITERS.lock().await.remove(&question_info.id);
+
+    match wait_result {
+        Ok(Ok(QuestionReply::Answers(answers))) => Ok(answers),
+        Ok(Ok(QuestionReply::Rejected)) => Err(rocode_tool::ToolError::QuestionRejected(
+            "User rejected question request".to_string(),
+        )),
+        Ok(Err(_)) => Err(rocode_tool::ToolError::ExecutionError(
+            "Question response channel closed".to_string(),
+        )),
+        Err(_) => Err(rocode_tool::ToolError::ExecutionError(
+            "Timed out waiting for question response".to_string(),
+        )),
+    }
+}
 
 async fn list_questions() -> Json<Vec<QuestionInfo>> {
     let pending = QUESTION_REQUESTS.read().await;
@@ -4030,6 +4211,10 @@ async fn reply_question(
         .ok_or_else(|| ApiError::NotFound(format!("Question request not found: {}", id)))?;
     drop(pending);
 
+    if let Some(waiter) = QUESTION_WAITERS.lock().await.remove(&id) {
+        let _ = waiter.send(QuestionReply::Answers(req.answers.clone()));
+    }
+
     state.broadcast(
         &serde_json::json!({
             "type": "question.replied",
@@ -4051,6 +4236,10 @@ async fn reject_question(
         .remove(&id)
         .ok_or_else(|| ApiError::NotFound(format!("Question request not found: {}", id)))?;
     drop(pending);
+
+    if let Some(waiter) = QUESTION_WAITERS.lock().await.remove(&id) {
+        let _ = waiter.send(QuestionReply::Rejected);
+    }
 
     state.broadcast(
         &serde_json::json!({

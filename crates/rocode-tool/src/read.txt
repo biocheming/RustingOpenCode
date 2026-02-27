@@ -1,7 +1,7 @@
 Read a file or directory from the local filesystem. If the path does not exist, an error is returned.
 
 Usage:
-- The filePath parameter should be an absolute path.
+- The filePath parameter can be absolute, or project-relative (resolved from the current session directory).
 - By default, this tool returns up to 2000 lines from the start of the file.
 - The offset parameter is the line number to start from (1-indexed).
 - To read later sections, call this tool again with a larger offset.

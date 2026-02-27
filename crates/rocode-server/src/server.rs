@@ -340,9 +340,7 @@ impl ServerState {
             serde_json::from_value(serde_json::to_value(&session)?)?;
         let messages = std::mem::take(&mut stored.messages);
 
-        session_repo
-            .flush_with_messages(&stored, &messages)
-            .await?;
+        session_repo.flush_with_messages(&stored, &messages).await?;
 
         Ok(())
     }

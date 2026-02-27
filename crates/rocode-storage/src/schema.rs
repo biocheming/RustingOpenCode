@@ -181,8 +181,7 @@ CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
 
 /// Add finish column to messages table for existing databases.
 /// New databases get it from CREATE TABLE; this handles upgrades.
-pub const ADD_MESSAGES_FINISH_COLUMN: &str =
-    "ALTER TABLE messages ADD COLUMN finish TEXT";
+pub const ADD_MESSAGES_FINISH_COLUMN: &str = "ALTER TABLE messages ADD COLUMN finish TEXT";
 
 /// All migration statements to run
 pub const ALL_MIGRATIONS: &[&str] = &[

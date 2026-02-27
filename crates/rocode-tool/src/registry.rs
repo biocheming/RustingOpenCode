@@ -141,6 +141,134 @@ fn recover_write_args_from_jsonish(input: &str) -> Option<serde_json::Value> {
     None
 }
 
+fn recover_bash_args_from_jsonish(input: &str) -> Option<serde_json::Value> {
+    fn normalize_single_escaped_quotes(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        let mut prev: Option<char> = None;
+
+        while let Some(ch) = chars.next() {
+            if ch == '\\' && matches!(chars.peek(), Some('"')) && prev != Some('\\') {
+                out.push('"');
+                chars.next();
+                prev = Some('"');
+                continue;
+            }
+            out.push(ch);
+            prev = Some(ch);
+        }
+        out
+    }
+
+    fn recover_once(input: &str) -> Option<serde_json::Value> {
+        let command = parse_jsonish_string_field(input, "command")
+            .or_else(|| parse_jsonish_string_field(input, "cmd"))?;
+        let description = parse_jsonish_string_field(input, "description")
+            .unwrap_or_else(|| "Execute shell command".to_string());
+        let mut obj = serde_json::Map::new();
+        obj.insert("command".to_string(), serde_json::Value::String(command));
+        obj.insert(
+            "description".to_string(),
+            serde_json::Value::String(description),
+        );
+        if let Some(workdir) = parse_jsonish_string_field(input, "workdir")
+            .or_else(|| parse_jsonish_string_field(input, "cwd"))
+        {
+            obj.insert("workdir".to_string(), serde_json::Value::String(workdir));
+        }
+        Some(serde_json::Value::Object(obj))
+    }
+
+    if let Some(recovered) = recover_once(input) {
+        return Some(recovered);
+    }
+    if let Ok(inner) = serde_json::from_str::<String>(input) {
+        if let Some(recovered) = recover_once(&inner) {
+            return Some(recovered);
+        }
+    }
+    if input.contains("\\\"") {
+        let de_escaped_quotes = normalize_single_escaped_quotes(input);
+        if let Some(recovered) = recover_once(&de_escaped_quotes) {
+            return Some(recovered);
+        }
+    }
+    None
+}
+
+pub fn normalize_tool_arguments(tool_id: &str, mut args: serde_json::Value) -> serde_json::Value {
+    // Normalize: if args is a JSON string that contains a valid object,
+    // parse it into an actual object. This happens when the stream assembler
+    // fails to parse tool call arguments during streaming and wraps the raw
+    // text as Value::String.
+    if let Some(s) = args.as_str().map(|s| s.to_owned()) {
+        if let Some(parsed @ serde_json::Value::Object(_)) =
+            rocode_util::json::try_parse_json_object_robust(&s)
+        {
+            tracing::info!(
+                tool = %tool_id,
+                "recovered tool arguments via robust JSON parser"
+            );
+            args = parsed;
+        } else {
+            if let Some(parsed) =
+                rocode_util::json::recover_tool_arguments_from_jsonish(tool_id, &s)
+            {
+                tracing::info!(
+                    tool = %tool_id,
+                    "recovered tool arguments from JSON-ish payload"
+                );
+                args = parsed;
+            } else if tool_id == "write" {
+                if let Some(parsed) = recover_write_args_from_jsonish(&s) {
+                    tracing::info!(
+                        tool = %tool_id,
+                        "recovered write arguments from JSON-ish payload"
+                    );
+                    args = parsed;
+                }
+            } else if tool_id == "bash" {
+                if let Some(parsed) = recover_bash_args_from_jsonish(&s) {
+                    tracing::info!(
+                        tool = %tool_id,
+                        "recovered bash arguments from JSON-ish payload"
+                    );
+                    args = parsed;
+                }
+            }
+            // If still a string, try key=value fallback.
+            if args.is_string() && !looks_like_jsonish_payload(&s) {
+                // Some models (e.g. Qwen via LiteLLM) may send arguments in
+                // non-JSON formats like "key=value" or "key: value". Try to
+                // construct a JSON object from simple key=value pairs.
+                let mut obj = serde_json::Map::new();
+                for line in s.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some((key, value)) = line.split_once('=') {
+                        let key = key.trim().to_string();
+                        let value = value.trim();
+                        // Try to parse value as JSON, otherwise treat as string
+                        let json_value = serde_json::from_str(value)
+                            .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+                        obj.insert(key, json_value);
+                    }
+                }
+                if !obj.is_empty() {
+                    tracing::info!(
+                        tool = %tool_id,
+                        "normalized non-JSON tool arguments from key=value format"
+                    );
+                    args = serde_json::Value::Object(obj);
+                }
+            }
+        }
+    }
+    args
+}
+
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
 }
@@ -250,61 +378,7 @@ impl ToolRegistry {
             }
         };
 
-        let mut args = args;
-
-        // Normalize: if args is a JSON string that contains a valid object,
-        // parse it into an actual object. This happens when the stream assembler
-        // fails to parse tool call arguments during streaming and wraps the raw
-        // text as Value::String.
-        if let Some(s) = args.as_str().map(|s| s.to_owned()) {
-            if let Some(parsed @ serde_json::Value::Object(_)) =
-                rocode_util::json::try_parse_json_object_robust(&s)
-            {
-                tracing::info!(
-                    tool = %tool_id,
-                    "recovered tool arguments via robust JSON parser"
-                );
-                args = parsed;
-            } else {
-                if tool_id == "write" {
-                    if let Some(parsed) = recover_write_args_from_jsonish(&s) {
-                        tracing::info!(
-                            tool = %tool_id,
-                            "recovered write arguments from JSON-ish payload"
-                        );
-                        args = parsed;
-                    }
-                }
-                // If still a string, try key=value fallback.
-                if args.is_string() && !looks_like_jsonish_payload(&s) {
-                    // Some models (e.g. Qwen via LiteLLM) may send arguments in
-                    // non-JSON formats like "key=value" or "key: value". Try to
-                    // construct a JSON object from simple key=value pairs.
-                    let mut obj = serde_json::Map::new();
-                    for line in s.lines() {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if let Some((key, value)) = line.split_once('=') {
-                            let key = key.trim().to_string();
-                            let value = value.trim();
-                            // Try to parse value as JSON, otherwise treat as string
-                            let json_value = serde_json::from_str(value)
-                                .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
-                            obj.insert(key, json_value);
-                        }
-                    }
-                    if !obj.is_empty() {
-                        tracing::info!(
-                            tool = %tool_id,
-                            "normalized non-JSON tool arguments from key=value format"
-                        );
-                        args = serde_json::Value::Object(obj);
-                    }
-                }
-            }
-        }
+        let mut args = normalize_tool_arguments(tool_id, args);
 
         // If args is still an empty object, log a warning for diagnostics.
         if args.is_object() && args.as_object().map_or(false, |o| o.is_empty()) {
@@ -324,7 +398,7 @@ impl ToolRegistry {
             .with_data("tool", serde_json::json!(tool_id))
             .with_data("args", args.clone());
         if let Some(call_id) = &ctx.call_id {
-            before_hook_ctx = before_hook_ctx.with_data("call_id", serde_json::json!(call_id));
+            before_hook_ctx = before_hook_ctx.with_data("callID", serde_json::json!(call_id));
         }
         let before_outputs = rocode_plugin::trigger_collect(before_hook_ctx).await;
         for output in before_outputs {
@@ -343,7 +417,11 @@ impl ToolRegistry {
                 error = %e,
                 args_type = %match &args {
                     serde_json::Value::Object(o) => format!("object(keys={})", o.keys().cloned().collect::<Vec<_>>().join(",")),
-                    serde_json::Value::String(s) => format!("string(len={},preview={})", s.len(), &s[..s.len().min(200)]),
+                    serde_json::Value::String(s) => format!(
+                        "string(len={},preview={})",
+                        s.len(),
+                        s.chars().take(200).collect::<String>()
+                    ),
                     serde_json::Value::Null => "null".to_string(),
                     serde_json::Value::Array(_) => "array".to_string(),
                     serde_json::Value::Bool(_) => "bool".to_string(),
@@ -367,7 +445,7 @@ impl ToolRegistry {
             .with_data("tool", serde_json::json!(tool_id))
             .with_data("args", args);
         if let Some(call_id) = &ctx.call_id {
-            hook_ctx = hook_ctx.with_data("call_id", serde_json::json!(call_id));
+            hook_ctx = hook_ctx.with_data("callID", serde_json::json!(call_id));
         }
 
         hook_ctx = match &result {
@@ -526,13 +604,15 @@ mod tests {
             _ctx: ToolContext,
         ) -> Result<ToolResult, ToolError> {
             *self.captured.lock().expect("lock should succeed") = Some(args.clone());
-            let file_path = args
+            let primary = args
                 .get("file_path")
                 .or_else(|| args.get("filePath"))
+                .or_else(|| args.get("command"))
+                .or_else(|| args.get("cmd"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            Ok(ToolResult::simple("ok", file_path))
+            Ok(ToolResult::simple("ok", primary))
         }
     }
 
@@ -686,5 +766,48 @@ mod tests {
             .expect("content should be string");
         assert!(content.contains("<div class="));
         assert!(content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn execute_recovers_bash_args_from_unterminated_jsonish_payload() {
+        let registry = ToolRegistry::new();
+        let captured = Arc::new(Mutex::new(None));
+        registry
+            .register(CaptureTool {
+                captured: captured.clone(),
+                id: "bash",
+            })
+            .await;
+
+        let malformed = serde_json::Value::String(
+            "{\"command\":\"cat > /tmp/f.html << 'EOF'\n<!doctype html>\n".to_string(),
+        );
+
+        let result = registry
+            .execute("bash", malformed, test_tool_context())
+            .await
+            .expect("tool should execute");
+
+        assert!(result.output.starts_with("cat > /tmp/f.html"));
+        let captured_args = captured
+            .lock()
+            .expect("lock should succeed")
+            .clone()
+            .expect("args should be captured");
+        assert_eq!(
+            captured_args["description"]
+                .as_str()
+                .expect("description should be set"),
+            "Execute shell command"
+        );
+    }
+
+    #[test]
+    fn normalize_tool_arguments_recovers_bash_jsonish_payload() {
+        let malformed = serde_json::Value::String("{\"command\":\"echo hello\nworld".to_string());
+        let normalized = normalize_tool_arguments("bash", malformed);
+        assert!(normalized.is_object());
+        assert_eq!(normalized["command"], "echo hello\nworld");
+        assert_eq!(normalized["description"], "Execute shell command");
     }
 }

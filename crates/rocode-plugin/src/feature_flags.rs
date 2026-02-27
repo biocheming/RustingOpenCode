@@ -38,6 +38,40 @@ pub fn set(flag: &str, enabled: bool) {
     }
 }
 
+/// All known flag names.
+const ALL_FLAGS: &[&str] = &[
+    "plugin_seq_hooks",
+    "plugin_timeout_self_heal",
+    "plugin_circuit_breaker",
+    "plugin_large_payload_file_ipc",
+];
+
+/// Initialize flags from environment variables.
+///
+/// For each flag, checks `ROCODE_<FLAG_NAME_UPPERCASED>` (e.g.
+/// `ROCODE_PLUGIN_SEQ_HOOKS=0` disables sequential hooks).
+/// Values `"0"`, `"false"`, `"off"` disable; anything else enables.
+/// Logs effective values at info level.
+pub fn init_from_env() {
+    for &flag in ALL_FLAGS {
+        let env_key = format!("ROCODE_{}", flag.to_uppercase());
+        if let Ok(val) = std::env::var(&env_key) {
+            let normalized = val.trim().to_ascii_lowercase();
+            let enabled = !matches!(normalized.as_str(), "0" | "false" | "off");
+            set(flag, enabled);
+            tracing::info!(flag = flag, enabled = enabled, env = %env_key, "[plugin-flags] override from env");
+        }
+    }
+    // Log effective state
+    for &flag in ALL_FLAGS {
+        tracing::info!(
+            flag = flag,
+            enabled = is_enabled(flag),
+            "[plugin-flags] effective"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +96,20 @@ mod tests {
         assert!(!is_enabled("plugin_seq_hooks"));
         set("plugin_seq_hooks", true);
         assert!(is_enabled("plugin_seq_hooks"));
+    }
+
+    #[test]
+    fn env_parsing_is_case_and_whitespace_insensitive() {
+        // Simulate what init_from_env does internally
+        for val in ["0", "false", "off", "FALSE", "False", " false ", " OFF "] {
+            let normalized = val.trim().to_ascii_lowercase();
+            let enabled = !matches!(normalized.as_str(), "0" | "false" | "off");
+            assert!(!enabled, "expected disabled for {:?}", val);
+        }
+        for val in ["1", "true", "yes", "anything"] {
+            let normalized = val.trim().to_ascii_lowercase();
+            let enabled = !matches!(normalized.as_str(), "0" | "false" | "off");
+            assert!(enabled, "expected enabled for {:?}", val);
+        }
     }
 }

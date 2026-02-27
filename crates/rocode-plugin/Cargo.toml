@@ -1,6 +1,6 @@
 [package]
 name = "rocode-plugin"
-version = "2026.2.26"
+version = "2026.2.27"
 edition = "2021"
 
 [dependencies]
@@ -15,4 +15,3 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 which = "7"
 dirs = "6"
-futures = "0.3"

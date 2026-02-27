@@ -179,7 +179,10 @@ impl Tool for GrepTool {
                     if let Ok(line) = line_result {
                         if regex.is_match(&line) {
                             let truncated_line = if line.len() > MAX_LINE_LENGTH {
-                                format!("{}...", &line[..MAX_LINE_LENGTH])
+                                format!(
+                                    "{}...",
+                                    line.chars().take(MAX_LINE_LENGTH).collect::<String>()
+                                )
                             } else {
                                 line.clone()
                             };

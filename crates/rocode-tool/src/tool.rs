@@ -205,6 +205,7 @@ pub struct TaskAgentInfo {
     pub name: String,
     pub model: Option<TaskAgentModel>,
     pub can_use_task: bool,
+    pub steps: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

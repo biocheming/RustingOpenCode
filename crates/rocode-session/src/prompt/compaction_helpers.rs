@@ -38,7 +38,7 @@ pub fn trigger_compaction(session: &mut Session, messages: &[SessionMessage]) ->
 
     let summary = format!(
         "[Context Compaction Triggered]\nRecent messages summarized:\n{}",
-        &text_content[..text_content.len().min(500)]
+        text_content.chars().take(500).collect::<String>()
     );
 
     // Persist the compaction summary as a Compaction part on a new assistant message.

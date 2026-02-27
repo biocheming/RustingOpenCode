@@ -211,8 +211,8 @@ pub fn max_steps_for_agent(agent_steps: Option<u32>) -> u32 {
 pub fn generate_session_title(first_user_message: &str) -> String {
     let first_line = first_user_message.lines().next().unwrap_or("").trim();
 
-    if first_line.len() > 100 {
-        format!("{}...", &first_line[..97])
+    if first_line.chars().count() > 100 {
+        format!("{}...", first_line.chars().take(97).collect::<String>())
     } else if first_line.is_empty() {
         "New Session".to_string()
     } else {
@@ -280,8 +280,8 @@ pub async fn generate_session_title_llm(
 
             if cleaned.is_empty() {
                 fallback
-            } else if cleaned.len() > 100 {
-                format!("{}...", &cleaned[..97])
+            } else if cleaned.chars().count() > 100 {
+                format!("{}...", cleaned.chars().take(97).collect::<String>())
             } else {
                 cleaned
             }

@@ -606,6 +606,7 @@ impl AgentExecutor {
                     model_id: m.model_id.clone(),
                 }),
                 can_use_task: info.is_tool_allowed("task"),
+                steps: info.max_steps,
             }))
         });
 

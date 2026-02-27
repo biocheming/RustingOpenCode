@@ -62,12 +62,45 @@ fn bind_session_upsert<'q>(
         .bind(&session.title)
         .bind(&session.version)
         .bind(session.share.as_ref().map(|s| s.url.as_str()))
-        .bind(session.summary.as_ref().map(|s| s.additions as i64).unwrap_or(0))
-        .bind(session.summary.as_ref().map(|s| s.deletions as i64).unwrap_or(0))
-        .bind(session.summary.as_ref().map(|s| s.files as i64).unwrap_or(0))
-        .bind(session.summary.as_ref().and_then(|s| serde_json::to_string(&s.diffs).ok()))
-        .bind(session.revert.as_ref().and_then(|r| serde_json::to_string(r).ok()))
-        .bind(session.permission.as_ref().and_then(|p| serde_json::to_string(p).ok()))
+        .bind(
+            session
+                .summary
+                .as_ref()
+                .map(|s| s.additions as i64)
+                .unwrap_or(0),
+        )
+        .bind(
+            session
+                .summary
+                .as_ref()
+                .map(|s| s.deletions as i64)
+                .unwrap_or(0),
+        )
+        .bind(
+            session
+                .summary
+                .as_ref()
+                .map(|s| s.files as i64)
+                .unwrap_or(0),
+        )
+        .bind(
+            session
+                .summary
+                .as_ref()
+                .and_then(|s| serde_json::to_string(&s.diffs).ok()),
+        )
+        .bind(
+            session
+                .revert
+                .as_ref()
+                .and_then(|r| serde_json::to_string(r).ok()),
+        )
+        .bind(
+            session
+                .permission
+                .as_ref()
+                .and_then(|p| serde_json::to_string(p).ok()),
+        )
         .bind(usage.map(|u| u.input_tokens as i64).unwrap_or(0))
         .bind(usage.map(|u| u.output_tokens as i64).unwrap_or(0))
         .bind(usage.map(|u| u.reasoning_tokens as i64).unwrap_or(0))
@@ -491,8 +524,7 @@ impl SessionRepository {
                 .await
                 .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
         } else if keep_ids.len() <= 998 {
-            let placeholders: String =
-                keep_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let placeholders: String = keep_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "DELETE FROM messages WHERE session_id = ? AND id NOT IN ({})",
                 placeholders
@@ -1182,7 +1214,10 @@ mod tests {
             make_message("m2", "s1", MessageRole::Assistant),
         ];
 
-        session_repo.flush_with_messages(&session, &msgs).await.unwrap();
+        session_repo
+            .flush_with_messages(&session, &msgs)
+            .await
+            .unwrap();
 
         let loaded = session_repo.get("s1").await.unwrap();
         assert!(loaded.is_some());
@@ -1207,12 +1242,18 @@ mod tests {
             make_message("m3", "s1", MessageRole::User),
         ];
 
-        session_repo.flush_with_messages(&session, &msgs).await.unwrap();
+        session_repo
+            .flush_with_messages(&session, &msgs)
+            .await
+            .unwrap();
         assert_eq!(message_repo.list_for_session("s1").await.unwrap().len(), 3);
 
         // Simulate revert: flush with only m1
         let msgs_after_revert = vec![make_message("m1", "s1", MessageRole::User)];
-        session_repo.flush_with_messages(&session, &msgs_after_revert).await.unwrap();
+        session_repo
+            .flush_with_messages(&session, &msgs_after_revert)
+            .await
+            .unwrap();
 
         let remaining = message_repo.list_for_session("s1").await.unwrap();
         assert_eq!(remaining.len(), 1);
@@ -1235,12 +1276,21 @@ mod tests {
             .map(|i| make_message(&format!("m{}", i), "s1", MessageRole::User))
             .collect();
 
-        session_repo.flush_with_messages(&session, &msgs).await.unwrap();
-        assert_eq!(message_repo.list_for_session("s1").await.unwrap().len(), 1100);
+        session_repo
+            .flush_with_messages(&session, &msgs)
+            .await
+            .unwrap();
+        assert_eq!(
+            message_repo.list_for_session("s1").await.unwrap().len(),
+            1100
+        );
 
         // Remove last 100
         msgs.truncate(1000);
-        session_repo.flush_with_messages(&session, &msgs).await.unwrap();
+        session_repo
+            .flush_with_messages(&session, &msgs)
+            .await
+            .unwrap();
 
         let remaining = message_repo.list_for_session("s1").await.unwrap();
         assert_eq!(remaining.len(), 1000);
@@ -1279,7 +1329,10 @@ mod tests {
             make_message("m1", "s1", MessageRole::User),
             make_message("m2", "s1", MessageRole::Assistant),
         ];
-        session_repo.flush_with_messages(&session, &msgs).await.unwrap();
+        session_repo
+            .flush_with_messages(&session, &msgs)
+            .await
+            .unwrap();
 
         // Sabotage: rename messages table so message upsert fails inside the tx
         sqlx::query("ALTER TABLE messages RENAME TO messages_backup")
@@ -1292,7 +1345,10 @@ mod tests {
         session.title = "v2".to_string();
         let new_msgs = vec![make_message("m3", "s1", MessageRole::User)];
         let result = session_repo.flush_with_messages(&session, &new_msgs).await;
-        assert!(result.is_err(), "flush should fail when messages table is missing");
+        assert!(
+            result.is_err(),
+            "flush should fail when messages table is missing"
+        );
 
         // Restore messages table
         sqlx::query("ALTER TABLE messages_backup RENAME TO messages")
@@ -1302,11 +1358,18 @@ mod tests {
 
         // Verify rollback: session title must still be "v1"
         let loaded = session_repo.get("s1").await.unwrap().unwrap();
-        assert_eq!(loaded.title, "v1", "session upsert should have been rolled back");
+        assert_eq!(
+            loaded.title, "v1",
+            "session upsert should have been rolled back"
+        );
 
         // Verify original messages are intact
         let loaded_msgs = message_repo.list_for_session("s1").await.unwrap();
-        assert_eq!(loaded_msgs.len(), 2, "original messages should survive the failed tx");
+        assert_eq!(
+            loaded_msgs.len(),
+            2,
+            "original messages should survive the failed tx"
+        );
         assert_eq!(loaded_msgs[0].id, "m1");
         assert_eq!(loaded_msgs[1].id, "m2");
     }

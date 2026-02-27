@@ -10,6 +10,7 @@ pub mod invalid;
 pub mod ls;
 pub mod lsp_tool;
 pub mod multiedit;
+pub mod path_guard;
 pub mod plan;
 pub mod question;
 pub mod read;

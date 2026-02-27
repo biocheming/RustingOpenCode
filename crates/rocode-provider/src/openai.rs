@@ -3,8 +3,9 @@ use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing;
 
@@ -115,8 +116,7 @@ impl RawChatResponse {
                         let func = tc.function.as_ref();
                         let name = func.and_then(|f| f.name.as_deref()).unwrap_or("");
                         let args_str = func.and_then(|f| f.arguments.as_deref()).unwrap_or("{}");
-                        let input: serde_json::Value =
-                            serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                        let input = parse_tool_call_input(name, args_str);
                         let id = tc
                             .id
                             .clone()
@@ -177,6 +177,111 @@ impl RawChatResponse {
     }
 }
 
+fn parse_tool_call_input(tool_name: &str, args_str: &str) -> Value {
+    let strict = serde_json::from_str::<Value>(args_str);
+    if let Ok(parsed @ Value::Object(_)) = &strict {
+        return parsed.clone();
+    }
+
+    if let Some(parsed_object) = rocode_util::json::try_parse_json_object_robust(args_str) {
+        increment_tool_args_recovered(tool_name, "parse", args_str.len());
+        return parsed_object;
+    }
+
+    if let Some(recovered) =
+        rocode_util::json::recover_tool_arguments_from_jsonish(tool_name, args_str)
+    {
+        tracing::info!(
+            tool = tool_name,
+            args_len = args_str.len(),
+            "recovered malformed tool call arguments from JSON-ish payload"
+        );
+        increment_tool_args_recovered(tool_name, "parse", args_str.len());
+        return recovered;
+    }
+
+    match strict {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                args_len = args_str.len(),
+                "failed to parse OpenAI tool call arguments as JSON, preserving raw string"
+            );
+            Value::String(args_str.to_string())
+        }
+    }
+}
+
+fn normalize_tool_call_arguments_for_request(
+    tool_name: &str,
+    tool_call_id: &str,
+    input: &Value,
+) -> Option<String> {
+    match input {
+        Value::Object(_) => Some(input.to_string()),
+        Value::String(raw) => {
+            if let Some(parsed_object) = rocode_util::json::try_parse_json_object_robust(raw) {
+                increment_tool_args_recovered(tool_name, "history", raw.len());
+                return Some(parsed_object.to_string());
+            }
+            if let Some(recovered) =
+                rocode_util::json::recover_tool_arguments_from_jsonish(tool_name, raw)
+            {
+                tracing::info!(
+                    tool = tool_name,
+                    tool_call_id = tool_call_id,
+                    raw_len = raw.len(),
+                    "recovered historical tool call input from JSON-ish payload"
+                );
+                increment_tool_args_recovered(tool_name, "history", raw.len());
+                return Some(recovered.to_string());
+            }
+            let sentinel = serde_json::json!({
+                "_rocode_unrecoverable_tool_args": true,
+                "tool": tool_name,
+                "tool_call_id": tool_call_id,
+                "raw_len": raw.len(),
+                "raw_preview": raw.chars().take(240).collect::<String>(),
+            });
+            tracing::debug!(
+                tool = tool_name,
+                tool_call_id = tool_call_id,
+                raw_len = raw.len(),
+                "coercing unrecoverable historical tool_call input to sentinel object"
+            );
+            increment_tool_args_sentinel(tool_name, "history", raw.len());
+            Some(sentinel.to_string())
+        }
+        other => {
+            let input_type = match other {
+                Value::Null => "null",
+                Value::Bool(_) => "bool",
+                Value::Number(_) => "number",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                Value::String(_) => "string",
+            };
+            tracing::debug!(
+                tool = tool_name,
+                tool_call_id = tool_call_id,
+                input_type = input_type,
+                "coercing non-object historical tool_call input to sentinel object"
+            );
+            increment_tool_args_sentinel(tool_name, "history", 0);
+            Some(
+                serde_json::json!({
+                    "_rocode_unrecoverable_tool_args": true,
+                    "tool": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "input_type": input_type,
+                })
+                .to_string(),
+            )
+        }
+    }
+}
+
 use crate::custom_fetch::get_custom_fetch_proxy;
 use crate::responses::{
     FinishReason, GenerateOptions, OpenAIResponsesConfig, OpenAIResponsesLanguageModel,
@@ -189,6 +294,46 @@ use crate::{
 };
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
+static TOOL_ARGS_RECOVERED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TOOL_ARGS_SENTINEL_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn increment_tool_args_recovered(tool_name: &str, phase: &'static str, raw_len: usize) {
+    let total = TOOL_ARGS_RECOVERED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::debug!(
+        metric = "tool_args_recovered_total",
+        total,
+        tool = tool_name,
+        phase,
+        raw_len,
+        "tool arguments recovered"
+    );
+    if total % 25 == 0 {
+        tracing::info!(
+            metric = "tool_args_recovered_total",
+            total,
+            "tool arguments recovered aggregate"
+        );
+    }
+}
+
+fn increment_tool_args_sentinel(tool_name: &str, phase: &'static str, raw_len: usize) {
+    let total = TOOL_ARGS_SENTINEL_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::debug!(
+        metric = "tool_args_sentinel_total",
+        total,
+        tool = tool_name,
+        phase,
+        raw_len,
+        "tool arguments replaced with sentinel"
+    );
+    if total % 25 == 0 {
+        tracing::info!(
+            metric = "tool_args_sentinel_total",
+            total,
+            "tool arguments sentinel aggregate"
+        );
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OpenAIConfig {
@@ -541,6 +686,7 @@ impl OpenAIProvider {
 
     fn to_openai_compatible_chat_messages(messages: &[Message]) -> Vec<Value> {
         let mut converted = Vec::new();
+        let mut assistant_tool_call_ids: HashSet<String> = HashSet::new();
 
         for message in messages {
             match message.role {
@@ -557,10 +703,16 @@ impl OpenAIProvider {
                     }));
                 }
                 Role::Assistant => {
-                    converted.push(Self::assistant_message_to_openai(&message.content));
+                    let (assistant_msg, emitted_tool_calls) =
+                        Self::assistant_message_to_openai(&message.content);
+                    assistant_tool_call_ids.extend(emitted_tool_calls);
+                    converted.push(assistant_msg);
                 }
                 Role::Tool => {
-                    converted.extend(Self::tool_messages_to_openai(&message.content));
+                    converted.extend(Self::tool_messages_to_openai(
+                        &message.content,
+                        &assistant_tool_call_ids,
+                    ));
                 }
             }
         }
@@ -614,12 +766,15 @@ impl OpenAIProvider {
         }
     }
 
-    fn assistant_message_to_openai(content: &crate::Content) -> Value {
+    fn assistant_message_to_openai(content: &crate::Content) -> (Value, Vec<String>) {
         match content {
-            crate::Content::Text(text) => json!({
-                "role": "assistant",
-                "content": text,
-            }),
+            crate::Content::Text(text) => (
+                json!({
+                    "role": "assistant",
+                    "content": text,
+                }),
+                Vec::new(),
+            ),
             crate::Content::Parts(parts) => {
                 let mut text = String::new();
                 let mut tool_calls = Vec::new();
@@ -633,16 +788,20 @@ impl OpenAIProvider {
                         }
                         "tool_use" => {
                             if let Some(tool_use) = &part.tool_use {
-                                let args = serde_json::to_string(&tool_use.input)
-                                    .unwrap_or_else(|_| "{}".to_string());
-                                tool_calls.push(json!({
-                                    "id": tool_use.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_use.name,
-                                        "arguments": args,
-                                    }
-                                }));
+                                if let Some(args) = normalize_tool_call_arguments_for_request(
+                                    &tool_use.name,
+                                    &tool_use.id,
+                                    &tool_use.input,
+                                ) {
+                                    tool_calls.push(json!({
+                                        "id": tool_use.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_use.name,
+                                            "arguments": args,
+                                        }
+                                    }));
+                                }
                             }
                         }
                         _ => {
@@ -668,12 +827,27 @@ impl OpenAIProvider {
                     );
                     message.insert("tool_calls".to_string(), Value::Array(tool_calls));
                 }
-                Value::Object(message)
+                let ids = message
+                    .get("tool_calls")
+                    .and_then(|value| value.as_array())
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .filter_map(|call| call.get("id").and_then(Value::as_str))
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                (Value::Object(message), ids)
             }
         }
     }
 
-    fn tool_messages_to_openai(content: &crate::Content) -> Vec<Value> {
+    fn tool_messages_to_openai(
+        content: &crate::Content,
+        assistant_tool_call_ids: &HashSet<String>,
+    ) -> Vec<Value> {
         match content {
             crate::Content::Text(text) => {
                 if text.is_empty() {
@@ -689,6 +863,13 @@ impl OpenAIProvider {
                 let mut messages = Vec::new();
                 for part in parts {
                     if let Some(tool_result) = &part.tool_result {
+                        if !assistant_tool_call_ids.contains(&tool_result.tool_use_id) {
+                            tracing::warn!(
+                                tool_call_id = %tool_result.tool_use_id,
+                                "dropping orphan historical tool message without matching assistant tool_call"
+                            );
+                            continue;
+                        }
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_result.tool_use_id,
@@ -979,8 +1160,8 @@ impl OpenAIProvider {
             Self::reassemble_sse_chunks(&body)?
         } else {
             serde_json::from_str(&body).map_err(|e| {
-                let preview = if body.len() > 500 {
-                    format!("{}...", &body[..500])
+                let preview = if body.chars().count() > 500 {
+                    format!("{}...", body.chars().take(500).collect::<String>())
                 } else {
                     body.clone()
                 };
@@ -1512,5 +1693,265 @@ mod tests {
         assert_eq!(converted[1]["role"], "tool");
         assert_eq!(converted[1]["tool_call_id"], "call_1");
         assert_eq!(converted[1]["content"], "ok");
+    }
+
+    #[test]
+    fn keeps_tool_message_when_assistant_tool_call_is_unrecoverable_via_sentinel() {
+        let assistant = Message {
+            role: Role::Assistant,
+            content: crate::Content::Parts(vec![
+                crate::ContentPart {
+                    content_type: "text".to_string(),
+                    text: Some("Attempting tool call".to_string()),
+                    ..Default::default()
+                },
+                crate::ContentPart {
+                    content_type: "tool_use".to_string(),
+                    tool_use: Some(crate::ToolUse {
+                        id: "call_bad".to_string(),
+                        name: "write".to_string(),
+                        input: Value::String("not-json".to_string()),
+                    }),
+                    ..Default::default()
+                },
+            ]),
+            cache_control: None,
+            provider_options: None,
+        };
+
+        let tool_result = Message {
+            role: Role::Tool,
+            content: crate::Content::Parts(vec![crate::ContentPart {
+                content_type: "tool_result".to_string(),
+                tool_result: Some(crate::ToolResult {
+                    tool_use_id: "call_bad".to_string(),
+                    content: "ok".to_string(),
+                    is_error: Some(false),
+                }),
+                ..Default::default()
+            }]),
+            cache_control: None,
+            provider_options: None,
+        };
+
+        let converted =
+            OpenAIProvider::to_openai_compatible_chat_messages(&[assistant, tool_result]);
+        assert_eq!(
+            converted.len(),
+            2,
+            "unrecoverable args should be coerced to sentinel object to keep tool/result pair"
+        );
+        assert_eq!(converted[0]["role"], "assistant");
+        assert_eq!(converted[1]["role"], "tool");
+    }
+
+    #[test]
+    fn raw_chat_response_parses_valid_tool_arguments_as_object() {
+        let raw = RawChatResponse {
+            id: Some("resp_1".to_string()),
+            model: Some("test-model".to_string()),
+            choices: vec![RawChoice {
+                index: Some(0),
+                message: Some(RawMessage {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                    tool_calls: Some(vec![RawToolCall {
+                        id: Some("call_1".to_string()),
+                        function: Some(RawFunction {
+                            name: Some("write".to_string()),
+                            arguments: Some(
+                                r#"{"file_path":"t2.html","content":"line1\nline2"}"#.to_string(),
+                            ),
+                        }),
+                    }]),
+                    _reasoning_text: None,
+                }),
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+        };
+
+        let chat = raw.into_chat_response();
+        let choice = &chat.choices[0];
+        let crate::Content::Parts(parts) = &choice.message.content else {
+            panic!("expected parts content");
+        };
+        let input = parts[0]
+            .tool_use
+            .as_ref()
+            .expect("missing tool_use")
+            .input
+            .clone();
+        assert!(input.is_object(), "valid JSON args should remain an object");
+        assert_eq!(input["file_path"], "t2.html");
+    }
+
+    #[test]
+    fn raw_chat_response_recovers_truncated_write_arguments_into_object() {
+        let truncated_json = "{\"file_path\":\"t2.html\",\"content\":\"line1";
+        let raw = RawChatResponse {
+            id: Some("resp_2".to_string()),
+            model: Some("test-model".to_string()),
+            choices: vec![RawChoice {
+                index: Some(0),
+                message: Some(RawMessage {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                    tool_calls: Some(vec![RawToolCall {
+                        id: Some("call_1".to_string()),
+                        function: Some(RawFunction {
+                            name: Some("write".to_string()),
+                            arguments: Some(truncated_json.to_string()),
+                        }),
+                    }]),
+                    _reasoning_text: None,
+                }),
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+        };
+
+        let chat = raw.into_chat_response();
+        let choice = &chat.choices[0];
+        let crate::Content::Parts(parts) = &choice.message.content else {
+            panic!("expected parts content");
+        };
+        let input = parts[0]
+            .tool_use
+            .as_ref()
+            .expect("missing tool_use")
+            .input
+            .clone();
+        assert!(
+            input.is_object(),
+            "truncated write arguments should be recovered into object"
+        );
+        assert_eq!(input["file_path"], "t2.html");
+        assert_eq!(input["content"], "line1");
+    }
+
+    #[test]
+    fn raw_chat_response_preserves_invalid_unknown_tool_arguments_as_string() {
+        let truncated_json = "{\"foo\":\"bar";
+        let raw = RawChatResponse {
+            id: Some("resp_2b".to_string()),
+            model: Some("test-model".to_string()),
+            choices: vec![RawChoice {
+                index: Some(0),
+                message: Some(RawMessage {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                    tool_calls: Some(vec![RawToolCall {
+                        id: Some("call_1".to_string()),
+                        function: Some(RawFunction {
+                            name: Some("unknown_tool".to_string()),
+                            arguments: Some(truncated_json.to_string()),
+                        }),
+                    }]),
+                    _reasoning_text: None,
+                }),
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+        };
+
+        let chat = raw.into_chat_response();
+        let choice = &chat.choices[0];
+        let crate::Content::Parts(parts) = &choice.message.content else {
+            panic!("expected parts content");
+        };
+        let input = parts[0]
+            .tool_use
+            .as_ref()
+            .expect("missing tool_use")
+            .input
+            .clone();
+        assert!(input.is_string(), "unknown tool should preserve raw string");
+        assert_eq!(
+            input.as_str().expect("expected string args"),
+            truncated_json
+        );
+    }
+
+    #[test]
+    fn raw_chat_response_recovers_literal_control_characters_into_object() {
+        let raw = RawChatResponse {
+            id: Some("resp_3".to_string()),
+            model: Some("test-model".to_string()),
+            choices: vec![RawChoice {
+                index: Some(0),
+                message: Some(RawMessage {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                    tool_calls: Some(vec![RawToolCall {
+                        id: Some("call_1".to_string()),
+                        function: Some(RawFunction {
+                            name: Some("write".to_string()),
+                            arguments: Some(
+                                "{\"file_path\":\"t2.html\",\"content\":\"line1\nline2\"}"
+                                    .to_string(),
+                            ),
+                        }),
+                    }]),
+                    _reasoning_text: None,
+                }),
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+        };
+
+        let chat = raw.into_chat_response();
+        let choice = &chat.choices[0];
+        let crate::Content::Parts(parts) = &choice.message.content else {
+            panic!("expected parts content");
+        };
+        let input = parts[0]
+            .tool_use
+            .as_ref()
+            .expect("missing tool_use")
+            .input
+            .clone();
+        assert!(
+            input.is_object(),
+            "literal control characters should be recovered into JSON object"
+        );
+        assert_eq!(input["file_path"], "t2.html");
+    }
+
+    #[test]
+    fn normalize_tool_call_arguments_recovers_json_object_from_raw_string() {
+        let input = Value::String("{\"file_path\":\"t2.html\",\"content\":\"ok\"}".to_string());
+        let normalized =
+            normalize_tool_call_arguments_for_request("write", "call_1", &input).unwrap();
+        let parsed: Value =
+            serde_json::from_str(&normalized).expect("normalized must be valid JSON");
+        assert!(
+            parsed.is_object(),
+            "normalized args should be a JSON object"
+        );
+        assert_eq!(parsed["file_path"], "t2.html");
+    }
+
+    #[test]
+    fn normalize_tool_call_arguments_coerces_unrecoverable_non_json_string_to_sentinel() {
+        let input = Value::String("not-json".to_string());
+        let normalized = normalize_tool_call_arguments_for_request("write", "call_1", &input);
+        let parsed: Value = serde_json::from_str(&normalized.expect("sentinel should be produced"))
+            .expect("normalized sentinel must be valid JSON");
+        assert_eq!(parsed["tool"], "write");
+        assert_eq!(parsed["tool_call_id"], "call_1");
+        assert_eq!(parsed["_rocode_unrecoverable_tool_args"], true);
+    }
+
+    #[test]
+    fn parse_tool_call_input_recovers_truncated_write_jsonish_payload() {
+        let truncated = "{\"file_path\":\"t2.html\",\"content\":\"<html><body>hello";
+        let parsed = parse_tool_call_input("write", truncated);
+        assert!(
+            parsed.is_object(),
+            "truncated write payload should be recovered"
+        );
+        assert_eq!(parsed["file_path"], "t2.html");
+        assert_eq!(parsed["content"], "<html><body>hello");
     }
 }

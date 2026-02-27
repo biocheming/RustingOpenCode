@@ -301,6 +301,31 @@ impl Prompt {
         };
 
         frame.render_widget(paragraph, chunks[0]);
+        if self.focused {
+            let content_origin_x = chunks[0]
+                .x
+                .saturating_add(1)
+                .saturating_add(PROMPT_BLOCK_PAD_LEFT);
+            let content_origin_y = chunks[0].y.saturating_add(PROMPT_BLOCK_PAD_TOP);
+            let input_width = usize::from(
+                chunks[0]
+                    .width
+                    .saturating_sub(1)
+                    .saturating_sub(PROMPT_BLOCK_PAD_LEFT)
+                    .saturating_sub(PROMPT_BLOCK_PAD_RIGHT),
+            )
+            .max(1);
+            let visible_rows = usize::from(content_lines.max(1));
+            let (cursor_row, cursor_col) =
+                self.cursor_visual_offset(input_width, visible_rows.saturating_sub(1));
+            let cursor_x = content_origin_x
+                .saturating_add(cursor_col as u16)
+                .min(chunks[0].right().saturating_sub(1));
+            let cursor_y = content_origin_y
+                .saturating_add(cursor_row as u16)
+                .min(chunks[0].bottom().saturating_sub(1));
+            frame.set_cursor(cursor_x, cursor_y);
+        }
 
         let mut info_parts = vec![
             Span::styled(
@@ -984,6 +1009,30 @@ impl Prompt {
             .min(PROMPT_MAX_INPUT_LINES)
     }
 
+    fn cursor_visual_offset(&self, width: usize, max_row: usize) -> (usize, usize) {
+        let mut row = 0usize;
+        let mut col = 0usize;
+        let safe_cursor = self.cursor_position.min(self.input.len());
+        let prefix = &self.input[..safe_cursor];
+
+        for ch in prefix.chars() {
+            if ch == '\n' {
+                row = row.saturating_add(1);
+                col = 0;
+                continue;
+            }
+
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if col > 0 && col + ch_width > width {
+                row = row.saturating_add(1);
+                col = 0;
+            }
+            col = col.saturating_add(ch_width);
+        }
+
+        (row.min(max_row), col.min(width.saturating_sub(1)))
+    }
+
     fn render_status_line(&self, theme: &Theme) -> Line<'static> {
         if let Some(status) = self.current_session_status() {
             return self.status_line_for_session(status, theme);
@@ -998,6 +1047,14 @@ impl Prompt {
         };
         let session_ctx = self.context.session.read();
         Some(session_ctx.status(&session_id).clone())
+    }
+
+    fn current_session_queue_count(&self) -> usize {
+        let session_id = match self.context.current_route() {
+            crate::router::Route::Session { session_id } => session_id,
+            _ => return 0,
+        };
+        self.context.queued_prompts_for_session(&session_id)
     }
 
     fn status_line_for_session(&self, status: SessionStatus, theme: &Theme) -> Line<'static> {
@@ -1033,6 +1090,14 @@ impl Prompt {
                     Span::styled("thinking", Style::default().fg(theme.text_muted)),
                     Span::raw("  "),
                 ];
+                let queued = self.current_session_queue_count();
+                if queued > 0 {
+                    spans.push(Span::styled(
+                        format!("queued {}", queued),
+                        Style::default().fg(theme.warning),
+                    ));
+                    spans.push(Span::raw("  "));
+                }
                 if self.interrupt_confirmation_active() {
                     spans.push(Span::styled(interrupt, Style::default().fg(theme.warning)));
                     spans.push(Span::styled(

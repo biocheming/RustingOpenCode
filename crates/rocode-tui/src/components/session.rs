@@ -1550,6 +1550,7 @@ mod tests {
             completed_at: None,
             cost: 0.0,
             tokens: TokenUsage::default(),
+            metadata: None,
             parts,
         }
     }

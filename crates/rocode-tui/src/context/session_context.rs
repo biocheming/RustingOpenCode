@@ -31,6 +31,7 @@ pub struct Message {
     pub completed_at: Option<DateTime<Utc>>,
     pub cost: f64,
     pub tokens: TokenUsage,
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
     pub parts: Vec<MessagePart>,
 }
 

@@ -65,6 +65,9 @@ impl PluginLoader {
     /// Create a new loader. Detects the JS runtime and writes the host script
     /// to `~/.cache/opencode/plugin-host.ts`.
     pub fn new() -> Result<Self, PluginLoaderError> {
+        // Initialize feature flags from env before anything else
+        crate::feature_flags::init_from_env();
+
         let runtime = detect_runtime().ok_or(PluginLoaderError::NoRuntime)?;
 
         let cache_dir = dirs::cache_dir()
@@ -74,6 +77,42 @@ impl PluginLoader {
 
         let host_script_path = cache_dir.join("plugin-host.ts");
         std::fs::write(&host_script_path, HOST_SCRIPT)?;
+
+        // Clean up stale IPC temp files.
+        // 1. Clean own PID namespace (leftover from previous run with same PID).
+        let ipc_dir = super::client::ipc_temp_dir();
+        if ipc_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&ipc_dir) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        // 2. Prune orphaned PID directories older than 1 hour (crash leftovers).
+        let ipc_parent = std::env::temp_dir().join("rocode-plugin-ipc");
+        if ipc_parent.exists() {
+            let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            if let Ok(entries) = std::fs::read_dir(&ipc_parent) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    // Skip our own PID dir (already handled above)
+                    if path == ipc_dir {
+                        continue;
+                    }
+                    let stale = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .map(|t| t < cutoff)
+                        .unwrap_or(false);
+                    if stale {
+                        let _ = std::fs::remove_dir_all(&path);
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             clients: RwLock::new(Vec::new()),
@@ -336,9 +375,7 @@ impl PluginLoader {
                             let mut map = breakers.lock().await;
                             let cb = map
                                 .entry(hook_name_owned.clone())
-                                .or_insert_with(|| {
-                                    CircuitBreaker::new(3, Duration::from_secs(60))
-                                });
+                                .or_insert_with(|| CircuitBreaker::new(3, Duration::from_secs(60)));
                             if cb.is_tripped() {
                                 tracing::debug!(
                                     plugin = plugin_name.as_str(),
@@ -367,9 +404,8 @@ impl PluginLoader {
                             Err(ref e) if matches!(e, PluginSubprocessError::Timeout) => {
                                 if crate::feature_flags::is_enabled("plugin_circuit_breaker") {
                                     let mut map = breakers.lock().await;
-                                    let cb = map
-                                        .entry(hook_name_owned.clone())
-                                        .or_insert_with(|| {
+                                    let cb =
+                                        map.entry(hook_name_owned.clone()).or_insert_with(|| {
                                             CircuitBreaker::new(3, Duration::from_secs(60))
                                         });
                                     cb.record_failure();

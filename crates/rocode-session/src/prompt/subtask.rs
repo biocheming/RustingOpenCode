@@ -1,9 +1,26 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use rocode_provider::{ChatRequest, Content, Message, Provider, ToolDefinition};
+use anyhow::anyhow;
+use rocode_provider::{
+    ChatRequest, Content, ContentPart, Message, Provider, Role, ToolDefinition,
+    ToolResult as ProviderToolResult,
+};
+use rocode_tool::{ToolContext, ToolError};
 
-use super::{AgentParams, ModelRef};
+use super::{AgentParams, AskQuestionHook, ModelRef};
+
+const TASK_STATUS_COMPLETED: &str = "completed";
+const TASK_NO_TEXT_OUTPUT_MESSAGE: &str =
+    "Task completed successfully. No textual output was returned by subagent.";
+const MAX_STEPS_SUMMARY_PROMPT: &str = "You have reached the maximum allowed steps for this subtask. Do NOT make any more tool calls. Return a concise final summary of work completed and any remaining work.";
+
+#[derive(Debug, Clone)]
+struct InlineToolCall {
+    id: String,
+    name: String,
+    input: serde_json::Value,
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolSchema {
@@ -28,7 +45,11 @@ pub struct SubtaskExecutor {
     pub prompt: String,
     pub description: Option<String>,
     pub model: Option<ModelRef>,
+    pub working_directory: Option<String>,
     pub agent_params: AgentParams,
+    pub max_steps: Option<u32>,
+    pub ask_question_hook: Option<AskQuestionHook>,
+    pub question_session_id: Option<String>,
 }
 
 impl SubtaskExecutor {
@@ -38,7 +59,11 @@ impl SubtaskExecutor {
             prompt: prompt.to_string(),
             description: None,
             model: None,
+            working_directory: None,
             agent_params: AgentParams::default(),
+            max_steps: None,
+            ask_question_hook: None,
+            question_session_id: None,
         }
     }
 
@@ -50,6 +75,38 @@ impl SubtaskExecutor {
     pub fn with_model(mut self, model: ModelRef) -> Self {
         self.model = Some(model);
         self
+    }
+
+    pub fn with_working_directory(mut self, directory: impl Into<String>) -> Self {
+        self.working_directory = Some(directory.into());
+        self
+    }
+
+    pub fn with_ask_question_hook(
+        mut self,
+        ask_question_hook: AskQuestionHook,
+        session_id: String,
+    ) -> Self {
+        self.ask_question_hook = Some(ask_question_hook);
+        self.question_session_id = Some(session_id);
+        self
+    }
+
+    pub fn with_max_steps(mut self, max_steps: Option<u32>) -> Self {
+        self.max_steps = max_steps;
+        self
+    }
+
+    fn format_task_output(subsession_id: &str, result_text: &str) -> String {
+        let task_body = if result_text.trim().is_empty() {
+            TASK_NO_TEXT_OUTPUT_MESSAGE.to_string()
+        } else {
+            result_text.to_string()
+        };
+        format!(
+            "task_id: {} (for resuming to continue this task if needed)\ntask_status: {}\n\n<task_result>\n{}\n</task_result>",
+            subsession_id, TASK_STATUS_COMPLETED, task_body
+        )
     }
 
     pub async fn execute(
@@ -82,17 +139,11 @@ impl SubtaskExecutor {
             .do_prompt_subsession(subsession_id.clone(), self.prompt.clone())
             .await
         {
-            return Ok(format!(
-                "task_id: {} (for resuming to continue this task if needed)\n\n<task_result>\n{}\n</task_result>",
-                subsession_id, output
-            ));
+            return Ok(Self::format_task_output(&subsession_id, &output));
         }
 
         let output = self.execute_inline(provider, tool_registry, &[]).await?;
-        Ok(format!(
-            "task_id: {} (for resuming to continue this task if needed)\n\n<task_result>\n{}\n</task_result>",
-            subsession_id, output
-        ))
+        Ok(Self::format_task_output(&subsession_id, &output))
     }
 
     pub async fn execute_inline(
@@ -117,32 +168,185 @@ impl SubtaskExecutor {
             })
             .collect();
 
-        let messages = vec![Message::user(&self.prompt)];
+        let directory = self
+            .working_directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            });
+        let mut messages = vec![Message::user(&self.prompt)];
+        let mut executed_tool_calls: u32 = 0;
 
-        let request = ChatRequest {
-            model: model.model_id,
-            messages,
-            max_tokens: Some(self.agent_params.max_tokens.unwrap_or(8192)),
-            temperature: self.agent_params.temperature,
-            system: None,
-            tools: Some(tool_defs),
-            stream: Some(false),
-            top_p: self.agent_params.top_p,
-            variant: None,
+        let mut step: u32 = 0;
+        loop {
+            step = step.saturating_add(1);
+            let is_last_step = self.max_steps.is_some_and(|limit| step >= limit);
+            let mut request_messages = messages.clone();
+            if is_last_step {
+                request_messages.push(Message {
+                    role: Role::Assistant,
+                    content: Content::Text(MAX_STEPS_SUMMARY_PROMPT.to_string()),
+                    cache_control: None,
+                    provider_options: None,
+                });
+            }
+            let request = ChatRequest {
+                model: model.model_id.clone(),
+                messages: request_messages,
+                max_tokens: Some(self.agent_params.max_tokens.unwrap_or(8192)),
+                temperature: self.agent_params.temperature,
+                system: None,
+                tools: if is_last_step {
+                    None
+                } else {
+                    Some(tool_defs.clone())
+                },
+                stream: Some(false),
+                top_p: self.agent_params.top_p,
+                variant: None,
+                provider_options: None,
+            };
+
+            let response = provider.chat(request).await?;
+            let choice = response
+                .choices
+                .first()
+                .ok_or_else(|| anyhow!("subtask provider returned no choices"))?;
+            let (text_output, tool_calls) = extract_text_and_tool_calls(&choice.message.content);
+
+            if tool_calls.is_empty() {
+                if text_output.trim().is_empty() && executed_tool_calls == 0 {
+                    return Err(anyhow!(
+                        "subtask returned no text and executed no tool calls"
+                    ));
+                }
+                return Ok(text_output);
+            }
+
+            if is_last_step {
+                if !text_output.trim().is_empty() {
+                    return Ok(text_output);
+                }
+                return Ok(
+                    "Subtask reached its configured step limit; returning without further tool execution."
+                        .to_string(),
+                );
+            }
+
+            tracing::debug!(
+                step,
+                tool_call_count = tool_calls.len(),
+                "subtask executing tool calls"
+            );
+
+            messages.push(Message {
+                role: Role::Assistant,
+                content: choice.message.content.clone(),
+                cache_control: None,
+                provider_options: None,
+            });
+
+            for tool_call in tool_calls {
+                let mut ctx = ToolContext::new(
+                    "subtask".to_string(),
+                    "subtask".to_string(),
+                    directory.clone(),
+                )
+                .with_agent(self.agent_name.clone());
+                if let Some(question_hook) = self.ask_question_hook.clone() {
+                    let question_session_id = self
+                        .question_session_id
+                        .clone()
+                        .unwrap_or_else(|| "subtask".to_string());
+                    ctx = ctx.with_ask_question(move |questions| {
+                        let question_hook = question_hook.clone();
+                        let question_session_id = question_session_id.clone();
+                        async move { question_hook(question_session_id, questions).await }
+                    });
+                }
+                ctx.call_id = Some(tool_call.id.clone());
+
+                let execution = if disabled.contains(tool_call.name.as_str()) {
+                    Err(ToolError::PermissionDenied(format!(
+                        "Tool '{}' is disabled for this subagent session",
+                        tool_call.name
+                    )))
+                } else {
+                    tool_registry
+                        .execute(&tool_call.name, tool_call.input.clone(), ctx)
+                        .await
+                        .map(|result| result.output)
+                };
+
+                let (tool_output, is_error) = match execution {
+                    Ok(output) => (output, false),
+                    Err(err) => (err.to_string(), true),
+                };
+
+                messages.push(build_tool_result_message(
+                    tool_call.id.as_str(),
+                    tool_output,
+                    is_error,
+                ));
+                executed_tool_calls += 1;
+            }
+        }
+    }
+}
+
+fn extract_text_and_tool_calls(content: &Content) -> (String, Vec<InlineToolCall>) {
+    match content {
+        Content::Text(text) => (text.clone(), Vec::new()),
+        Content::Parts(parts) => {
+            let mut text = String::new();
+            let mut tool_calls = Vec::new();
+
+            for part in parts {
+                if let Some(part_text) = &part.text {
+                    text.push_str(part_text);
+                }
+
+                if part.content_type == "tool_use" {
+                    if let Some(tool_use) = &part.tool_use {
+                        tool_calls.push(InlineToolCall {
+                            id: tool_use.id.clone(),
+                            name: tool_use.name.clone(),
+                            input: tool_use.input.clone(),
+                        });
+                    }
+                }
+            }
+
+            (text, tool_calls)
+        }
+    }
+}
+
+fn build_tool_result_message(tool_call_id: &str, output: String, is_error: bool) -> Message {
+    Message {
+        role: Role::Tool,
+        content: Content::Parts(vec![ContentPart {
+            content_type: "tool_result".to_string(),
+            text: None,
+            image_url: None,
+            tool_use: None,
+            tool_result: Some(ProviderToolResult {
+                tool_use_id: tool_call_id.to_string(),
+                content: output,
+                is_error: Some(is_error),
+            }),
+            cache_control: None,
+            filename: None,
+            media_type: None,
             provider_options: None,
-        };
-
-        let response = provider.chat(request).await?;
-
-        let output = response
-            .choices
-            .first()
-            .and_then(|c| match &c.message.content {
-                Content::Text(text) => Some(text.clone()),
-                Content::Parts(parts) => parts.first().and_then(|p| p.text.clone()),
-            })
-            .unwrap_or_default();
-
-        Ok(output)
+        }]),
+        cache_control: None,
+        provider_options: None,
     }
 }
