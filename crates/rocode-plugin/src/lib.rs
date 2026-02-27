@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -17,6 +16,10 @@ pub struct HookOutput {
 }
 
 impl HookOutput {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
     pub fn with_payload(payload: serde_json::Value) -> Self {
         Self {
             payload: Some(payload),
@@ -194,7 +197,7 @@ fn context_data_hash(data: &HashMap<String, serde_json::Value>) -> u64 {
 
 pub struct PluginSystem {
     hooks: RwLock<HashMap<HookEvent, Vec<Arc<Hook>>>>,
-    cache: RwLock<HashMap<(HookEvent, u64), Vec<HookResult>>>,
+    pub(crate) cache: RwLock<HashMap<(HookEvent, u64), Vec<HookResult>>>,
 }
 
 impl PluginSystem {
@@ -212,7 +215,7 @@ impl PluginSystem {
         entry.sort_by(|a, b| b.priority.cmp(&a.priority));
     }
 
-    /// Execute all hooks for an event in parallel using `join_all`.
+    /// Execute all hooks for an event sequentially (TS parity: for-loop, not join_all).
     pub async fn trigger(&self, context: HookContext) -> Vec<HookResult> {
         let hooks = self.hooks.read().await;
 
@@ -235,15 +238,25 @@ impl PluginSystem {
             }
         }
 
-        // Execute all enabled hooks in parallel.
-        let futures: Vec<_> = enabled
-            .iter()
-            .map(|h| (h.handler)(context.clone()))
-            .collect();
         // Drop the read lock before awaiting.
         drop(hooks);
 
-        let results: Vec<HookResult> = join_all(futures).await;
+        // Execute hooks sequentially (TS parity: for-loop, not join_all).
+        let mut results: Vec<HookResult> = Vec::with_capacity(enabled.len());
+        for hook in &enabled {
+            let start = std::time::Instant::now();
+            let result = (hook.handler)(context.clone()).await;
+            let elapsed = start.elapsed();
+            let status = if result.is_ok() { "ok" } else { "err" };
+            tracing::debug!(
+                event = ?context.event,
+                hook_id = %hook.name,
+                duration_ms = elapsed.as_millis() as u64,
+                status = status,
+                "[plugin-perf] hook executed"
+            );
+            results.push(result);
+        }
 
         // Cache results for deterministic events.
         if CACHEABLE_EVENTS.contains(&context.event) {
@@ -475,5 +488,26 @@ mod tests {
             payload.get("prompt").and_then(|v| v.as_str()),
             Some("override")
         );
+    }
+
+    #[tokio::test]
+    async fn trigger_logs_hook_duration() {
+        let system = PluginSystem::new();
+        system
+            .register(Hook::new(
+                "test:slow",
+                HookEvent::ConfigLoaded,
+                |_ctx| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    Ok(HookOutput::empty())
+                },
+            ))
+            .await;
+
+        let ctx = HookContext::new(HookEvent::ConfigLoaded);
+        system.cache.write().await.clear();
+        let results = system.trigger(ctx).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
     }
 }
